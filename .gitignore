@@ -1,0 +1,45 @@
+# Clojure
+.cpcache/
+target/
+classes/
+*.jar
+*.class
+pom.xml.asc
+.nrepl-port
+.repl*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+
+# Editors
+.idea/
+*.iml
+.vscode/
+.calva/
+.lsp/
+.dir-locals.el
+
+# Shadow-cljs
+.shadow-cljs/
+node_modules/
+public/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+/resources
+/checkouts
+out/
+.internal/

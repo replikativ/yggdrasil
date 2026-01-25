@@ -1,0 +1,58 @@
+version: 2.1
+
+orbs:
+  tools: replikativ/clj-tools@0
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - tools/setup:
+          context: docker-deploy
+      - tools/build:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - tools/format:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - test-git:
+          context: docker-deploy
+      - tools/deploy:
+          context:
+            - clojars-deploy
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/build
+            - test-git
+      - tools/release:
+          context:
+            - github-token
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/deploy
+
+jobs:
+  test-git:
+    docker:
+      - image: cimg/clojure:1.11.1
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run:
+          name: Configure git for tests
+          command: |
+            git config --global user.email "ci@test.com"
+            git config --global user.name "CI Test"
+      - run:
+          name: Download dependencies
+          command: clojure -P -M:test
+      - run:
+          name: Run git adapter tests
+          command: clojure -M:test -n yggdrasil.adapters.git-test

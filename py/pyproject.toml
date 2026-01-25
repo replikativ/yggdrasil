@@ -1,0 +1,12 @@
+[project]
+name = "yggdrasil"
+version = "0.1.0"
+description = "Unified Copy-on-Write Memory Model - Python bindings"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
