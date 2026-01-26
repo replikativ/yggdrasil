@@ -203,15 +203,18 @@
       this))
 
   (checkout [this name] (p/checkout this name nil))
-  (checkout [this name _opts]
+  (checkout [_ name _opts]
     (let [branch-str (clojure.core/name name)
           wt-path (branch-path repo-path worktrees-dir branch-str)]
       ;; Verify the worktree exists
       (when-not (.exists (java.io.File. wt-path))
         (throw (ex-info (str "Branch worktree not found: " branch-str)
                         {:branch branch-str :path wt-path})))
-      (reset! current-branch-atom branch-str)
-      this))
+      ;; Return NEW GitSystem with fresh atom (value semantics)
+      ;; This enables fork-safe usage where each fork gets independent state
+      (->GitSystem repo-path worktrees-dir
+                   (atom branch-str)  ; Fresh atom, not shared
+                   system-name watcher-state branch-locks)))
 
   p/Graphable
   (history [this] (p/history this {}))
