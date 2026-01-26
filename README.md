@@ -163,8 +163,6 @@ P2P version control with content-addressed commits on IPFS. Uses IPNS for branch
 - Reproducible data science (content-addressed training data)
 - Decentralized build artifacts
 
-**See:** [.internal/IPFS_ADAPTER.md](/.internal/IPFS_ADAPTER.md) for detailed documentation.
-
 ### Iceberg Adapter
 
 Git-like version control for data lakes on object storage (S3, HDFS, etc.). Tracks table metadata and snapshots without moving data.
@@ -212,8 +210,6 @@ Git-like version control for data lakes on object storage (S3, HDFS, etc.). Trac
 - Multi-tenant data lake branching
 - Schema evolution with rollback
 - Time-travel queries and compliance
-
-**See:** [.internal/ICEBERG_ADAPTER.md](/.internal/ICEBERG_ADAPTER.md) for detailed documentation.
 
 ### ZFS Adapter
 
@@ -543,13 +539,13 @@ Yggdrasil provides **Parallel Snapshot Isolation (PSI)** semantics across all ad
 - **Causal ordering**: Commits form a DAG with HLC timestamps for cross-system ordering
 - **Write-conflict detection**: `Mergeable.conflicts` detects concurrent modifications
 
-See [CONSISTENCY.md](CONSISTENCY.md) for detailed semantics, adapter-specific guarantees, and academic references.
+See [CONSISTENCY.md](docs/CONSISTENCY.md) for detailed semantics, adapter-specific guarantees, and academic references.
 
 ## Categorical Semantics
 
 For users interested in the formal mathematical foundations, Yggdrasil's protocols can be understood through category theory as a **snapshot-first model** where version control operations correspond to categorical constructions (pushouts, coinitial morphisms, etc.).
 
-See [docs/CATEGORICAL_SEMANTICS.md](docs/CATEGORICAL_SEMANTICS.md) for the formal treatment, comparison with patch-based systems (Darcs, Pijul), and theoretical justification of design decisions. This is optional reading and not required to use the library.
+See [CATEGORICAL_SEMANTICS.md](docs/CATEGORICAL_SEMANTICS.md) for the formal treatment, comparison with patch-based systems (Darcs, Pijul), and theoretical justification of design decisions. This is optional reading and not required to use the library.
 
 ## Development
 
