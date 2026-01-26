@@ -43,3 +43,4 @@ Thumbs.db
 /checkouts
 out/
 .internal/
+.clj-kondo/

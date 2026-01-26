@@ -4,11 +4,11 @@
 [![Clojars](https://img.shields.io/clojars/v/org.replikativ/yggdrasil.svg)](https://clojars.org/org.replikativ/yggdrasil)
 [![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/CB7GJAN0L)
 
-> *In Norse mythology, [Yggdrasil](https://en.wikipedia.org/wiki/Yggdrasil) is the immense World Tree whose branches extend into the heavens and whose roots reach into disparate realms, connecting the nine worlds into a unified cosmos.*
+> *In Norse mythology, [Yggdrasil](https://en.wikipedia.org/wiki/Yggdrasil) is the immense World Tree whose branches extend into the heavens and whose roots reach into disparate realms, connecting diverse worlds into a unified cosmos.*
 
 Unified copy-on-write memory model protocols for heterogeneous storage systems.
 
-Yggdrasil defines a layered protocol stack that abstracts over Git, ZFS, Btrfs, OverlayFS, Podman, Datahike, [Proximum](https://github.com/replikativ/proximum), and [Scriptum](https://github.com/replikativ/scriptum), enabling cross-system composition with causal consistency guarantees.
+Yggdrasil defines a layered protocol stack that abstracts over Git, ZFS, Btrfs, OverlayFS, Podman, IPFS, Iceberg, Datahike, LakeFS, Dolt, [Proximum](https://github.com/replikativ/proximum), and [Scriptum](https://github.com/replikativ/scriptum), enabling cross-system composition with causal consistency guarantees.
 
 ## Installation
 
@@ -92,6 +92,8 @@ pip install yggdrasil-protocols
 | Git | commits | branches (worktrees) | full DAG | 3-way | - | poll |
 | ZFS | snapshots | clones | linear | - | - | poll |
 | Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll |
+| IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll |
+| Iceberg | snapshots | branches | full DAG | manual | - | poll |
 | Datahike | commit-id | branch! | full DAG | merge! | - | - |
 | Scriptum | generations | COW dirs | full DAG | add-only | - | - |
 | OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll |
@@ -118,6 +120,100 @@ Uses **git worktrees** for concurrent branch access. Each branch gets its own wo
 - Other branches live at `<repo-path>-worktrees/<branch-name>`
 - Per-branch `ReentrantLock` serializes concurrent writes to the same branch
 - Observer mode: poll function detects external `git checkout`, commits, and branch operations
+
+### IPFS Adapter
+
+P2P version control with content-addressed commits on IPFS. Uses IPNS for branch management and decentralized propagation.
+
+```clojure
+(require '[yggdrasil.adapters.ipfs :as ipfs])
+
+;; Initialize system
+(def sys (ipfs/init! {:system-name "dbpedia"}))
+
+;; User adds data to IPFS
+(shell "ipfs add -r dbpedia-jan/")  ; => QmXxx...
+
+;; Yggdrasil tracks version
+(ipfs/commit! sys "DBpedia January 2024" {:root "QmXxx..."})
+
+;; Branch and merge
+(p/branch! sys :experimental)
+(p/checkout sys :experimental)
+(ipfs/commit! sys "Experimental data" {:root "QmYyy..."})
+(p/checkout sys :main)
+(p/merge! sys :experimental {:root "QmMerged..." :message "Merge experimental"})
+
+;; Cleanup
+(ipfs/destroy! sys {:delete-state? true :delete-keys? false})
+```
+
+**Architecture:**
+- Commits stored as DAG-JSON in IPFS (content-addressed)
+- Branches are IPNS names (mutable pointers to commit CIDs)
+- State file tracks branch metadata and cached CIDs
+- IPNS publish: ~60s with `--allow-offline` (2-5 min for full DHT propagation)
+- User manages data (Yggdrasil tracks versions only)
+- Manual merge: user provides merged data root CID
+
+**Requirements:** Running IPFS daemon (`ipfs daemon`)
+
+**Use cases:**
+- Monthly dataset releases (DBpedia, Wikidata)
+- Reproducible data science (content-addressed training data)
+- Decentralized build artifacts
+
+**See:** [.internal/IPFS_ADAPTER.md](/.internal/IPFS_ADAPTER.md) for detailed documentation.
+
+### Iceberg Adapter
+
+Git-like version control for data lakes on object storage (S3, HDFS, etc.). Tracks table metadata and snapshots without moving data.
+
+```clojure
+(require '[yggdrasil.adapters.iceberg :as ice])
+
+;; Initialize new table
+(def sys (ice/init! "s3://my-bucket/warehouse"
+                    "db.table"
+                    {:spark-config {...}}))
+
+;; Create Spark session and register table
+(def spark (ice/create-spark-session sys))
+
+;; Write data via Spark
+(.write (.format df "iceberg") "db.table")
+
+;; Yggdrasil tracks snapshots
+(ice/commit! sys "Initial data load")
+
+;; Branch for experimental schema changes
+(p/branch! sys :schema-v2)
+(p/checkout sys :schema-v2)
+;; ... modify table schema via Spark ...
+(ice/commit! sys "Add new columns")
+
+;; Merge schema changes back
+(p/checkout sys :main)
+(p/merge! sys :schema-v2 {:message "Merge schema v2"})
+
+;; Cleanup
+(ice/destroy! sys)
+```
+
+**Architecture:**
+- Metadata stored in Iceberg's JSON manifests (object storage)
+- Branches tracked via Iceberg's branch management
+- Manual merge: user resolves data/schema conflicts before merge
+- Full integration with Spark, Flink, Trino, etc.
+
+**Requirements:** Apache Spark with Iceberg runtime JAR
+
+**Use cases:**
+- Multi-tenant data lake branching
+- Schema evolution with rollback
+- Time-travel queries and compliance
+
+**See:** [.internal/ICEBERG_ADAPTER.md](/.internal/ICEBERG_ADAPTER.md) for detailed documentation.
 
 ### ZFS Adapter
 
@@ -449,6 +545,12 @@ Yggdrasil provides **Parallel Snapshot Isolation (PSI)** semantics across all ad
 
 See [CONSISTENCY.md](CONSISTENCY.md) for detailed semantics, adapter-specific guarantees, and academic references.
 
+## Categorical Semantics
+
+For users interested in the formal mathematical foundations, Yggdrasil's protocols can be understood through category theory as a **snapshot-first model** where version control operations correspond to categorical constructions (pushouts, coinitial morphisms, etc.).
+
+See [docs/CATEGORICAL_SEMANTICS.md](docs/CATEGORICAL_SEMANTICS.md) for the formal treatment, comparison with patch-based systems (Darcs, Pijul), and theoretical justification of design decisions. This is optional reading and not required to use the library.
+
 ## Development
 
 ```bash
@@ -457,6 +559,12 @@ clj -M:test
 
 # Run only git adapter tests
 clj -M:test -n yggdrasil.adapters.git-test
+
+# Run IPFS tests (requires IPFS daemon running)
+clj -M:test -n yggdrasil.adapters.ipfs-test
+
+# Run Iceberg tests (requires Spark with Iceberg)
+clj -M:test -n yggdrasil.adapters.iceberg-test
 
 # Run ZFS tests (requires ZFS + sudo setup)
 ZFS_TEST_POOL=rpool/yggdrasil clj -M:test -n yggdrasil.adapters.zfs-test
@@ -479,6 +587,8 @@ src/yggdrasil/
   compliance.clj       # Protocol compliance test suite
   adapters/
     git.clj            # Git adapter (worktree-based)
+    ipfs.clj           # IPFS adapter (P2P content-addressed)
+    iceberg.clj        # Iceberg adapter (data lake versioning)
     zfs.clj            # ZFS adapter
     btrfs.clj          # Btrfs adapter
     overlayfs.clj      # OverlayFS + Bubblewrap adapter
@@ -488,6 +598,8 @@ src/yggdrasil/
     dolt.clj           # Dolt adapter (SQL versioning)
 test/yggdrasil/adapters/
   git_test.clj         # Git compliance tests
+  ipfs_test.clj        # IPFS compliance tests
+  iceberg_test.clj     # Iceberg compliance tests
   zfs_test.clj         # ZFS compliance tests
   btrfs_test.clj       # Btrfs compliance tests
   overlayfs_test.clj   # OverlayFS compliance tests
