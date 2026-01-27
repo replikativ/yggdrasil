@@ -48,6 +48,35 @@
 (defn- commit-as-db-fn []
   (requiring-resolve 'datahike.experimental.versioning/commit-as-db))
 
+(defn- connect-fn []
+  (requiring-resolve 'datahike.api/connect))
+
+(defn- q-fn []
+  (requiring-resolve 'datahike.api/q))
+
+(defn- branch-as-db-fn []
+  (requiring-resolve 'datahike.experimental.versioning/branch-as-db))
+
+;; ============================================================
+;; Branch diff computation
+;; ============================================================
+
+(defn- compute-branch-diff
+  "Compute datoms in source-db that are not in target-db.
+   Returns vector of [:db/add e a v] transaction data."
+  [source-db target-db]
+  (let [q (q-fn)
+        ;; Find all datoms in source that are not in target
+        ;; Excludes :db/txInstant as those are metadata
+        diff (q '[:find ?e ?a ?v
+                  :in $ $2
+                  :where
+                  [$ ?e ?a ?v]
+                  [(not= :db/txInstant ?a)]
+                  (not [$2 ?e ?a ?v])]
+                source-db target-db)]
+    (mapv (fn [[e a v]] [:db/add e a v]) diff)))
+
 ;; ============================================================
 ;; History traversal (synchronous, bounded)
 ;; ============================================================
@@ -122,14 +151,16 @@
   (current-branch [_]
     (branch-of conn))
 
-  (branch! [_ name]
+  (branch! [this name]
     (let [branch! (branch!-fn)]
-      (branch! conn (branch-of conn) name)))
+      (branch! conn (branch-of conn) name)
+      this))
 
   (branch! [this name from] (p/branch! this name from nil))
-  (branch! [_ name from _opts]
+  (branch! [this name from _opts]
     (let [branch! (branch!-fn)]
-      (branch! conn from name)))
+      (branch! conn from name)
+      this))
 
   (delete-branch! [this name] (p/delete-branch! this name nil))
   (delete-branch! [_ name _opts]
@@ -137,11 +168,14 @@
       (delete-branch! conn name)))
 
   (checkout [this name] (p/checkout this name nil))
-  (checkout [this _name _opts]
+  (checkout [this name _opts]
     ;; In Datahike, "checkout" means connecting to a different branch.
-    ;; We return a new DatahikeSystem pointing to that branch's head.
-    ;; The caller is responsible for managing the connection lifecycle.
-    this)
+    ;; We create a new connection to the target branch and return a new DatahikeSystem.
+    (let [connect (connect-fn)
+          current-cfg (:config @conn)
+          branch-cfg (assoc current-cfg :branch name)
+          branch-conn (connect branch-cfg)]
+      (->DatahikeSystem branch-conn system-name)))
 
   p/Graphable
   (history [this] (p/history this {}))
@@ -215,13 +249,24 @@
 
   p/Mergeable
   (merge! [this source] (p/merge! this source {}))
-  (merge! [_ source opts]
+  (merge! [this source opts]
     (let [merge! (merge!-fn)
+          branch-as-db (branch-as-db-fn)
+          store (store-of conn)
+          ;; Source can be a branch keyword or commit UUID
+          source-branch (if (keyword? source) source nil)
           parents (if (keyword? source)
                     #{source}
-                    #{(if (uuid? source) source (parse-uuid (str source)))})]
-      (merge! conn parents (or (:tx-data opts) []) (:tx-meta opts))
-      (str (commit-id-of (db-of conn)))))
+                    #{(if (uuid? source) source (parse-uuid (str source)))})
+          ;; If no tx-data provided, compute diff from source branch
+          tx-data (or (:tx-data opts)
+                      (when source-branch
+                        (let [source-db (branch-as-db store source-branch)
+                              target-db (db-of conn)]
+                          (compute-branch-diff source-db target-db)))
+                      [])]
+      (merge! conn parents tx-data (:tx-meta opts))
+      this))
 
   (conflicts [this a b] (p/conflicts this a b nil))
   (conflicts [_ a b _opts]
