@@ -43,8 +43,8 @@
 
 (defn- current-wt
   "Get the worktree path for the current branch."
-  [repo-path worktrees-dir current-branch-atom]
-  (branch-path repo-path worktrees-dir @current-branch-atom))
+  [repo-path worktrees-dir current-branch]
+  (branch-path repo-path worktrees-dir current-branch))
 
 (defn- head-sha
   "Get HEAD sha for a worktree directory."
@@ -82,18 +82,16 @@
 
 (defn- poll-fn
   "Poll function for git watcher. Detects new commits, branch changes,
-   and external checkout operations (for observer mode without worktrees)."
-  [repo-path worktrees-dir current-branch-atom last-state]
+   and external checkout operations (for observer mode).
+   Note: Does not mutate system state - only emits events."
+  [repo-path worktrees-dir current-branch last-state]
   (let [;; Detect external branch switches on the main worktree
         actual-branch (try (git repo-path "rev-parse" "--abbrev-ref" "HEAD")
                            (catch Exception _ "main"))
-        ;; If the repo's checked-out branch changed externally, track it
-        _ (when (not= @current-branch-atom actual-branch)
-            (reset! current-branch-atom actual-branch))
-        wt (current-wt repo-path worktrees-dir current-branch-atom)
+        ;; Use actual branch from git (may differ from system's current-branch)
+        wt (current-wt repo-path worktrees-dir actual-branch)
         current-head (head-sha wt)
         current-branches (set (branch-list repo-path))
-        current-branch @current-branch-atom
         prev-head (:head last-state)
         prev-branches (or (:branches last-state) #{})
         prev-branch (:branch last-state)
@@ -101,12 +99,12 @@
                  (and current-head (not= current-head prev-head))
                  (conj {:type :commit
                         :snapshot-id current-head
-                        :branch current-branch
+                        :branch actual-branch
                         :timestamp (System/currentTimeMillis)})
 
-                 (and prev-branch (not= current-branch prev-branch))
+                 (and prev-branch (not= actual-branch prev-branch))
                  (conj {:type :checkout
-                        :branch current-branch
+                        :branch actual-branch
                         :timestamp (System/currentTimeMillis)})
 
                  true
@@ -122,10 +120,10 @@
                           :timestamp (System/currentTimeMillis)})))]
     {:state {:head current-head
              :branches current-branches
-             :branch current-branch}
+             :branch actual-branch}
      :events events}))
 
-(defrecord GitSystem [repo-path worktrees-dir current-branch-atom
+(defrecord GitSystem [repo-path worktrees-dir current-branch
                       system-name watcher-state branch-locks]
   p/SystemIdentity
   (system-id [_] (or system-name (str "git:" repo-path)))
@@ -135,11 +133,11 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (let [wt (current-wt repo-path worktrees-dir current-branch-atom)]
+    (let [wt (current-wt repo-path worktrees-dir current-branch)]
       (head-sha wt)))
 
   (parent-ids [_]
-    (let [wt (current-wt repo-path worktrees-dir current-branch-atom)
+    (let [wt (current-wt repo-path worktrees-dir current-branch)
           out (try (git wt "log" "-1" "--format=%P" "HEAD")
                    (catch Exception _ ""))]
       (if (str/blank? out)
@@ -168,16 +166,16 @@
   (branches [this] (p/branches this nil))
   (branches [_ _opts]
     (let [listed (set (map keyword (branch-list repo-path)))
-          current (keyword @current-branch-atom)]
-      (conj listed current)))
+          current-kw (keyword current-branch)]
+      (conj listed current-kw)))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     (let [branch-str (clojure.core/name name)
           wt-path (branch-path repo-path worktrees-dir branch-str)
-          source-wt (current-wt repo-path worktrees-dir current-branch-atom)]
+          source-wt (current-wt repo-path worktrees-dir current-branch)]
       ;; Create worktree for the new branch from current branch's HEAD
       (git source-wt "worktree" "add" "-b" branch-str wt-path)
       ;; Ensure entries dir exists
@@ -210,16 +208,16 @@
       (when-not (.exists (java.io.File. wt-path))
         (throw (ex-info (str "Branch worktree not found: " branch-str)
                         {:branch branch-str :path wt-path})))
-      ;; Return NEW GitSystem with fresh atom (value semantics)
+      ;; Return NEW GitSystem with updated branch (value semantics)
       ;; This enables fork-safe usage where each fork gets independent state
       (->GitSystem repo-path worktrees-dir
-                   (atom branch-str)  ; Fresh atom, not shared
+                   branch-str  ; Plain value, not atom
                    system-name watcher-state branch-locks)))
 
   p/Graphable
   (history [this] (p/history this {}))
   (history [_ opts]
-    (let [wt (current-wt repo-path worktrees-dir current-branch-atom)
+    (let [wt (current-wt repo-path worktrees-dir current-branch)
           args (cond-> ["log" "--format=%H"]
                  (:limit opts) (conj (str "-" (:limit opts)))
                  (:since opts) (conj (str (:since opts) "..HEAD")))]
@@ -266,10 +264,10 @@
     (let [branch-name (if (keyword? source)
                         (clojure.core/name source)
                         (str source))
-          wt (current-wt repo-path worktrees-dir current-branch-atom)
+          wt (current-wt repo-path worktrees-dir current-branch)
           msg (or (:message opts) (str "Merge " branch-name))
           args (concat ["merge" "--no-edit" "-m" msg] [branch-name])]
-      (with-branch-lock branch-locks @current-branch-atom
+      (with-branch-lock branch-locks current-branch
         (apply git wt args))
       this))
 
@@ -298,7 +296,7 @@
           watch-id (str (java.util.UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn repo-path worktrees-dir current-branch-atom)
+                        (partial poll-fn repo-path worktrees-dir current-branch)
                         interval)
       watch-id))
 
@@ -317,7 +315,7 @@
    (let [wt-dir (or (:worktrees-dir opts) (str repo-path "-worktrees"))]
      (.mkdirs (java.io.File. wt-dir))
      (->GitSystem repo-path wt-dir
-                  (atom (or (:initial-branch opts) "main"))
+                  (or (:initial-branch opts) "main")
                   (:system-name opts)
                   (w/create-watcher-state)
                   (atom {})))))

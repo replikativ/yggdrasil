@@ -203,12 +203,12 @@
 ;; ============================================================
 
 (defn- poll-fn
-  [namespace table current-branch-atom last-state]
+  [namespace table current-branch last-state]
   (try
     (let [table-meta (load-table-metadata namespace table)
           refs (get-refs table-meta)
           current-snap (get-current-snapshot-id table-meta)
-          branch @current-branch-atom
+          branch current-branch
           branch-snap (or (get-in refs [(keyword branch) :snapshot-id])
                           current-snap)
           prev-snap (:snapshot last-state)
@@ -263,7 +263,7 @@
 ;; System record
 ;; ============================================================
 
-(defrecord IcebergSystem [namespace table current-branch-atom system-name
+(defrecord IcebergSystem [namespace table current-branch system-name
                           watcher-state branch-locks opts logical-branches-atom]
   p/SystemIdentity
   (system-id [_] (or system-name (str "iceberg:" namespace "." table)))
@@ -274,7 +274,7 @@
   p/Snapshotable
   (snapshot-id [_]
     (let [table-meta (load-table-metadata namespace table)
-          branch @current-branch-atom
+          branch current-branch
           refs (get-refs table-meta)]
       (if (= branch "main")
         (str (get-current-snapshot-id table-meta))
@@ -336,7 +336,7 @@
       (clojure.set/union iceberg-branches logical-branches)))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     (let [table-meta (load-table-metadata namespace table)
@@ -349,7 +349,7 @@
           from-str (if from (str from) nil)
           table-meta (load-table-metadata namespace table)
           snap-id (or from-str (str (get-current-snapshot-id table-meta)))
-          current-branch-kw (keyword @current-branch-atom)]
+          current-branch-kw (keyword current-branch)]
       (if (and snap-id (not= "-1" snap-id))
         ;; Snapshots exist: create Iceberg ref
         (let [updates [{:action "set-snapshot-ref"
@@ -389,8 +389,8 @@
       (when-not (or is-iceberg-branch is-logical-branch)
         (throw (ex-info (str "Branch not found: " branch-str)
                         {:branch branch-str})))
-      (reset! current-branch-atom branch-str)
-      this))
+      (->IcebergSystem namespace table branch-str system-name
+                       watcher-state branch-locks opts logical-branches-atom)))
 
   p/Graphable
   (history [this] (p/history this {}))
@@ -469,11 +469,11 @@
               *s3-endpoint* (or (:s3-endpoint opts) (:s3-endpoint (:opts this)) *s3-endpoint*)
               *s3-access-key* (or (:s3-access-key opts) (:s3-access-key (:opts this)) *s3-access-key*)
               *s3-secret-key* (or (:s3-secret-key opts) (:s3-secret-key (:opts this)) *s3-secret-key*)]
-      (with-branch-lock* branch-locks @current-branch-atom
+      (with-branch-lock* branch-locks current-branch
         (fn []
           (let [source-branch (if (keyword? source) (clojure.core/name source) (str source))
                 source-branch-kw (keyword source-branch)
-                dest-branch @current-branch-atom
+                dest-branch current-branch
                 dest-branch-kw (keyword dest-branch)
                 table-meta (load-table-metadata namespace table)
                 refs (get-refs table-meta)
@@ -548,7 +548,7 @@
           watch-id (str (UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn namespace table current-branch-atom)
+                        (partial poll-fn namespace table current-branch)
                         interval)
       watch-id))
 
@@ -579,7 +579,7 @@
      (let [branch (or (:initial-branch opts) "main")]
        (->IcebergSystem namespace
                         table
-                        (atom branch)
+                        branch
                         (:system-name opts)
                         (w/create-watcher-state)
                         (atom {})
@@ -640,14 +640,14 @@
              *s3-endpoint* (or (:s3-endpoint (:opts sys)) *s3-endpoint*)
              *s3-access-key* (or (:s3-access-key (:opts sys)) *s3-access-key*)
              *s3-secret-key* (or (:s3-secret-key (:opts sys)) *s3-secret-key*)]
-     (with-branch-lock* (:branch-locks sys) @(:current-branch-atom sys)
+     (with-branch-lock* (:branch-locks sys) (:current-branch sys)
        (fn []
          (let [{:keys [namespace table]} sys
                msg (or message "commit")
                table-meta (load-table-metadata namespace table)
                current-snap-id (get-current-snapshot-id table-meta)
                new-snap-id (System/currentTimeMillis)
-               current-branch @(:current-branch-atom sys)
+               current-branch (:current-branch sys)
                manifest-list (str "s3://warehouse/" namespace "/" table "/metadata/empty-manifest-list.avro")
                ;; Get current sequence number and increment
                current-seq (or (get-in table-meta [:metadata :last-sequence-number])

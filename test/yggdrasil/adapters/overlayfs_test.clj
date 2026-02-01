@@ -39,7 +39,7 @@
    :read-entry (fn [sys key]
                  (ofs/read-file sys (str "entries/" key)))
    :count-entries (fn [sys]
-                    (let [branch @(:current-branch-atom sys)
+                    (let [branch (:current-branch sys)
                           upper-entries (java.io.File.
                                          (str (:workspace-path sys) "/branches/"
                                               branch "/upper/entries"))

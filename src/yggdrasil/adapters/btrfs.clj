@@ -207,8 +207,8 @@
 ;; ============================================================
 
 (defn- poll-fn
-  [base-path current-branch-atom last-state]
-  (let [branch @current-branch-atom
+  [base-path current-branch last-state]
+  (let [branch current-branch
         current-commits (read-commits base-path branch)
         current-branches (->> (File. (str base-path "/branches"))
                               (.listFiles)
@@ -245,7 +245,7 @@
 ;; System record
 ;; ============================================================
 
-(defrecord BtrfsSystem [base-path current-branch-atom system-name
+(defrecord BtrfsSystem [base-path current-branch system-name
                         watcher-state branch-locks max-snapshots]
   p/SystemIdentity
   (system-id [_] (or system-name (str "btrfs:" base-path)))
@@ -255,15 +255,15 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (:id (latest-commit base-path @current-branch-atom)))
+    (:id (latest-commit base-path current-branch)))
 
   (parent-ids [_]
-    (or (:parent-ids (latest-commit base-path @current-branch-atom)) #{}))
+    (or (:parent-ids (latest-commit base-path current-branch)) #{}))
 
   (as-of [this snap-id] (p/as-of this snap-id nil))
   (as-of [_ snap-id _opts]
     ;; Return the snapshot subvolume path for read-only access
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           commits (read-commits base-path branch)
           commit (first (filter #(= (:id %) (str snap-id)) commits))]
       (when commit
@@ -273,7 +273,7 @@
 
   (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id nil))
   (snapshot-meta [_ snap-id _opts]
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           commits (read-commits base-path branch)
           commit (first (filter #(= (:id %) (str snap-id)) commits))]
       (when commit
@@ -294,12 +294,12 @@
         #{:main})))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     ;; Create writable Btrfs snapshot of current branch subvolume
     (let [branch-str (clojure.core/name name)
-          source-branch @current-branch-atom
+          source-branch current-branch
           src-subvol (branch-path base-path source-branch)
           dest-subvol (branch-path base-path branch-str)]
       (ensure-dirs! (snapshots-path base-path branch-str))
@@ -321,7 +321,7 @@
   (branch! [this name from _opts]
     ;; Branch from a specific snapshot
     (let [branch-str (clojure.core/name name)
-          source-branch @current-branch-atom
+          source-branch current-branch
           snap-path (str (snapshots-path base-path source-branch) "/" from)
           dest-subvol (branch-path base-path branch-str)]
       (ensure-dirs! (snapshots-path base-path branch-str))
@@ -374,13 +374,13 @@
       (when-not (.exists (File. (branch-path base-path branch-str)))
         (throw (ex-info (str "Branch not found: " branch-str)
                         {:branch branch-str})))
-      (reset! current-branch-atom branch-str)
-      this))
+      (->BtrfsSystem base-path branch-str system-name
+                     watcher-state branch-locks max-snapshots)))
 
   p/Graphable
   (history [this] (p/history this {}))
   (history [_ opts]
-    (let [commits (read-commits base-path @current-branch-atom)
+    (let [commits (read-commits base-path current-branch)
           commits (vec (rseq (vec commits)))
           commits (if-let [limit (:limit opts)]
                     (vec (take limit commits))
@@ -389,7 +389,7 @@
 
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _opts]
-    (let [commits (read-commits base-path @current-branch-atom)
+    (let [commits (read-commits base-path current-branch)
           idx (.indexOf (mapv :id commits) (str snap-id))]
       (if (pos? idx)
         (mapv :id (take idx commits))
@@ -397,7 +397,7 @@
 
   (ancestor? [this a b] (p/ancestor? this a b nil))
   (ancestor? [_ a b _opts]
-    (let [commits (read-commits base-path @current-branch-atom)
+    (let [commits (read-commits base-path current-branch)
           ids (mapv :id commits)
           idx-a (.indexOf ids (str a))
           idx-b (.indexOf ids (str b))]
@@ -435,14 +435,14 @@
 
   (commit-graph [this] (p/commit-graph this nil))
   (commit-graph [_ _opts]
-    (let [commits (read-commits base-path @current-branch-atom)
+    (let [commits (read-commits base-path current-branch)
           nodes (into {}
                       (map (fn [c]
                              [(:id c) {:parent-ids (or (:parent-ids c) #{})
                                        :meta (dissoc c :id :parent-ids)}])
                            commits))]
       {:nodes nodes
-       :branches {(keyword @current-branch-atom)
+       :branches {(keyword current-branch)
                   (:id (last commits))}
        :roots (if (seq commits) #{(:id (first commits))} #{})}))
 
@@ -456,7 +456,7 @@
   (merge! [this source opts]
     ;; File-level merge: copy entries from source branch to current
     (let [source-branch (if (keyword? source) (clojure.core/name source) (str source))
-          dest-branch @current-branch-atom
+          dest-branch current-branch
           source-entries (entries-path base-path source-branch)
           dest-entries (entries-path base-path dest-branch)]
       (when (.exists (File. source-entries))
@@ -548,7 +548,7 @@
           watch-id (str (UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn base-path current-branch-atom)
+                        (partial poll-fn base-path current-branch)
                         interval)
       watch-id))
 
@@ -565,7 +565,7 @@
   ([base-path] (create base-path {}))
   ([base-path opts]
    (->BtrfsSystem base-path
-                  (atom (or (:initial-branch opts) "main"))
+                  (or (:initial-branch opts) "main")
                   (:system-name opts)
                   (w/create-watcher-state)
                   (atom {})
@@ -617,10 +617,10 @@
    Takes a read-only Btrfs snapshot and records metadata."
   ([sys] (commit! sys nil))
   ([sys message]
-   (with-branch-lock* (:branch-locks sys) @(:current-branch-atom sys)
+   (with-branch-lock* (:branch-locks sys) (:current-branch sys)
      (fn []
-       (let [{:keys [base-path current-branch-atom max-snapshots]} sys
-             branch @current-branch-atom
+       (let [{:keys [base-path current-branch max-snapshots]} sys
+             branch current-branch
              commit-id (str (UUID/randomUUID))
              commits (read-commits base-path branch)
              parent-ids (if-let [prev (last commits)]
@@ -646,7 +646,7 @@
 (defn write-file!
   "Write a file to the current branch's entries directory."
   [sys relative-path content]
-  (let [branch @(:current-branch-atom sys)
+  (let [branch (:current-branch sys)
         f (File. (str (entries-path (:base-path sys) branch) "/" relative-path))]
     (.mkdirs (.getParentFile f))
     (spit f content)))
@@ -654,7 +654,7 @@
 (defn read-file
   "Read a file from the current branch's entries directory."
   [sys relative-path]
-  (let [branch @(:current-branch-atom sys)
+  (let [branch (:current-branch sys)
         f (File. (str (entries-path (:base-path sys) branch) "/" relative-path))]
     (when (.exists f)
       (slurp f))))
@@ -662,7 +662,7 @@
 (defn delete-file!
   "Delete a file from the current branch's entries directory."
   [sys relative-path]
-  (let [branch @(:current-branch-atom sys)
+  (let [branch (:current-branch sys)
         f (File. (str (entries-path (:base-path sys) branch) "/" relative-path))]
     (when (.exists f)
       (.delete f))))

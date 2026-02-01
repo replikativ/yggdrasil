@@ -135,8 +135,8 @@
   "Execute a command inside the branch's container.
    Returns {:exit int, :out string, :err string}."
   [sys cmd & {:keys [env dir]}]
-  (let [{:keys [system-id current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [system-id current-branch]} sys
+        branch current-branch
         cname (container-name system-id branch)
         exec-args (cond-> ["exec"]
                     dir (into ["-w" dir])
@@ -153,8 +153,8 @@
 ;; ============================================================
 
 (defn- poll-fn
-  [system-id workspace-path current-branch-atom last-state]
-  (let [branch @current-branch-atom
+  [system-id workspace-path current-branch last-state]
+  (let [branch current-branch
         current-commits (read-commits workspace-path branch)
         ;; List branches from metadata dirs
         meta-dir (File. (str workspace-path "/metadata"))
@@ -193,7 +193,7 @@
 ;; ============================================================
 
 (defrecord PodmanSystem [system-id base-image workspace-path
-                         current-branch-atom watcher-state branch-locks]
+                         current-branch watcher-state branch-locks]
   p/SystemIdentity
   (system-id [_] system-id)
   (system-type [_] :podman)
@@ -202,24 +202,24 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (let [commit (latest-commit workspace-path @current-branch-atom)]
+    (let [commit (latest-commit workspace-path current-branch)]
       (:id commit)))
 
   (parent-ids [_]
-    (let [commit (latest-commit workspace-path @current-branch-atom)]
+    (let [commit (latest-commit workspace-path current-branch)]
       (or (:parent-ids commit) #{})))
 
   (as-of [this snap-id] (p/as-of this snap-id nil))
   (as-of [_ snap-id _opts]
     ;; Return info for accessing historical state (create temp container from image)
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           img (image-name system-id branch (str snap-id))]
       (when (image-exists? img)
         {:image img :commit-id (str snap-id)})))
 
   (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id nil))
   (snapshot-meta [_ snap-id _opts]
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           commits (read-commits workspace-path branch)
           commit (first (filter #(= (:id %) (str snap-id)) commits))]
       (when commit
@@ -240,12 +240,12 @@
         #{:main})))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     ;; Fork from current branch's latest committed image
     (let [branch-str (clojure.core/name name)
-          source-branch @current-branch-atom
+          source-branch current-branch
           source-commit (latest-commit workspace-path source-branch)
           source-img (if source-commit
                        (image-name system-id source-branch (:id source-commit))
@@ -264,7 +264,7 @@
   (branch! [this name from _opts]
     ;; Fork from a specific snapshot
     (let [branch-str (clojure.core/name name)
-          source-branch @current-branch-atom
+          source-branch current-branch
           source-img (image-name system-id source-branch (str from))
           new-img (image-name system-id branch-str)]
       (podman "tag" source-img new-img)
@@ -311,13 +311,14 @@
                       (image-name system-id branch-str (:id commit))
                       (image-name system-id branch-str))]
             (start-container! system-id branch-str img))))
-      (reset! current-branch-atom branch-str)
-      this))
+      ;; Return NEW system with updated branch (value semantics)
+      (->PodmanSystem system-id base-image workspace-path
+                      branch-str watcher-state branch-locks)))
 
   p/Graphable
   (history [this] (p/history this {}))
   (history [_ opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           commits (vec (rseq (vec commits)))
           commits (if-let [limit (:limit opts)]
                     (vec (take limit commits))
@@ -326,7 +327,7 @@
 
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           idx (.indexOf (mapv :id commits) (str snap-id))]
       (if (pos? idx)
         (mapv :id (take idx commits))
@@ -334,7 +335,7 @@
 
   (ancestor? [this a b] (p/ancestor? this a b nil))
   (ancestor? [_ a b _opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           ids (mapv :id commits)
           idx-a (.indexOf ids (str a))
           idx-b (.indexOf ids (str b))]
@@ -372,14 +373,14 @@
 
   (commit-graph [this] (p/commit-graph this nil))
   (commit-graph [_ _opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           nodes (into {}
                       (map (fn [c]
                              [(:id c) {:parent-ids (or (:parent-ids c) #{})
                                        :meta (dissoc c :id :parent-ids)}])
                            commits))]
       {:nodes nodes
-       :branches {(keyword @current-branch-atom)
+       :branches {(keyword current-branch)
                   (:id (last commits))}
        :roots (if (seq commits) #{(:id (first commits))} #{})}))
 
@@ -393,7 +394,7 @@
   (merge! [this source opts]
     ;; Copy changed files from source container to dest container
     (let [source-branch (if (keyword? source) (clojure.core/name source) (str source))
-          dest-branch @current-branch-atom
+          dest-branch current-branch
           source-cname (container-name system-id source-branch)
           dest-cname (container-name system-id dest-branch)
           ;; Get list of changed files in source container
@@ -504,7 +505,7 @@
           watch-id (str (UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn system-id workspace-path current-branch-atom)
+                        (partial poll-fn system-id workspace-path current-branch)
                         interval)
       watch-id))
 
@@ -523,7 +524,7 @@
    (create system-id base-image workspace-path {}))
   ([system-id base-image workspace-path opts]
    (->PodmanSystem system-id base-image workspace-path
-                   (atom (or (:initial-branch opts) "main"))
+                   (or (:initial-branch opts) "main")
                    (w/create-watcher-state)
                    (atom {}))))
 
@@ -587,8 +588,8 @@
   "Commit the current container state as a new snapshot."
   ([sys] (commit! sys nil))
   ([sys message]
-   (let [{:keys [system-id workspace-path current-branch-atom]} sys
-         branch @current-branch-atom
+   (let [{:keys [system-id workspace-path current-branch]} sys
+         branch current-branch
          cname (container-name system-id branch)
          commit-id (str (UUID/randomUUID))
          commits (read-commits workspace-path branch)
@@ -612,8 +613,8 @@
 (defn write-file!
   "Write a file inside the current branch's container."
   [sys relative-path content]
-  (let [{:keys [system-id current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [system-id current-branch]} sys
+        branch current-branch
         cname (container-name system-id branch)
         ;; Write to temp file, then copy in
         tmp (str "/tmp/ygg-write-" (System/nanoTime))]
@@ -630,8 +631,8 @@
 (defn read-file
   "Read a file from the current branch's container."
   [sys relative-path]
-  (let [{:keys [system-id current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [system-id current-branch]} sys
+        branch current-branch
         cname (container-name system-id branch)
         result (sh "podman" "exec" cname "cat" (str "/" relative-path))]
     (when (zero? (:exit result))
@@ -640,7 +641,7 @@
 (defn delete-file!
   "Delete a file inside the current branch's container."
   [sys relative-path]
-  (let [{:keys [system-id current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [system-id current-branch]} sys
+        branch current-branch
         cname (container-name system-id branch)]
     (sh "podman" "exec" cname "rm" "-f" (str "/" relative-path))))

@@ -44,9 +44,8 @@
    :read-entry (fn [sys key]
                  (pm/read-file sys (str "entries/" key)))
    :count-entries (fn [sys]
-                    (let [{:keys [system-id current-branch-atom]} sys
-                          branch @current-branch-atom
-                          cname (str "ygg-" system-id "-" branch)
+                    (let [{:keys [system-id current-branch]} sys
+                          cname (str "ygg-" system-id "-" current-branch)
                           result (sh "podman" "exec" cname
                                      "sh" "-c"
                                      "ls /entries 2>/dev/null | wc -l")]

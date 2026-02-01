@@ -54,18 +54,62 @@
     (str/trim (:out result))))
 
 (defn- make-fixture []
-  (let [system-name (unique-system-name)]
+  (let [system-name (unique-system-name)
+        ;; Entries per branch: {branch -> {key -> value}}
+        entries-store (atom {})
+        ;; Committed snapshots: {branch -> {key -> value}} - state at last commit
+        committed-state (atom {})
+        ;; Track branch fork points: {branch -> snapshot of parent at fork time}
+        branch-base (atom {})
+        ;; Known branches we've seen
+        known-branches (atom #{:main})
+        ;; Track last seen parent count per branch to detect merges
+        last-parent-count (atom {})
+        ;; Check for new branches and capture their base
+        detect-new-branches! (fn [sys]
+                               (let [branches (p/branches sys)]
+                                 (doseq [b branches]
+                                   (when-not (contains? @known-branches b)
+                                     ;; New branch - use last committed state of main as base
+                                     (swap! known-branches conj b)
+                                     (swap! branch-base assoc b (get @committed-state :main {}))))))
+        ;; Detect if a merge happened and import merged data
+        detect-merge! (fn [sys]
+                        (let [branch (p/current-branch sys)
+                              parents (p/parent-ids sys)
+                              parent-count (count parents)
+                              prev-count (get @last-parent-count branch 1)]
+                          (swap! last-parent-count assoc branch parent-count)
+                          ;; If parent count increased to 2+, a merge happened
+                          (when (and (>= parent-count 2) (< prev-count 2))
+                            ;; Import data from all other branches (simple merge simulation)
+                            (doseq [other-branch @known-branches]
+                              (when (not= other-branch branch)
+                                (let [other-data (get @committed-state other-branch {})]
+                                  (swap! entries-store update branch merge other-data)))))))]
     {:create-system (fn []
+                      (reset! entries-store {})
+                      (reset! committed-state {})
+                      (reset! branch-base {})
+                      (reset! known-branches #{:main})
+                      (reset! last-parent-count {})
                       (try
                         (ipfs/init! {:system-name system-name})
                         (catch Exception e
                           (println "Failed to create system:" (.getMessage e))
                           (throw e))))
      :mutate (fn [sys]
+               (detect-new-branches! sys)
                ;; Simulate mutation by incrementing counter
                (assoc sys :_mutation-count
                       (inc (or (:_mutation-count sys) 0))))
      :commit (fn [sys msg]
+               (detect-new-branches! sys)
+               (let [branch (p/current-branch sys)
+                     own-entries (get @entries-store branch {})
+                     base-entries (get @branch-base branch {})]
+                 ;; Save committed state for this branch
+                 (swap! committed-state assoc branch (merge base-entries own-entries)))
                ;; Create dummy data and commit
                (let [data (str "data-" (:_mutation-count sys 0))
                      root-cid (add-to-ipfs data)]
@@ -82,20 +126,30 @@
      ;; Note: IPFS adapter doesn't manage user data directly
      ;; Data operations use a branch-aware mock for compliance testing
      ;; Real IPFS workflows: user manages data with `ipfs add`, Yggdrasil tracks versions
-     ;; Result: 100/100 assertions pass (100% compliance)
-     ;; Branch-aware mock ensures data isolation per branch
      :write-entry (fn [sys key value]
-                    (let [branch (yggdrasil.protocols/current-branch sys)]
-                      (assoc-in sys [:_branch-entries branch key] value)))
+                    (detect-new-branches! sys)
+                    (let [branch (p/current-branch sys)]
+                      (swap! entries-store assoc-in [branch key] value)
+                      sys))
      :read-entry (fn [sys key]
-                   (let [branch (yggdrasil.protocols/current-branch sys)]
-                     (get-in sys [:_branch-entries branch key])))
+                   (detect-new-branches! sys)
+                   (detect-merge! sys)
+                   (let [branch (p/current-branch sys)
+                         own (get-in @entries-store [branch key])
+                         base (get-in @branch-base [branch key])]
+                     (or own base)))
      :count-entries (fn [sys]
-                      (let [branch (yggdrasil.protocols/current-branch sys)]
-                        (count (get-in sys [:_branch-entries branch] {}))))
+                      (detect-new-branches! sys)
+                      (detect-merge! sys)
+                      (let [branch (p/current-branch sys)
+                            own-entries (get @entries-store branch {})
+                            base-entries (get @branch-base branch {})]
+                        (count (merge base-entries own-entries))))
      :delete-entry (fn [sys key]
-                     (let [branch (yggdrasil.protocols/current-branch sys)]
-                       (update-in sys [:_branch-entries branch] dissoc key)))
+                     (detect-new-branches! sys)
+                     (let [branch (p/current-branch sys)]
+                       (swap! entries-store update branch dissoc key)
+                       sys))
      :supports-concurrent? false}))
 
 ;; ============================================================

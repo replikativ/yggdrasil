@@ -205,9 +205,9 @@
 ;; ============================================================
 
 (defn- poll-fn
-  [repo-name current-branch-atom last-state]
+  [repo-name current-branch last-state]
   (try
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           head (current-head repo-name branch)
           branches (set (keys (list-branches repo-name)))
           prev-head (:head last-state)
@@ -239,7 +239,7 @@
 ;; System record
 ;; ============================================================
 
-(defrecord LakeFSSystem [repo-name current-branch-atom system-name
+(defrecord LakeFSSystem [repo-name current-branch system-name
                          watcher-state branch-locks init-commit]
   p/SystemIdentity
   (system-id [_] (or system-name (str "lakefs:" repo-name)))
@@ -249,10 +249,10 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (current-head repo-name @current-branch-atom))
+    (current-head repo-name current-branch))
 
   (parent-ids [_]
-    (let [entries (get-log repo-name @current-branch-atom :amount 1)]
+    (let [entries (get-log repo-name current-branch :amount 1)]
       (if-let [entry (first entries)]
         (disj (or (:parents entry) #{}) init-commit)
         #{})))
@@ -265,7 +265,7 @@
   (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id nil))
   (snapshot-meta [_ snap-id _opts]
     ;; Look up commit in log
-    (let [entries (get-log repo-name @current-branch-atom :amount 1000)]
+    (let [entries (get-log repo-name current-branch :amount 1000)]
       (when-let [entry (first (filter #(= (:id %) (str snap-id)) entries))]
         {:snapshot-id (:id entry)
          :parent-ids (disj (or (:parents entry) #{}) init-commit)
@@ -278,13 +278,13 @@
     (set (map keyword (keys (list-branches repo-name)))))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     (let [branch-str (clojure.core/name name)]
       (lakectl "branch" "create"
                (branch-uri repo-name branch-str)
-               "--source" (branch-uri repo-name @current-branch-atom))
+               "--source" (branch-uri repo-name current-branch))
       this))
 
   (branch! [this name from] (p/branch! this name from nil))
@@ -308,20 +308,20 @@
       (when-not (contains? branches-map branch-str)
         (throw (ex-info (str "Branch not found: " branch-str)
                         {:branch branch-str})))
-      (reset! current-branch-atom branch-str)
-      this))
+      ;; Use assoc to preserve any extra keys (e.g., test config)
+      (assoc this :current-branch branch-str)))
 
   p/Graphable
   (history [this] (p/history this {}))
   (history [_ opts]
     (let [limit (or (:limit opts) 1000)
-          entries (get-log repo-name @current-branch-atom :amount limit)
+          entries (get-log repo-name current-branch :amount limit)
           ids (filterv #(not= % init-commit) (mapv :id entries))]
       (vec (take limit ids))))
 
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _opts]
-    (let [entries (get-log repo-name @current-branch-atom :amount 1000)
+    (let [entries (get-log repo-name current-branch :amount 1000)
           ids (filterv #(not= % init-commit) (mapv :id entries))
           idx (.indexOf ids (str snap-id))]
       (if (>= idx 0)
@@ -331,7 +331,7 @@
   (ancestor? [this a b] (p/ancestor? this a b nil))
   (ancestor? [_ a b _opts]
     ;; a is ancestor of b if a appears after b in the log
-    (let [entries (get-log repo-name @current-branch-atom :amount 1000)
+    (let [entries (get-log repo-name current-branch :amount 1000)
           ids (mapv :id entries)
           idx-a (.indexOf ids (str a))
           idx-b (.indexOf ids (str b))]
@@ -364,13 +364,13 @@
                       #{init-commit})]
           (when (seq common)
             ;; Find the latest common commit (earliest in either branch's log)
-            (let [entries (get-log repo-name @current-branch-atom :amount 1000)
+            (let [entries (get-log repo-name current-branch :amount 1000)
                   ordered (filter #(common (:id %)) entries)]
               (:id (first ordered))))))))
 
   (commit-graph [this] (p/commit-graph this nil))
   (commit-graph [_ _opts]
-    (let [entries (get-log repo-name @current-branch-atom :amount 1000)
+    (let [entries (get-log repo-name current-branch :amount 1000)
           nodes (into {}
                       (map (fn [e]
                              [(:id e) {:parent-ids (disj (or (:parents e) #{}) init-commit)
@@ -393,7 +393,7 @@
   (merge! [this source] (p/merge! this source {}))
   (merge! [this source opts]
     (let [source-branch (if (keyword? source) (clojure.core/name source) (str source))
-          dest-branch @current-branch-atom]
+          dest-branch current-branch]
       (lakectl "merge" (branch-uri repo-name source-branch)
                (branch-uri repo-name dest-branch))
       this))
@@ -403,7 +403,7 @@
     ;; Use diff to detect conflicts (same path modified on both sides)
     (try
       (let [;; Find common ancestor
-            entries-a (get-log repo-name @current-branch-atom :amount 1000)
+            entries-a (get-log repo-name current-branch :amount 1000)
             history-a (set (mapv :id entries-a))
             ;; Get branches for each ref
             branches-map (list-branches repo-name)
@@ -414,8 +414,8 @@
                                     (let [es (get-log repo-name br :amount 1000)]
                                       (some #(= (:id %) (str ref)) es)))
                                   all-branch-names)))
-            branch-a (or (find-branch a) @current-branch-atom)
-            branch-b (or (find-branch b) @current-branch-atom)
+            branch-a (or (find-branch a) current-branch)
+            branch-b (or (find-branch b) current-branch)
             ;; Diff each branch from their common point
             diff-a (parse-diff (lakectl "diff"
                                         (ref-uri repo-name (str a))
@@ -454,7 +454,7 @@
           watch-id (str (UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn repo-name current-branch-atom)
+                        (partial poll-fn repo-name current-branch)
                         interval)
       watch-id))
 
@@ -476,7 +476,7 @@
                        (let [entries (get-log repo-name branch :amount 1000)]
                          (:id (last entries))))]
      (->LakeFSSystem repo-name
-                     (atom branch)
+                     branch
                      (:system-name opts)
                      (w/create-watcher-state)
                      (atom {})
@@ -507,10 +507,10 @@
   "Create a commit on the current branch."
   ([sys] (commit! sys nil))
   ([sys message]
-   (with-branch-lock* (:branch-locks sys) @(:current-branch-atom sys)
+   (with-branch-lock* (:branch-locks sys) (:current-branch sys)
      (fn []
-       (let [{:keys [repo-name current-branch-atom]} sys
-             branch @current-branch-atom
+       (let [{:keys [repo-name current-branch]} sys
+             branch current-branch
              msg (or message "commit")]
          (let [output (lakectl "commit" (branch-uri repo-name branch)
                                "-m" msg)]
@@ -521,8 +521,8 @@
 (defn write-entry!
   "Write a key-value entry as an object under entries/ prefix."
   [sys key value]
-  (let [{:keys [repo-name current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [repo-name current-branch]} sys
+        branch current-branch
         ;; Write to temp file, then upload
         tmp (File/createTempFile "ygg-lakefs-" ".tmp")]
     (try
@@ -537,8 +537,8 @@
 (defn read-entry
   "Read a value by key from the entries/ prefix."
   [sys key]
-  (let [{:keys [repo-name current-branch-atom]} sys
-        branch @current-branch-atom]
+  (let [{:keys [repo-name current-branch]} sys
+        branch current-branch]
     (try
       (lakectl "fs" "cat" (object-uri repo-name branch (str "entries/" key)))
       (catch Exception _ nil))))
@@ -546,8 +546,8 @@
 (defn delete-entry!
   "Delete an entry by key."
   [sys key]
-  (let [{:keys [repo-name current-branch-atom]} sys
-        branch @current-branch-atom]
+  (let [{:keys [repo-name current-branch]} sys
+        branch current-branch]
     (try
       (lakectl "fs" "rm" (object-uri repo-name branch (str "entries/" key)))
       (catch Exception _))))
@@ -555,8 +555,8 @@
 (defn count-entries
   "Count entries under the entries/ prefix."
   [sys]
-  (let [{:keys [repo-name current-branch-atom]} sys
-        branch @current-branch-atom]
+  (let [{:keys [repo-name current-branch]} sys
+        branch current-branch]
     (try
       (let [output (lakectl "fs" "ls" (object-uri repo-name branch "entries/"))]
         (if (str/blank? output)

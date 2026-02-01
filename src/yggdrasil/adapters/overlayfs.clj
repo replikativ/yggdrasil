@@ -142,8 +142,8 @@
    Returns: {:exit int, :out string, :err string}"
   [sys cmd & {:keys [net? env dir timeout]
               :or {net? false}}]
-  (let [{:keys [base-path workspace-path current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [base-path workspace-path current-branch]} sys
+        branch current-branch
         upper (upper-dir workspace-path branch)
         work (work-dir workspace-path branch)]
     ;; Ensure work dir is clean (overlayfs requires empty workdir)
@@ -190,8 +190,8 @@
 ;; ============================================================
 
 (defn- poll-fn
-  [workspace-path current-branch-atom last-state]
-  (let [branch @current-branch-atom
+  [workspace-path current-branch last-state]
+  (let [branch current-branch
         current-commits (read-commits workspace-path branch)
         current-branches (->> (File. (str workspace-path "/branches"))
                               (.listFiles)
@@ -240,7 +240,7 @@
 ;; System record
 ;; ============================================================
 
-(defrecord OverlayFSSystem [base-path workspace-path current-branch-atom
+(defrecord OverlayFSSystem [base-path workspace-path current-branch
                             system-name watcher-state branch-locks]
   p/SystemIdentity
   (system-id [_] (or system-name (str "overlayfs:" workspace-path)))
@@ -250,17 +250,17 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (let [commit (latest-commit workspace-path @current-branch-atom)]
+    (let [commit (latest-commit workspace-path current-branch)]
       (:id commit)))
 
   (parent-ids [_]
-    (let [commit (latest-commit workspace-path @current-branch-atom)]
+    (let [commit (latest-commit workspace-path current-branch)]
       (or (:parent-ids commit) #{})))
 
   (as-of [this snap-id] (p/as-of this snap-id nil))
   (as-of [_ snap-id _opts]
     ;; Return the snapshot directory path for read-only access
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           commits (read-commits workspace-path branch)
           commit (first (filter #(= (:id %) (str snap-id)) commits))]
       (when commit
@@ -268,7 +268,7 @@
 
   (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id nil))
   (snapshot-meta [_ snap-id _opts]
-    (let [branch @current-branch-atom
+    (let [branch current-branch
           commits (read-commits workspace-path branch)
           commit (first (filter #(= (:id %) (str snap-id)) commits))]
       (when commit
@@ -289,12 +289,12 @@
         #{:main})))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     ;; Branch from current branch's latest state (copy upper dir)
     (let [branch-str (clojure.core/name name)
-          source-branch @current-branch-atom
+          source-branch current-branch
           new-upper (upper-dir workspace-path branch-str)
           new-work (work-dir workspace-path branch-str)
           source-upper (upper-dir workspace-path source-branch)
@@ -320,7 +320,7 @@
   (branch! [this name from _opts]
     ;; Branch from a specific snapshot
     (let [branch-str (clojure.core/name name)
-          source-branch @current-branch-atom
+          source-branch current-branch
           source-snaps (snapshots-dir workspace-path source-branch)
           snap-path (str source-snaps "/" from)
           new-upper (upper-dir workspace-path branch-str)
@@ -355,13 +355,13 @@
       (when-not (.exists (File. (branch-dir workspace-path branch-str)))
         (throw (ex-info (str "Branch not found: " branch-str)
                         {:branch branch-str})))
-      (reset! current-branch-atom branch-str)
-      this))
+      (->OverlayFSSystem base-path workspace-path branch-str
+                         system-name watcher-state branch-locks)))
 
   p/Graphable
   (history [this] (p/history this {}))
   (history [_ opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           commits (vec (rseq (vec commits)))
           commits (if-let [limit (:limit opts)]
                     (vec (take limit commits))
@@ -370,7 +370,7 @@
 
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           idx (.indexOf (mapv :id commits) (str snap-id))]
       (if (pos? idx)
         (mapv :id (take idx commits))
@@ -378,7 +378,7 @@
 
   (ancestor? [this a b] (p/ancestor? this a b nil))
   (ancestor? [_ a b _opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           ids (mapv :id commits)
           idx-a (.indexOf ids (str a))
           idx-b (.indexOf ids (str b))]
@@ -419,14 +419,14 @@
 
   (commit-graph [this] (p/commit-graph this nil))
   (commit-graph [_ _opts]
-    (let [commits (read-commits workspace-path @current-branch-atom)
+    (let [commits (read-commits workspace-path current-branch)
           nodes (into {}
                       (map (fn [c]
                              [(:id c) {:parent-ids (or (:parent-ids c) #{})
                                        :meta (dissoc c :id :parent-ids)}])
                            commits))]
       {:nodes nodes
-       :branches {(keyword @current-branch-atom)
+       :branches {(keyword current-branch)
                   (:id (last commits))}
        :roots (if (seq commits) #{(:id (first commits))} #{})}))
 
@@ -440,7 +440,7 @@
   (merge! [this source opts]
     ;; Add-only merge: copy all files from source's upper to current upper
     (let [source-branch (if (keyword? source) (clojure.core/name source) (str source))
-          dest-branch @current-branch-atom
+          dest-branch current-branch
           source-upper (upper-dir workspace-path source-branch)
           dest-upper (upper-dir workspace-path dest-branch)]
       (when (.exists (File. source-upper))
@@ -527,7 +527,7 @@
           watch-id (str (UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn workspace-path current-branch-atom)
+                        (partial poll-fn workspace-path current-branch)
                         interval)
       watch-id))
 
@@ -546,7 +546,7 @@
   ([base-path workspace-path] (create base-path workspace-path {}))
   ([base-path workspace-path opts]
    (->OverlayFSSystem base-path workspace-path
-                      (atom (or (:initial-branch opts) "main"))
+                      (or (:initial-branch opts) "main")
                       (:system-name opts)
                       (w/create-watcher-state)
                       (atom {}))))
@@ -575,8 +575,8 @@
    Snapshots the upper directory state and records metadata."
   ([sys] (commit! sys nil))
   ([sys message]
-   (let [{:keys [workspace-path current-branch-atom]} sys
-         branch @current-branch-atom
+   (let [{:keys [workspace-path current-branch]} sys
+         branch current-branch
          upper (upper-dir workspace-path branch)
          commit-id (str (UUID/randomUUID))
          commits (read-commits workspace-path branch)
@@ -608,8 +608,8 @@
   "Read a file from the current branch's effective state.
    Checks upper first (branch-specific changes), then base (shared)."
   [sys relative-path]
-  (let [{:keys [base-path workspace-path current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [base-path workspace-path current-branch]} sys
+        branch current-branch
         upper-file (File. (str (upper-dir workspace-path branch) "/" relative-path))
         base-file (File. (str base-path "/" relative-path))]
     (cond
@@ -620,8 +620,8 @@
 (defn write-file!
   "Write a file to the current branch's upper directory."
   [sys relative-path content]
-  (let [{:keys [workspace-path current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [workspace-path current-branch]} sys
+        branch current-branch
         f (File. (str (upper-dir workspace-path branch) "/" relative-path))]
     (.mkdirs (.getParentFile f))
     (spit f content)))
@@ -630,8 +630,8 @@
   "Delete a file from the current branch.
    If the file exists in base, creates a whiteout marker in upper."
   [sys relative-path]
-  (let [{:keys [base-path workspace-path current-branch-atom]} sys
-        branch @current-branch-atom
+  (let [{:keys [base-path workspace-path current-branch]} sys
+        branch current-branch
         upper-file (File. (str (upper-dir workspace-path branch) "/" relative-path))
         base-file (File. (str base-path "/" relative-path))]
     (when (.exists upper-file)

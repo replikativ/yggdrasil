@@ -106,11 +106,16 @@
 ;; Polling watcher
 ;; ============================================================
 
-(defn- current-head [repo-path]
-  (let [rows (dolt-sql-values repo-path
-                              "SELECT commit_hash FROM dolt_log LIMIT 1")]
-    (when (seq rows)
-      (first (first rows)))))
+(defn- current-head
+  "Get the current HEAD commit. If branch is provided, get HEAD for that specific branch."
+  ([repo-path] (current-head repo-path nil))
+  ([repo-path branch]
+   (let [query (if branch
+                 (str "SELECT commit_hash FROM dolt_log('" branch "') LIMIT 1")
+                 "SELECT commit_hash FROM dolt_log LIMIT 1")
+         rows (dolt-sql-values repo-path query)]
+     (when (seq rows)
+       (first (first rows))))))
 
 (defn- list-branches [repo-path]
   (let [rows (dolt-sql-values repo-path
@@ -118,8 +123,8 @@
     (set (map first rows))))
 
 (defn- poll-fn
-  [repo-path current-branch-atom last-state]
-  (let [branch @current-branch-atom
+  [repo-path current-branch last-state]
+  (let [branch current-branch
         head (current-head repo-path)
         branches (list-branches repo-path)
         prev-head (:head last-state)
@@ -149,7 +154,7 @@
 ;; System record
 ;; ============================================================
 
-(defrecord DoltSystem [repo-path current-branch-atom system-name
+(defrecord DoltSystem [repo-path current-branch system-name
                        watcher-state branch-locks init-commit]
   p/SystemIdentity
   (system-id [_] (or system-name (str "dolt:" repo-path)))
@@ -159,10 +164,10 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (current-head repo-path))
+    (current-head repo-path current-branch))
 
   (parent-ids [_]
-    (let [head (current-head repo-path)]
+    (let [head (current-head repo-path current-branch)]
       (if head
         (let [rows (dolt-sql-values repo-path
                                     (str "SELECT parent_hash FROM dolt_commit_ancestors "
@@ -203,7 +208,7 @@
     (set (map keyword (list-branches repo-path))))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     (let [branch-str (clojure.core/name name)]
@@ -225,9 +230,10 @@
   (checkout [this name] (p/checkout this name nil))
   (checkout [this name _opts]
     (let [branch-str (clojure.core/name name)]
-      (dolt repo-path "checkout" branch-str)
-      (reset! current-branch-atom branch-str)
-      this))
+      ;; Just return a new system pointing to the branch
+      ;; Actual checkout happens during write operations
+      (->DoltSystem repo-path branch-str system-name
+                    watcher-state branch-locks init-commit)))
 
   p/Graphable
   (history [this] (p/history this {}))
@@ -297,6 +303,8 @@
   (merge! [this source opts]
     (let [source-branch (if (keyword? source) (clojure.core/name source) (str source))
           [author-name author-email] (parse-author *author*)]
+      ;; Checkout target branch before merging
+      (dolt repo-path "checkout" current-branch)
       (dolt repo-path "merge" source-branch
             "--author" (str author-name " <" author-email ">"))
       this))
@@ -342,7 +350,7 @@
           watch-id (str (UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn repo-path current-branch-atom)
+                        (partial poll-fn repo-path current-branch)
                         interval)
       watch-id))
 
@@ -374,7 +382,7 @@
      (try (dolt repo-path "checkout" branch)
           (catch Exception _))
      (->DoltSystem repo-path
-                   (atom branch)
+                   branch
                    (:system-name opts)
                    (w/create-watcher-state)
                    (atom {})
@@ -410,25 +418,31 @@
    Stages all changes and commits."
   ([sys] (commit! sys nil))
   ([sys message]
-   (with-branch-lock* (:branch-locks sys) @(:current-branch-atom sys)
+   (with-branch-lock* (:branch-locks sys) (:current-branch sys)
      (fn []
        (let [repo (:repo-path sys)
+             branch (:current-branch sys)
              [author-name author-email] (parse-author *author*)
              msg (or message "commit")]
+         ;; Checkout the branch first
+         (dolt repo "checkout" branch)
          ;; Stage all changes
          (dolt repo "add" ".")
          ;; Commit
          (dolt repo "commit" "-m" msg
                "--author" (str author-name " <" author-email ">")
                "--allow-empty")
-         (current-head repo))))))
+         (current-head repo branch))))))
 
 (defn write-entry!
   "Write a key-value entry to the entries table."
   [sys key value]
   (let [repo (:repo-path sys)
+        branch (:current-branch sys)
         escaped-key (str/replace key "'" "''")
         escaped-val (str/replace (str value) "'" "''")]
+    ;; Checkout branch before write
+    (dolt repo "checkout" branch)
     (dolt repo "sql" "-q"
           (str "REPLACE INTO entries (k, v) VALUES ('" escaped-key "', '" escaped-val "')"))))
 
@@ -436,17 +450,23 @@
   "Read a value by key from the entries table."
   [sys key]
   (let [repo (:repo-path sys)
-        escaped-key (str/replace key "'" "''")
-        rows (dolt-sql-values repo
-                              (str "SELECT v FROM entries WHERE k = '" escaped-key "'"))]
-    (when (seq rows)
-      (first (first rows)))))
+        branch (:current-branch sys)
+        escaped-key (str/replace key "'" "''")]
+    ;; Checkout branch to read current working tree state
+    (dolt repo "checkout" branch)
+    (let [rows (dolt-sql-values repo
+                                (str "SELECT v FROM entries WHERE k = '" escaped-key "'"))]
+      (when (seq rows)
+        (first (first rows))))))
 
 (defn delete-entry!
   "Delete an entry by key from the entries table."
   [sys key]
   (let [repo (:repo-path sys)
+        branch (:current-branch sys)
         escaped-key (str/replace key "'" "''")]
+    ;; Checkout branch before write
+    (dolt repo "checkout" branch)
     (dolt repo "sql" "-q"
           (str "DELETE FROM entries WHERE k = '" escaped-key "'"))))
 
@@ -454,10 +474,13 @@
   "Count the number of entries in the entries table."
   [sys]
   (let [repo (:repo-path sys)
-        rows (dolt-sql-values repo "SELECT COUNT(*) FROM entries")]
-    (if (seq rows)
-      (Integer/parseInt (first (first rows)))
-      0)))
+        branch (:current-branch sys)]
+    ;; Checkout branch to read current working tree state
+    (dolt repo "checkout" branch)
+    (let [rows (dolt-sql-values repo "SELECT COUNT(*) FROM entries")]
+      (if (seq rows)
+        (Integer/parseInt (first (first rows)))
+        0))))
 
 (defn dolt-available?
   "Check if the dolt binary is available."

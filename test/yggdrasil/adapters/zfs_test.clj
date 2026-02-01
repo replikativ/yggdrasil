@@ -37,7 +37,7 @@
 (defn- branch-mount
   "Get the mount path for the current branch of a ZFSSystem."
   [sys]
-  (str (:mount-base sys) "/" (:prefix sys) "/" @(:current-branch-atom sys)))
+  (str (:mount-base sys) "/" (:prefix sys) "/" (:current-branch sys)))
 
 (defn- make-fixture []
   {:create-system (fn []
@@ -49,7 +49,7 @@
                (spit f (str (System/nanoTime)))
                sys))
    :commit (fn [sys msg]
-             (let [ds (str (:base-pool sys) "/" (:prefix sys) "/" @(:current-branch-atom sys))
+             (let [ds (str (:base-pool sys) "/" (:prefix sys) "/" (:current-branch sys))
                    snap-name (str (java.util.UUID/randomUUID))
                    full-snap (str ds "@" snap-name)]
                (zfs-cmd "snapshot" full-snap)

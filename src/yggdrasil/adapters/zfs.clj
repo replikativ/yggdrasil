@@ -81,8 +81,8 @@
 
 (defn- poll-fn
   "Poll function for ZFS watcher. Detects new snapshots and datasets."
-  [base-pool prefix current-branch-atom last-state]
-  (let [current-ds (str base-pool "/" prefix "/" @current-branch-atom)
+  [base-pool prefix current-branch last-state]
+  (let [current-ds (str base-pool "/" prefix "/" current-branch)
         current-snaps (set (dataset-snapshots current-ds))
         current-branches (set (list-child-datasets base-pool prefix))
         prev-snaps (or (:snapshots last-state) #{})
@@ -93,7 +93,7 @@
                  (into (for [s new-snaps]
                          {:type :commit
                           :snapshot-id s
-                          :branch @current-branch-atom
+                          :branch current-branch
                           :timestamp (System/currentTimeMillis)}))
 
                  true
@@ -134,7 +134,7 @@
     (try (f)
          (finally (.unlock l)))))
 
-(defrecord ZFSSystem [base-pool prefix mount-base current-branch-atom system-name watcher-state branch-locks]
+(defrecord ZFSSystem [base-pool prefix mount-base current-branch system-name watcher-state branch-locks]
   p/SystemIdentity
   (system-id [_] (or system-name (str "zfs:" base-pool "/" prefix)))
   (system-type [_] :zfs)
@@ -143,12 +143,12 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (let [ds (str base-pool "/" prefix "/" @current-branch-atom)
+    (let [ds (str base-pool "/" prefix "/" current-branch)
           snaps (dataset-snapshots ds)]
       (last snaps)))
 
   (parent-ids [_]
-    (let [ds (str base-pool "/" prefix "/" @current-branch-atom)
+    (let [ds (str base-pool "/" prefix "/" current-branch)
           snaps (dataset-snapshots ds)]
       (if (< (count snaps) 2)
         #{}
@@ -158,7 +158,7 @@
   (as-of [_ snap-id _opts]
     ;; Return the .zfs/snapshot path for read-only access
     (let [snap-name (snapshot-short-name (str snap-id))
-          ds (str base-pool "/" prefix "/" @current-branch-atom)
+          ds (str base-pool "/" prefix "/" current-branch)
           mount (dataset-mount-point ds)]
       (str mount "/.zfs/snapshot/" snap-name)))
 
@@ -187,12 +187,12 @@
     (set (map keyword (list-child-datasets base-pool prefix))))
 
   (current-branch [_]
-    (keyword @current-branch-atom))
+    (keyword current-branch))
 
   (branch! [this name]
     ;; Clone from latest snapshot of current branch
     (let [branch-str (clojure.core/name name)
-          source-ds (str base-pool "/" prefix "/" @current-branch-atom)
+          source-ds (str base-pool "/" prefix "/" current-branch)
           snaps (dataset-snapshots source-ds)
           latest-snap (last snaps)
           new-ds (str base-pool "/" prefix "/" branch-str)
@@ -234,13 +234,14 @@
       (when-not (dataset-exists? ds)
         (throw (ex-info (str "Branch not found: " branch-str)
                         {:branch branch-str})))
-      (reset! current-branch-atom branch-str)
-      this))
+      ;; Return NEW system with updated branch (value semantics)
+      (->ZFSSystem base-pool prefix mount-base branch-str
+                   system-name watcher-state branch-locks)))
 
   p/Graphable
   (history [this] (p/history this {}))
   (history [_ opts]
-    (let [ds (str base-pool "/" prefix "/" @current-branch-atom)
+    (let [ds (str base-pool "/" prefix "/" current-branch)
           snaps (vec (rseq (vec (dataset-snapshots ds))))
           snaps (if-let [limit (:limit opts)]
                   (vec (take limit snaps))
@@ -249,7 +250,7 @@
 
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _opts]
-    (let [ds (str base-pool "/" prefix "/" @current-branch-atom)
+    (let [ds (str base-pool "/" prefix "/" current-branch)
           snaps (dataset-snapshots ds)
           idx (.indexOf snaps (str snap-id))]
       (if (pos? idx)
@@ -258,7 +259,7 @@
 
   (ancestor? [this a b] (p/ancestor? this a b nil))
   (ancestor? [_ a b _opts]
-    (let [ds (str base-pool "/" prefix "/" @current-branch-atom)
+    (let [ds (str base-pool "/" prefix "/" current-branch)
           snaps (dataset-snapshots ds)
           idx-a (.indexOf snaps (str a))
           idx-b (.indexOf snaps (str b))]
@@ -296,7 +297,7 @@
 
   (commit-graph [this] (p/commit-graph this nil))
   (commit-graph [this _opts]
-    (let [ds (str base-pool "/" prefix "/" @current-branch-atom)
+    (let [ds (str base-pool "/" prefix "/" current-branch)
           snaps (dataset-snapshots ds)
           nodes (into {}
                       (map-indexed
@@ -305,7 +306,7 @@
                              :meta (p/snapshot-meta this s)}])
                        snaps))]
       {:nodes nodes
-       :branches {(keyword @current-branch-atom) (last snaps)}
+       :branches {(keyword current-branch) (last snaps)}
        :roots (if (seq snaps) #{(first snaps)} #{})}))
 
   (commit-info [this snap-id] (p/commit-info this snap-id nil))
@@ -320,7 +321,7 @@
           watch-id (str (java.util.UUID/randomUUID))]
       (w/add-callback! watcher-state watch-id callback)
       (w/start-polling! watcher-state
-                        (partial poll-fn base-pool prefix current-branch-atom)
+                        (partial poll-fn base-pool prefix current-branch)
                         interval)
       watch-id))
 
@@ -345,7 +346,7 @@
   ([base-pool prefix opts]
    (let [mb (or (:mount-base opts) *mount-base*)]
      (->ZFSSystem base-pool prefix mb
-                  (atom (or (:initial-branch opts) "main"))
+                  (or (:initial-branch opts) "main")
                   (:system-name opts)
                   (w/create-watcher-state)
                   (atom {})))))

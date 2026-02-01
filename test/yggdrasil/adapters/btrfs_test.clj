@@ -74,7 +74,7 @@
    :read-entry (fn [sys key]
                  (btrfs/read-file sys key))
    :count-entries (fn [sys]
-                    (let [branch @(:current-branch-atom sys)
+                    (let [branch (:current-branch sys)
                           entries-dir (File. (str (:base-path sys) "/branches/"
                                                   branch "/entries"))]
                       (if (.exists entries-dir)

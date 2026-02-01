@@ -9,6 +9,7 @@
   (:require [clojure.test :refer [deftest testing use-fixtures]]
             [yggdrasil.adapters.lakefs :as lfs]
             [yggdrasil.compliance :as compliance]
+            [yggdrasil.protocols]
             [clojure.java.shell :refer [sh]])
   (:import [java.io File]
            [java.net Socket]))
@@ -60,29 +61,38 @@
               proc (.start pb)]
           (reset! server-process proc)
           ;; Wait for port
-          (when (wait-for-port 8000 10000)
-            ;; Setup credentials
-            (Thread/sleep 1000)
-            (let [result (sh "curl" "-s" "-X" "POST"
-                             "http://127.0.0.1:8000/api/v1/setup_lakefs"
-                             "-H" "Content-Type: application/json"
-                             "-d" "{\"username\":\"admin\"}")]
-              (when (zero? (:exit result))
-                (let [output (:out result)
-                      access-key (second (re-find #"\"access_key_id\":\"([^\"]+)\"" output))
-                      secret-key (second (re-find #"\"secret_access_key\":\"([^\"]+)\"" output))]
-                  (when (and access-key secret-key)
-                    ;; Write lakectl config
-                    (let [config-path (str (System/getProperty "java.io.tmpdir")
-                                           "/ygg-lakefs-test.yaml")]
-                      (spit config-path
-                            (str "credentials:\n"
-                                 "  access_key_id: " access-key "\n"
-                                 "  secret_access_key: " secret-key "\n"
-                                 "server:\n"
-                                 "  endpoint_url: http://127.0.0.1:8000\n"))
-                      (reset! test-config-path config-path)
-                      true)))))))))))
+          (when (wait-for-port 8000 15000)
+            ;; Wait for server to be fully ready, then setup credentials with retry
+            (Thread/sleep 3000)
+            (loop [attempts 3]
+              (let [result (sh "curl" "-s" "-X" "POST"
+                               "http://127.0.0.1:8000/api/v1/setup_lakefs"
+                               "-H" "Content-Type: application/json"
+                               "-d" "{\"username\":\"admin\"}")]
+                (if (zero? (:exit result))
+                  (let [output (:out result)
+                        access-key (second (re-find #"\"access_key_id\":\"([^\"]+)\"" output))
+                        secret-key (second (re-find #"\"secret_access_key\":\"([^\"]+)\"" output))]
+                    (if (and access-key secret-key)
+                      ;; Write lakectl config
+                      (let [config-path (str (System/getProperty "java.io.tmpdir")
+                                             "/ygg-lakefs-test.yaml")]
+                        (spit config-path
+                              (str "credentials:\n"
+                                   "  access_key_id: " access-key "\n"
+                                   "  secret_access_key: " secret-key "\n"
+                                   "server:\n"
+                                   "  endpoint_url: http://127.0.0.1:8000\n"))
+                        (reset! test-config-path config-path)
+                        true)
+                      ;; Credentials not in response, retry
+                      (when (pos? attempts)
+                        (Thread/sleep 2000)
+                        (recur (dec attempts)))))
+                  ;; Request failed, retry
+                  (when (pos? attempts)
+                    (Thread/sleep 2000)
+                    (recur (dec attempts))))))))))))
 
 (defn- teardown-server! []
   (when-let [proc @server-process]
@@ -152,6 +162,14 @@
                      (binding [lfs/*lakectl-config* (:_config sys)]
                        (lfs/delete-entry! sys key)
                        sys))
+     :branch! (fn [sys branch]
+                (binding [lfs/*lakectl-config* (:_config sys)]
+                  (yggdrasil.protocols/branch! sys branch)
+                  sys))
+     :checkout (fn [sys branch]
+                 (binding [lfs/*lakectl-config* (:_config sys)]
+                   (assoc (yggdrasil.protocols/checkout sys branch)
+                          :_config (:_config sys))))
      :supports-concurrent? false}))
 
 ;; ============================================================

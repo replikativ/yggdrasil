@@ -217,7 +217,7 @@
 ;; System Record
 ;; ============================================================
 
-(defrecord IPFSSystem [system-name state-atom]
+(defrecord IPFSSystem [system-name state-atom current-branch]
 
   p/SystemIdentity
   (system-type [_] :ipfs)
@@ -232,9 +232,8 @@
 
   p/Snapshotable
   (snapshot-id [_]
-    (let [state @state-atom
-          branch (:current-branch state)]
-      (get-branch-head state branch)))
+    (let [state @state-atom]
+      (get-branch-head state current-branch)))
 
   (parent-ids [this]
     (let [snap-id (p/snapshot-id this)]
@@ -266,14 +265,13 @@
       (set (keys (:branches state)))))
 
   (current-branch [_]
-    (:current-branch @state-atom))
+    current-branch)
 
   (branch! [this name] (p/branch! this name nil nil))
   (branch! [this name from] (p/branch! this name from nil))
   (branch! [this name from _opts]
     (let [state @state-atom
           branch-name (keyword name)
-          current-branch (:current-branch state)
           from-branch (if (keyword? from) from current-branch)
           from-cid (if from
                      (if (keyword? from)
@@ -316,22 +314,23 @@
             ipns-name (:ipns-name branch-data)
             resolved-cid (name-resolve ipns-name)]
 
-        ;; Update state
+        ;; Update branch metadata (last-resolved-cid/at) but not current-branch
         (swap! state-atom
                (fn [s]
                  (-> s
-                     (assoc :current-branch branch-kw)
                      (assoc-in [:branches branch-kw :last-resolved-cid] resolved-cid)
                      (assoc-in [:branches branch-kw :last-resolved-at] (System/currentTimeMillis)))))
         (save-state! @state-atom))
 
-      this))
+      ;; Return NEW system with updated current-branch (value semantics)
+      ;; Use assoc to preserve any extra keys (e.g., test mock entries)
+      (assoc this :current-branch branch-kw)))
 
   (delete-branch! [this name] (p/delete-branch! this name nil))
   (delete-branch! [this name _opts]
     (let [state @state-atom
           branch-kw (keyword name)]
-      (when (= branch-kw (:current-branch state))
+      (when (= branch-kw current-branch)
         (throw (ex-info "Cannot delete current branch" {:branch name})))
 
       ;; Remove IPNS key
@@ -432,7 +431,6 @@
   (merge! [this source] (p/merge! this source nil))
   (merge! [this source opts]
     (let [state @state-atom
-          current-branch (:current-branch state)
           source-branch (keyword source)
           current-cid (get-branch-head state current-branch)
           source-cid (get-branch-head state source-branch)]
@@ -484,8 +482,7 @@
     ;; Simple polling implementation
     (let [watch-id (str (java.util.UUID/randomUUID))
           poll-interval (or (:poll-interval-ms opts) 5000)
-          state @state-atom
-          current-branch (:current-branch state)
+          watched-branch current-branch  ; Capture current branch value
           running (atom true)
 
           poll-fn (fn []
@@ -493,7 +490,7 @@
                       (Thread/sleep poll-interval)
                       (try
                         (let [state @state-atom
-                              branch-data (get-in state [:branches current-branch])
+                              branch-data (get-in state [:branches watched-branch])
                               ipns-name (:ipns-name branch-data)
                               old-cid (:last-resolved-cid branch-data)
                               new-cid (name-resolve ipns-name)]
@@ -503,12 +500,12 @@
                             (swap! state-atom
                                    (fn [s]
                                      (-> s
-                                         (assoc-in [:branches current-branch :last-resolved-cid] new-cid)
-                                         (assoc-in [:branches current-branch :last-resolved-at] (System/currentTimeMillis)))))
+                                         (assoc-in [:branches watched-branch :last-resolved-cid] new-cid)
+                                         (assoc-in [:branches watched-branch :last-resolved-at] (System/currentTimeMillis)))))
 
                            ;; Trigger callback
                             (callback {:type :commit
-                                       :branch current-branch
+                                       :branch watched-branch
                                        :snapshot-id new-cid})))
                         (catch Exception e
                           (println "Watch poll error:" (.getMessage e))))))
@@ -553,8 +550,8 @@
    (let [system-name (or (:system-name opts) "default")
          state (load-state system-name)
          state-atom (atom state)
-         branch (or (:branch opts) :main)
-         sys (->IPFSSystem system-name state-atom)]
+         ;; Use branch from opts, or from loaded state, or default to :main
+         branch (keyword (or (:branch opts) (:current-branch state) :main))]
 
      ;; Validate/create IPNS keys for all branches in state
      ;; (state may persist between runs, but keys may have been deleted)
@@ -572,15 +569,13 @@
        (when (seq branches-to-fix)
          (save-state! @state-atom)))
 
-     ;; Create initial branch if needed
-     (when-not (contains? (:branches state) branch)
-       (p/branch! sys branch))
+     ;; Create system with branch field
+     (let [sys (->IPFSSystem system-name state-atom branch)]
+       ;; Create initial branch if needed
+       (when-not (contains? (:branches state) branch)
+         (p/branch! sys branch))
 
-     ;; Set current branch
-     (swap! state-atom assoc :current-branch branch)
-     (save-state! @state-atom)
-
-     sys)))
+       sys))))
 
 (defn commit!
   "Create a commit pointing to a data root CID.
@@ -599,7 +594,7 @@
      (throw (ex-info "Commit requires :root CID in opts" {})))
 
    (let [state @(:state-atom sys)
-         current-branch (:current-branch state)
+         current-branch (:current-branch sys)
          current-cid (get-branch-head state current-branch)
          parents (if current-cid [current-cid] [])
 

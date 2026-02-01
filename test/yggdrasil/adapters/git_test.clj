@@ -20,7 +20,7 @@
 (defn- wt-path
   "Get the worktree path for the current branch of a GitSystem."
   [sys]
-  (let [branch @(:current-branch-atom sys)]
+  (let [branch (:current-branch sys)]
     (if (= branch "main")
       (:repo-path sys)
       (str (:worktrees-dir sys) "/" branch))))
