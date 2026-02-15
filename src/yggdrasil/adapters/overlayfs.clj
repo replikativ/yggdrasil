@@ -246,7 +246,7 @@
   (system-id [_] (or system-name (str "overlayfs:" workspace-path)))
   (system-type [_] :overlayfs)
   (capabilities [_]
-    (t/->Capabilities true true true true false true))
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -533,7 +533,32 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    (let [branches-dir (File. (str workspace-path "/branches"))]
+      (if (.exists branches-dir)
+        (->> (.listFiles branches-dir)
+             (filter #(.isDirectory %))
+             (keep (fn [d]
+                     (let [commit (latest-commit workspace-path (.getName d))]
+                       (:id commit))))
+             set)
+        #{})))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    (let [branches-dir (File. (str workspace-path "/branches"))]
+      (when (.exists branches-dir)
+        (doseq [branch-dir (.listFiles branches-dir)
+                :when (.isDirectory branch-dir)]
+          (let [snaps-dir (File. (str (.getPath branch-dir) "/snapshots"))]
+            (when (.exists snaps-dir)
+              (doseq [snap-id snapshot-ids]
+                (let [snap-path (str (.getPath snaps-dir) "/" snap-id)]
+                  (delete-recursive! snap-path))))))))
+    this))
 
 ;; ============================================================
 ;; Factory functions

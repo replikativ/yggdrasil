@@ -245,7 +245,7 @@
   (system-id [_] (or system-name (str "lakefs:" repo-name)))
   (system-type [_] :lakefs)
   (capabilities [_]
-    (t/->Capabilities true true true true false true))
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -460,7 +460,17 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    (let [branches-map (list-branches repo-name)]
+      (set (vals branches-map))))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this _snapshot-ids _opts]
+    ;; No-op: LakeFS manages GC server-side via retention policies
+    this))
 
 ;; ============================================================
 ;; Factory functions

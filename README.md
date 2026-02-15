@@ -30,6 +30,7 @@ pip install yggdrasil-protocols
 | 4 | `Mergeable` | Three-way merge, conflict detection |
 | 5 | `Overlayable` | Live forks with observation modes |
 | 6 | `Watchable` | State change observation (polling) |
+| 7 | `GarbageCollectable` | Coordinated cross-system GC (optional) |
 
 ### Snapshotable
 
@@ -87,19 +88,19 @@ pip install yggdrasil-protocols
 
 ### Capabilities Matrix
 
-| Adapter | Snapshot | Branch | Graph | Merge | Overlay | Watch |
-|---------|----------|--------|-------|-------|---------|-------|
-| Git | commits | branches (worktrees) | full DAG | 3-way | - | poll |
-| ZFS | snapshots | clones | linear | - | - | poll |
-| Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll |
-| IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll |
-| Iceberg | snapshots | branches | full DAG | manual | - | poll |
-| Datahike | commit-id | branch! | full DAG | merge! | - | - |
-| Scriptum | generations | COW dirs | full DAG | add-only | - | - |
-| OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll |
-| Podman | image layers | containers | full DAG | diff+apply | - | poll |
-| LakeFS | commits | branches | full DAG | 3-way | - | poll |
-| Dolt | commits | branches | full DAG | 3-way | - | poll |
+| Adapter | Snapshot | Branch | Graph | Merge | Overlay | Watch | GC |
+|---------|----------|--------|-------|-------|---------|-------|----|
+| Git | commits | branches (worktrees) | full DAG | 3-way | - | poll | yes |
+| ZFS | snapshots | clones | linear | - | - | poll | yes |
+| Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll | yes |
+| IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes |
+| Iceberg | snapshots | branches | full DAG | manual | - | poll | yes |
+| Datahike | commit-id | branch! | full DAG | merge! | - | listen | yes |
+| Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes |
+| OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes |
+| Podman | image layers | containers | full DAG | diff+apply | - | poll | yes |
+| LakeFS | commits | branches | full DAG | 3-way | - | poll | yes |
+| Dolt | commits | branches | full DAG | 3-way | - | poll | yes |
 
 ### Git Adapter
 
@@ -382,7 +383,7 @@ Container-based isolation using Podman (rootless, daemonless). Each branch is a 
 
 ### Datahike Adapter
 
-Wraps a Datahike connection, using its internal versioning system.
+Wraps a Datahike connection, using its internal versioning system. Uses `d/listen` for native commit hooks (no polling needed).
 
 ```clojure
 (require '[yggdrasil.adapters.datahike :as dh])
@@ -390,7 +391,7 @@ Wraps a Datahike connection, using its internal versioning system.
 (def sys (dh/create conn {:system-name "my-db"}))
 ```
 
-Requires Datahike on the classpath (resolved dynamically via `requiring-resolve`).
+Requires Datahike on the classpath.
 
 ### LakeFS Adapter
 
@@ -507,8 +508,8 @@ Causal ordering without synchronized clocks:
 ### Capabilities
 
 ```clojure
-(t/->Capabilities true true true false false true)
-;; snapshotable, branchable, graphable, mergeable, overlayable, watchable
+(t/->Capabilities true true true false false true true)
+;; snapshotable, branchable, graphable, mergeable, overlayable, watchable, garbage-collectable
 ```
 
 ## Composition
@@ -530,6 +531,99 @@ The `yggdrasil.compose` namespace provides multi-system coordination:
 ;; Collect current snapshot refs
 (compose/snapshot-refs [sys-a sys-b])
 ```
+
+## Coordination Layer
+
+The coordination layer provides cross-system snapshot tracking, temporal queries, and garbage collection. It sits above individual adapters and below the orchestrating runtime (e.g., Spindel).
+
+### Workspace
+
+The `yggdrasil.workspace` namespace is the primary coordination API. A workspace holds system refs, coordinates HLC timestamps, and manages the snapshot registry.
+
+```clojure
+(require '[yggdrasil.workspace :as ws])
+(require '[yggdrasil.adapters.git :as git])
+
+;; Create a workspace (in-memory registry)
+(def w (ws/create-workspace))
+
+;; Or with persistent registry (survives restarts)
+(def w (ws/create-workspace {:store-path "/var/lib/yggdrasil/registry"}))
+
+;; Add systems with auto-registration of commits
+(def git-sys (git/create "/path/to/repo" {:system-name "my-repo"}))
+(ws/manage! w git-sys)   ; installs commit hooks for auto-registration
+
+;; Coordinated multi-system commit with shared HLC
+(let [result (ws/coordinated-commit! w
+               {"my-repo"  (fn [sys] (git/commit! sys "sync point"))
+                "my-db"    (fn [sys] (dh/commit! sys))})]
+  ;; result: {:results {system-id -> RegistryEntry}
+  ;;          :errors  {system-id -> Exception}
+  ;;          :hlc     <pinned HLC>}
+  (when (seq (:errors result))
+    (println "Partial failure:" (keys (:errors result)))))
+
+;; Temporal query: world state at time T
+(let [world (ws/as-of-world w some-hlc)]
+  ;; world: {["my-repo" "main"] -> RegistryEntry
+  ;;         ["my-db" "main"]   -> RegistryEntry}
+  (doseq [[[sys-id branch] entry] world]
+    (println sys-id branch "was at" (:snapshot-id entry))))
+
+;; Hold refs to multiple branches (prevents GC)
+(ws/hold-ref! w "my-repo/:feature" feature-sys)
+(ws/release-ref! w "my-repo/:feature")  ; allows GC
+
+;; Run garbage collection
+(ws/gc! w {:grace-period-ms (* 7 24 60 60 1000)  ; 7 days
+           :dry-run? true})                        ; preview first
+
+;; Clean up
+(ws/unmanage! w "my-repo")
+(ws/close! w)
+```
+
+### Snapshot Registry
+
+The `yggdrasil.registry` namespace maintains a persistent sorted-set (PSS) index over `RegistryEntry` records, sorted by `[hlc system-id branch-name snapshot-id]`. Backed by konserve for durable, lazy-loading from disk.
+
+```clojure
+(require '[yggdrasil.registry :as reg])
+
+;; Query: all entries for a system/branch
+(reg/system-history registry "my-repo" "main" {:limit 10})
+
+;; Query: who references a snapshot?
+(reg/snapshot-refs registry "abc123")
+
+;; Query: temporal range
+(reg/entries-in-range registry from-hlc to-hlc)
+```
+
+### Garbage Collection
+
+The `yggdrasil.gc` namespace implements mark-and-sweep with a grace period:
+
+1. **Mark**: Walk all systems' branch heads to compute the reachable set
+2. **Retain**: Keep snapshots within the retention window (default 7 days)
+3. **Sweep**: Delete unreachable, expired snapshots via each adapter's native GC
+
+Adapters implement the `GarbageCollectable` protocol:
+
+```clojure
+(p/gc-roots sys)               ; => #{"snap-3" "snap-5"} branch heads
+(p/gc-sweep! sys #{"snap-1"})  ; delete unreachable snapshots
+```
+
+Cross-system safety: a snapshot referenced by *any* system is never collected, even if unreachable in another system.
+
+### Hooks
+
+The `yggdrasil.hooks` namespace provides an extension point for adapter-specific commit notification. Adapters extend the `install-commit-hook!` multimethod dispatched on `system-type`:
+
+- **Datahike**: Uses `d/listen` for immediate notification
+- **Default (Watchable)**: Falls back to `p/watch!` polling
 
 ## Consistency Model
 
@@ -576,11 +670,16 @@ clj -M:dev
 
 ```
 src/yggdrasil/
-  protocols.cljc       # Protocol definitions
-  types.cljc           # Core data types (SnapshotRef, HLC, etc.)
+  protocols.cljc       # Protocol definitions (layers 0-7)
+  types.cljc           # Core data types (SnapshotRef, HLC, Capabilities, RegistryEntry)
   watcher.clj          # Polling watcher infrastructure
-  compose.cljc         # Multi-system composition
+  compose.cljc         # Multi-system overlay lifecycle
   compliance.clj       # Protocol compliance test suite
+  workspace.clj        # Multi-system workspace with HLC coordination
+  registry.clj         # Snapshot registry (PSS index in konserve)
+  storage.clj          # IStorage for PSS B-tree nodes in konserve
+  gc.clj               # Coordinated cross-system garbage collection
+  hooks.clj            # Extension point for adapter-specific commit hooks
   adapters/
     git.clj            # Git adapter (worktree-based)
     ipfs.clj           # IPFS adapter (P2P content-addressed)
@@ -589,19 +688,23 @@ src/yggdrasil/
     btrfs.clj          # Btrfs adapter
     overlayfs.clj      # OverlayFS + Bubblewrap adapter
     podman.clj         # Podman container adapter
-    datahike.clj       # Datahike adapter
+    datahike.clj       # Datahike adapter (with native d/listen hooks)
     lakefs.clj         # LakeFS adapter (object storage)
     dolt.clj           # Dolt adapter (SQL versioning)
-test/yggdrasil/adapters/
-  git_test.clj         # Git compliance tests
-  ipfs_test.clj        # IPFS compliance tests
-  iceberg_test.clj     # Iceberg compliance tests
-  zfs_test.clj         # ZFS compliance tests
-  btrfs_test.clj       # Btrfs compliance tests
-  overlayfs_test.clj   # OverlayFS compliance tests
-  podman_test.clj      # Podman compliance tests
-  lakefs_test.clj      # LakeFS compliance tests
-  dolt_test.clj        # Dolt compliance tests
+test/yggdrasil/
+  workspace_test.clj   # Workspace coordination tests
+  registry_test.clj    # Registry index tests
+  gc_test.clj          # GC integration tests
+  adapters/
+    git_test.clj       # Git compliance tests
+    ipfs_test.clj      # IPFS compliance tests
+    iceberg_test.clj   # Iceberg compliance tests
+    zfs_test.clj       # ZFS compliance tests
+    btrfs_test.clj     # Btrfs compliance tests
+    overlayfs_test.clj # OverlayFS compliance tests
+    podman_test.clj    # Podman compliance tests
+    lakefs_test.clj    # LakeFS compliance tests
+    dolt_test.clj      # Dolt compliance tests
 ```
 
 ## License

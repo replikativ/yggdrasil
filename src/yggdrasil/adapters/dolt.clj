@@ -160,7 +160,7 @@
   (system-id [_] (or system-name (str "dolt:" repo-path)))
   (system-type [_] :dolt)
   (capabilities [_]
-    (t/->Capabilities true true true true false true))
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -356,7 +356,19 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    (let [rows (dolt-sql-values repo-path "SELECT hash FROM dolt_branches")]
+      (set (map first rows))))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    (try
+      (dolt repo-path "gc")
+      (catch Exception _))
+    this))
 
 ;; ============================================================
 ;; Factory functions

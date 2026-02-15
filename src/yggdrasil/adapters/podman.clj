@@ -198,7 +198,7 @@
   (system-id [_] system-id)
   (system-type [_] :podman)
   (capabilities [_]
-    (t/->Capabilities true true true true false true))
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -511,7 +511,32 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    (let [meta-dir (File. (str workspace-path "/metadata"))]
+      (if (.exists meta-dir)
+        (->> (.listFiles meta-dir)
+             (filter #(.isDirectory %))
+             (keep (fn [d]
+                     (let [commit (latest-commit workspace-path (.getName d))]
+                       (:id commit))))
+             set)
+        #{})))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    (let [meta-dir (File. (str workspace-path "/metadata"))]
+      (when (.exists meta-dir)
+        (doseq [branch-dir (.listFiles meta-dir)
+                :when (.isDirectory branch-dir)]
+          (let [branch (.getName branch-dir)]
+            (doseq [snap-id snapshot-ids]
+              (let [img (image-name system-id branch (str snap-id))]
+                (when (image-exists? img)
+                  (try (podman "rmi" img) (catch Exception _)))))))))
+    this))
 
 ;; ============================================================
 ;; Factory functions
