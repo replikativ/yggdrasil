@@ -10,6 +10,56 @@ Unified copy-on-write memory model protocols for heterogeneous storage systems.
 
 Yggdrasil defines a layered protocol stack that abstracts over Git, ZFS, Btrfs, OverlayFS, Podman, IPFS, Iceberg, Datahike, LakeFS, Dolt, [Proximum](https://github.com/replikativ/proximum), and [Scriptum](https://github.com/replikativ/scriptum), enabling cross-system composition with causal consistency guarantees.
 
+## Motivation
+
+Modern applications compose multiple storage systems — a Git repo for code, a database for structured data, a filesystem for artifacts, object storage for datasets. Each has its own versioning model (or none at all). When an agent or pipeline modifies several of these systems together, there is no unified way to snapshot, branch, or roll back across all of them atomically.
+
+Yggdrasil solves this by defining a common protocol stack over copy-on-write storage. Every adapter — whether it wraps Git commits, ZFS snapshots, Datahike transactions, or IPFS CIDs — speaks the same `branch!` / `commit!` / `merge!` vocabulary. A workspace coordinates them with a shared Hybrid Logical Clock (HLC), so you can query the consistent state of *all* systems at any point in time.
+
+## Quick Start
+
+A typical workflow: fork isolated branches across a Git repo and a Datahike database, do work, commit, merge back, and clean up.
+
+```clojure
+(require '[yggdrasil.protocols :as p])
+(require '[yggdrasil.workspace :as ws])
+(require '[yggdrasil.adapters.git :as git])
+(require '[yggdrasil.adapters.datahike :as dh])
+
+;; 1. Create a workspace and add systems
+(def w (ws/create-workspace))
+(def git-sys (git/create "/path/to/repo" {:system-name "my-repo"}))
+(def db-sys  (dh/create conn {:system-name "my-db"}))
+(ws/manage! w git-sys)
+(ws/manage! w db-sys)
+
+;; 2. Fork — branch both systems for isolated work
+(def child-git (-> git-sys (p/branch! :agent-42) (p/checkout :agent-42)))
+(def child-db  (-> db-sys  (p/branch! :agent-42) (p/checkout :agent-42)))
+
+;; 3. Work — write via adapter APIs or filesystem paths
+(spit (str (p/working-path child-git) "/result.edn") data)
+
+;; 4. Commit — coordinated across systems with a shared HLC
+(ws/coordinated-commit! w
+  {"my-repo" (fn [sys] (p/snapshot-id (p/commit! sys "Agent work")))
+   "my-db"   (fn [sys] (p/snapshot-id sys))})
+
+;; 5. Merge back to main
+(def git-sys (-> git-sys (p/checkout :main) (p/merge! :agent-42)))
+
+;; 6. Query the world at any wall-clock time
+(let [world (ws/as-of-time w (.getTime some-date))]
+  (let [db (p/as-of (ws/get-system w "my-db")
+                     (:snapshot-id (get world ["my-db" "main"])))]
+    (d/q '[:find ?e ?v :where [?e :attr ?v]] db)))
+
+;; 7. Clean up
+(p/delete-branch! git-sys :agent-42)
+(ws/gc! w)
+(ws/close! w)
+```
+
 ## Installation
 
 Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.replikativ/yggdrasil.svg)](https://clojars.org/org.replikativ/yggdrasil)
@@ -652,34 +702,6 @@ The `yggdrasil.hooks` namespace provides an extension point for adapter-specific
 
 - **Datahike**: Uses `d/listen` for immediate notification
 - **Default (Watchable)**: Falls back to `p/watch!` polling
-
-### Multi-System Lifecycle
-
-Runtimes like Spindel use these protocols for isolated agent execution:
-
-1. **Fork** — `p/branch!` + `p/checkout` on each managed system
-2. **Work** — read/write via `p/working-path` (filesystem adapters) or adapter API
-3. **Commit** — `p/commit!` on all `Committable` systems
-4. **Merge** — `p/merge!` back to parent branch
-5. **GC** — `ws/gc!` reclaims old snapshots across all systems
-
-```clojure
-;; Fork
-(def child-sys (-> sys (p/branch! :agent-123) (p/checkout :agent-123)))
-
-;; Work (filesystem adapters)
-(spit (str (p/working-path child-sys) "/result.edn") data)
-
-;; Commit
-(def child-sys (p/commit! child-sys "Agent work complete"))
-
-;; Merge back
-(def sys (-> sys (p/checkout :main) (p/merge! :agent-123)))
-
-;; GC old branches
-(p/delete-branch! sys :agent-123)
-(ws/gc! workspace)
-```
 
 ## Consistency Model
 
