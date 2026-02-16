@@ -30,11 +30,11 @@
    Same combination of sub-system states always yields the same ID."
   [systems]
   (let [pairs (sort-by first
-                (map (fn [[sid sys]] [sid (p/snapshot-id sys)])
-                     systems))
+                       (map (fn [[sid sys]] [sid (p/snapshot-id sys)])
+                            systems))
         content (pr-str pairs)]
     (str (java.util.UUID/nameUUIDFromBytes
-           (.getBytes content "UTF-8")))))
+          (.getBytes content "UTF-8")))))
 
 ;; ============================================================
 ;; Capability intersection
@@ -45,15 +45,15 @@
   [systems]
   (let [caps (map #(p/capabilities (val %)) systems)]
     (t/->Capabilities
-      (every? :snapshotable caps)
-      (every? :branchable caps)
-      (every? :graphable caps)
-      (every? :mergeable caps)
-      (every? :overlayable caps)
-      (every? :watchable caps)
-      (every? :garbage-collectable caps)
-      (every? :addressable caps)
-      (every? :committable caps))))
+     (every? :snapshotable caps)
+     (every? :branchable caps)
+     (every? :graphable caps)
+     (every? :mergeable caps)
+     (every? :overlayable caps)
+     (every? :watchable caps)
+     (every? :garbage-collectable caps)
+     (every? :addressable caps)
+     (every? :committable caps))))
 
 ;; ============================================================
 ;; Sub-snapshot resolution
@@ -70,10 +70,10 @@
 ;; ============================================================
 
 (defrecord CompositeSystem
-  [systems              ;; {system-id → system}
-   current-branch-name  ;; keyword — shared branch
-   composite-name       ;; string — system-id for the composite
-   history-atom]        ;; atom of {composite-snap-id → {:parent-ids #{} :timestamp long
+           [systems              ;; {system-id → system}
+            current-branch-name  ;; keyword — shared branch
+            composite-name       ;; string — system-id for the composite
+            history-atom]        ;; atom of {composite-snap-id → {:parent-ids #{} :timestamp long
                         ;;                               :sub-snapshots {sid → snap-id}}}
 
   p/SystemIdentity
@@ -94,9 +94,9 @@
     (if-let [sub-snaps (resolve-sub-snapshots history-atom snap-id)]
       ;; Known composite ID — delegate to each sub-system
       (into {}
-        (map (fn [[sid sys]]
-               [sid (p/as-of sys (get sub-snaps sid))]))
-        systems)
+            (map (fn [[sid sys]]
+                   [sid (p/as-of sys (get sub-snaps sid))]))
+            systems)
       ;; Unknown — return nil
       nil))
 
@@ -115,46 +115,46 @@
     (if (empty? systems)
       #{}
       (reduce set/intersection
-        (map (fn [[_ sys]] (p/branches sys)) systems))))
+              (map (fn [[_ sys]] (p/branches sys)) systems))))
 
   (current-branch [_] current-branch-name)
 
   (branch! [this name]
     (let [results (reduce-kv
-                    (fn [acc sid sys]
-                      (assoc acc sid (p/branch! sys name)))
-                    {}
-                    systems)]
+                   (fn [acc sid sys]
+                     (assoc acc sid (p/branch! sys name)))
+                   {}
+                   systems)]
       (assoc this :systems results)))
 
   (branch! [this name from] (p/branch! this name from nil))
   (branch! [this name from _opts]
     (let [results (reduce-kv
-                    (fn [acc sid sys]
-                      (assoc acc sid (p/branch! sys name from)))
-                    {}
-                    systems)]
+                   (fn [acc sid sys]
+                     (assoc acc sid (p/branch! sys name from)))
+                   {}
+                   systems)]
       (assoc this :systems results)))
 
   (delete-branch! [this name] (p/delete-branch! this name nil))
   (delete-branch! [this name _opts]
     (let [results (reduce-kv
-                    (fn [acc sid sys]
-                      (assoc acc sid (p/delete-branch! sys name)))
-                    {}
-                    systems)]
+                   (fn [acc sid sys]
+                     (assoc acc sid (p/delete-branch! sys name)))
+                   {}
+                   systems)]
       (assoc this :systems results)))
 
   (checkout [this name] (p/checkout this name nil))
   (checkout [this name _opts]
     (let [results (reduce-kv
-                    (fn [acc sid sys]
-                      (assoc acc sid (p/checkout sys name)))
-                    {}
-                    systems)]
+                   (fn [acc sid sys]
+                     (assoc acc sid (p/checkout sys name)))
+                   {}
+                   systems)]
       (assoc this
-        :systems results
-        :current-branch-name (keyword name))))
+             :systems results
+             :current-branch-name (keyword name))))
 
   p/Committable
   (commit! [this] (p/commit! this nil nil))
@@ -162,20 +162,20 @@
   (commit! [this message _opts]
     (let [old-snap (composite-snapshot-id systems)
           new-systems (reduce-kv
-                        (fn [acc sid sys]
-                          (if (satisfies? p/Committable sys)
-                            (assoc acc sid (p/commit! sys message))
-                            (assoc acc sid sys)))
-                        {}
-                        systems)
+                       (fn [acc sid sys]
+                         (if (satisfies? p/Committable sys)
+                           (assoc acc sid (p/commit! sys message))
+                           (assoc acc sid sys)))
+                       {}
+                       systems)
           new-snap (composite-snapshot-id new-systems)]
       (swap! history-atom assoc new-snap
              {:parent-ids #{old-snap}
               :timestamp (System/currentTimeMillis)
               :message message
               :sub-snapshots (into {}
-                               (map (fn [[sid sys]] [sid (p/snapshot-id sys)]))
-                               new-systems)})
+                                   (map (fn [[sid sys]] [sid (p/snapshot-id sys)]))
+                                   new-systems)})
       (assoc this :systems new-systems)))
 
   p/Graphable
@@ -235,16 +235,16 @@
   (commit-graph [_ _opts]
     (let [hist @history-atom]
       {:nodes (into {}
-                (map (fn [[id entry]]
-                       [id {:parent-ids (:parent-ids entry)
-                            :meta {:timestamp (:timestamp entry)
-                                   :message (:message entry)}}]))
-                hist)
+                    (map (fn [[id entry]]
+                           [id {:parent-ids (:parent-ids entry)
+                                :meta {:timestamp (:timestamp entry)
+                                       :message (:message entry)}}]))
+                    hist)
        :branches {current-branch-name (composite-snapshot-id systems)}
        :roots (set (filter
-                     (fn [id]
-                       (empty? (get-in hist [id :parent-ids] #{})))
-                     (keys hist)))}))
+                    (fn [id]
+                      (empty? (get-in hist [id :parent-ids] #{})))
+                    (keys hist)))}))
 
   (commit-info [this snap-id] (p/commit-info this snap-id nil))
   (commit-info [_ snap-id _opts]
@@ -258,10 +258,10 @@
   (merge! [this source] (p/merge! this source {}))
   (merge! [this source opts]
     (let [new-systems (reduce-kv
-                        (fn [acc sid sys]
-                          (assoc acc sid (p/merge! sys source opts)))
-                        {}
-                        systems)]
+                       (fn [acc sid sys]
+                         (assoc acc sid (p/merge! sys source opts)))
+                       {}
+                       systems)]
       (assoc this :systems new-systems)))
 
   (conflicts [this a b] (p/conflicts this a b nil))
@@ -275,23 +275,23 @@
     ;; Per-system diff requires resolving composite snap-ids to sub-system snap-ids.
     ;; Callers should use sub-system diffs directly for detailed results.
     (into {}
-      (map (fn [[sid sys]] [sid {:diff :composite-level}]))
-      systems))
+          (map (fn [[sid sys]] [sid {:diff :composite-level}]))
+          systems))
 
   p/GarbageCollectable
   (gc-roots [_]
     (if (empty? systems)
       #{}
       (reduce set/union
-        (map (fn [[_ sys]] (p/gc-roots sys)) systems))))
+              (map (fn [[_ sys]] (p/gc-roots sys)) systems))))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
   (gc-sweep! [this snapshot-ids _opts]
     (let [new-systems (reduce-kv
-                        (fn [acc sid sys]
-                          (assoc acc sid (p/gc-sweep! sys snapshot-ids)))
-                        {}
-                        systems)]
+                       (fn [acc sid sys]
+                         (assoc acc sid (p/gc-sweep! sys snapshot-ids)))
+                       {}
+                       systems)]
       (assoc this :systems new-systems))))
 
 ;; ============================================================
@@ -325,18 +325,18 @@
                                                                        (vals sys-map)))})))
                             first-branch))]
     (let [sys (->CompositeSystem
-                sys-map
-                resolved-branch
-                (or name (str "pullback:" (str/join "×" (sort (keys sys-map)))))
-                (atom {}))]
+               sys-map
+               resolved-branch
+               (or name (str "pullback:" (str/join "×" (sort (keys sys-map)))))
+               (atom {}))]
       ;; Record initial composite snapshot
       (let [snap (p/snapshot-id sys)]
         (swap! (:history-atom sys) assoc snap
                {:parent-ids #{}
                 :timestamp (System/currentTimeMillis)
                 :sub-snapshots (into {}
-                                 (map (fn [[sid s]] [sid (p/snapshot-id s)]))
-                                 sys-map)}))
+                                     (map (fn [[sid s]] [sid (p/snapshot-id s)]))
+                                     sys-map)}))
       sys)))
 
 (defn composite
@@ -353,17 +353,17 @@
   [systems-seq & {:keys [name branch] :or {branch :main}}]
   (let [sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
         sys (->CompositeSystem
-              sys-map
-              branch
-              (or name (str "composite:" (str/join "+" (sort (keys sys-map)))))
-              (atom {}))]
+             sys-map
+             branch
+             (or name (str "composite:" (str/join "+" (sort (keys sys-map)))))
+             (atom {}))]
     (let [snap (p/snapshot-id sys)]
       (swap! (:history-atom sys) assoc snap
              {:parent-ids #{}
               :timestamp (System/currentTimeMillis)
               :sub-snapshots (into {}
-                               (map (fn [[sid s]] [sid (p/snapshot-id s)]))
-                               sys-map)}))
+                                   (map (fn [[sid s]] [sid (p/snapshot-id s)]))
+                                   sys-map)}))
     sys))
 
 ;; ============================================================
