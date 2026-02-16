@@ -514,13 +514,14 @@ Universal reference to a point-in-time snapshot:
 
 ### HLC (Hybrid Logical Clock)
 
-Causal ordering without synchronized clocks:
+Each HLC has a `physical` (millis since epoch) and a `logical` counter. The physical component tracks `max(wall-clock, previous-physical)` — it never goes backward. When multiple events occur within the same millisecond, the logical counter increments to maintain strict ordering. This gives causal ordering without synchronized clocks across heterogeneous systems.
 
 ```clojure
 (t/hlc-now)                        ; create from current time
 (t/hlc-tick hlc)                   ; advance for local event
 (t/hlc-receive local-hlc remote)   ; update on message receipt
 (t/hlc-compare a b)                ; ordering comparison
+(t/->HLC-ceil millis)              ; upper bound for wall-clock queries
 ```
 
 ### Capabilities
@@ -583,12 +584,20 @@ The `yggdrasil.workspace` namespace is the primary coordination API. A workspace
   (when (seq (:errors result))
     (println "Partial failure:" (keys (:errors result)))))
 
-;; Temporal query: world state at time T
+;; Temporal query: world state at time T (by HLC)
 (let [world (ws/as-of-world w some-hlc)]
   ;; world: {["my-repo" "main"] -> RegistryEntry
   ;;         ["my-db" "main"]   -> RegistryEntry}
   (doseq [[[sys-id branch] entry] world]
     (println sys-id branch "was at" (:snapshot-id entry))))
+
+;; Temporal query: world state at a wall-clock time
+(let [world (ws/as-of-time w (.getTime some-date))]
+  ;; Joint query: get Datahike db at the same point as a Git commit
+  (let [db-entry (get world ["my-db" "main"])
+        db       (p/as-of (ws/get-system w "my-db")
+                           (:snapshot-id db-entry))]
+    (d/q '[:find ?e ?v :where [?e :attr ?v]] db)))
 
 ;; Hold refs to multiple branches (prevents GC)
 (ws/hold-ref! w "my-repo/:feature" feature-sys)

@@ -41,6 +41,13 @@
       (->HLC now 0)
       (->HLC (:physical hlc) (inc (:logical hlc))))))
 
+(defn ->HLC-ceil
+  "Create an HLC upper bound from a physical timestamp (millis since epoch).
+   Captures all events at or before this wall-clock time, including those
+   with logical counter > 0 within the same millisecond."
+  [physical-ms]
+  (->HLC physical-ms Integer/MAX_VALUE))
+
 (defn hlc-receive
   "Update HLC on receiving message with remote HLC."
   [local-hlc remote-hlc]

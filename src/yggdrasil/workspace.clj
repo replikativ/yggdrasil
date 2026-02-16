@@ -345,6 +345,13 @@
   [workspace hlc]
   (reg/as-of (:registry workspace) hlc))
 
+(defn as-of-time
+  "Query world state at a wall-clock time (millis since epoch).
+   Uses HLC-ceil to capture all events at or before that physical time,
+   including logical ticks within the same millisecond."
+  [workspace physical-ms]
+  (reg/as-of (:registry workspace) (t/->HLC-ceil physical-ms)))
+
 ;; ============================================================
 ;; Registry sync — populate from existing system state
 ;; ============================================================
