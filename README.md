@@ -86,6 +86,22 @@ pip install yggdrasil-protocols
   (p/unwatch! sys watch-id))
 ```
 
+### Addressable
+
+```clojure
+(require '[yggdrasil.protocols :as p])
+
+(p/working-path sys)  ; => "/path/to/repo-worktrees/feature"
+```
+
+### Committable
+
+```clojure
+(p/commit! sys)                              ; commit with no message
+(p/commit! sys "Add feature X")              ; with message
+(p/commit! sys "IPFS snapshot" {:root "Qm…"}) ; adapter-specific opts
+```
+
 ## Adapters
 
 ### Capabilities Matrix
@@ -138,12 +154,12 @@ P2P version control with content-addressed commits on IPFS. Uses IPNS for branch
 (shell "ipfs add -r dbpedia-jan/")  ; => QmXxx...
 
 ;; Yggdrasil tracks version
-(ipfs/commit! sys "DBpedia January 2024" {:root "QmXxx..."})
+(p/commit! sys "DBpedia January 2024" {:root "QmXxx..."})
 
 ;; Branch and merge
 (p/branch! sys :experimental)
 (p/checkout sys :experimental)
-(ipfs/commit! sys "Experimental data" {:root "QmYyy..."})
+(p/commit! sys "Experimental data" {:root "QmYyy..."})
 (p/checkout sys :main)
 (p/merge! sys :experimental {:root "QmMerged..." :message "Merge experimental"})
 
@@ -185,13 +201,13 @@ Git-like version control for data lakes on object storage (S3, HDFS, etc.). Trac
 (.write (.format df "iceberg") "db.table")
 
 ;; Yggdrasil tracks snapshots
-(ice/commit! sys "Initial data load")
+(p/commit! sys "Initial data load")
 
 ;; Branch for experimental schema changes
 (p/branch! sys :schema-v2)
 (p/checkout sys :schema-v2)
 ;; ... modify table schema via Spark ...
-(ice/commit! sys "Add new columns")
+(p/commit! sys "Add new columns")
 
 ;; Merge schema changes back
 (p/checkout sys :main)
@@ -273,7 +289,7 @@ True COW filesystem branching using Btrfs subvolumes. Lower memory overhead than
 ;; Write/read files
 (btrfs/write-file! sys "hello" "world")
 (btrfs/read-file sys "hello")  ; => "world"
-(btrfs/commit! sys "First commit")
+(p/commit! sys "First commit")
 
 ;; Cleanup
 (btrfs/destroy! sys)
@@ -339,7 +355,7 @@ Lightweight COW filesystem branching with optional process isolation via bubblew
 ;; Write/read files (overlayfs semantics: upper overrides base)
 (ofs/write-file! sys "entries/hello" "world")
 (ofs/read-file sys "entries/hello")  ; => "world"
-(ofs/commit! sys "First commit")
+(p/commit! sys "First commit")
 
 ;; Execute commands in bubblewrap sandbox
 (ofs/exec! sys ["ls" "/entries"])  ; network-isolated by default
@@ -367,7 +383,7 @@ Container-based isolation using Podman (rootless, daemonless). Each branch is a 
 ;; Write/read files inside container
 (pm/write-file! sys "entries/hello" "world")
 (pm/read-file sys "entries/hello")  ; => "world"
-(pm/commit! sys "First commit")
+(p/commit! sys "First commit")
 
 ;; Execute commands inside container
 (pm/exec! sys "ls /entries")
@@ -411,7 +427,7 @@ Git-like versioning for object storage (S3, GCS, Azure). Each branch is a separa
 ;; Write/read entries
 (lfs/write-entry! sys "key" "value")
 (lfs/read-entry sys "key")  ; => "value"
-(lfs/commit! sys "First commit")
+(p/commit! sys "First commit")
 
 ;; Cleanup
 (lfs/destroy! sys)
@@ -436,7 +452,7 @@ Git-like versioning for SQL databases. Each branch is a separate database state 
 ;; Write/read entries via SQL
 (dolt/write-entry! sys "key" "value")
 (dolt/read-entry sys "key")  ; => "value"
-(dolt/commit! sys "First commit")
+(p/commit! sys "First commit")
 
 ;; Cleanup
 (dolt/destroy! sys)
@@ -545,7 +561,7 @@ The `yggdrasil.workspace` namespace is the primary coordination API. A workspace
 
 ```clojure
 (require '[yggdrasil.workspace :as ws])
-(require '[yggdrasil.adapters.git :as git])
+(require '[yggdrasil.protocols :as p])
 
 ;; Create a workspace (in-memory registry)
 (def w (ws/create-workspace))
@@ -559,8 +575,8 @@ The `yggdrasil.workspace` namespace is the primary coordination API. A workspace
 
 ;; Coordinated multi-system commit with shared HLC
 (let [result (ws/coordinated-commit! w
-               {"my-repo"  (fn [sys] (git/commit! sys "sync point"))
-                "my-db"    (fn [sys] (dh/commit! sys))})]
+               {"my-repo"  (fn [sys] (p/snapshot-id (p/commit! sys "sync point")))
+                "my-db"    (fn [sys] (p/snapshot-id sys))})]
   ;; result: {:results {system-id -> RegistryEntry}
   ;;          :errors  {system-id -> Exception}
   ;;          :hlc     <pinned HLC>}
@@ -628,6 +644,34 @@ The `yggdrasil.hooks` namespace provides an extension point for adapter-specific
 - **Datahike**: Uses `d/listen` for immediate notification
 - **Default (Watchable)**: Falls back to `p/watch!` polling
 
+### Multi-System Lifecycle
+
+Runtimes like Spindel use these protocols for isolated agent execution:
+
+1. **Fork** — `p/branch!` + `p/checkout` on each managed system
+2. **Work** — read/write via `p/working-path` (filesystem adapters) or adapter API
+3. **Commit** — `p/commit!` on all `Committable` systems
+4. **Merge** — `p/merge!` back to parent branch
+5. **GC** — `ws/gc!` reclaims old snapshots across all systems
+
+```clojure
+;; Fork
+(def child-sys (-> sys (p/branch! :agent-123) (p/checkout :agent-123)))
+
+;; Work (filesystem adapters)
+(spit (str (p/working-path child-sys) "/result.edn") data)
+
+;; Commit
+(def child-sys (p/commit! child-sys "Agent work complete"))
+
+;; Merge back
+(def sys (-> sys (p/checkout :main) (p/merge! :agent-123)))
+
+;; GC old branches
+(p/delete-branch! sys :agent-123)
+(ws/gc! workspace)
+```
+
 ## Consistency Model
 
 Yggdrasil provides **Parallel Snapshot Isolation (PSI)** semantics across all adapters:
@@ -673,7 +717,7 @@ clj -M:dev
 
 ```
 src/yggdrasil/
-  protocols.cljc       # Protocol definitions (layers 0-7)
+  protocols.cljc       # Protocol definitions (layers 0-7 + Addressable, Committable)
   types.cljc           # Core data types (SnapshotRef, HLC, Capabilities, RegistryEntry)
   watcher.clj          # Polling watcher infrastructure
   compose.cljc         # Multi-system overlay lifecycle
