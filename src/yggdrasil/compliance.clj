@@ -681,6 +681,55 @@
           (finally (close! @sys-atom)))))))
 
 ;; ============================================================
+;; Layer 7: GarbageCollectable tests
+;; ============================================================
+
+(defn- gc-capable?
+  "Check if the system implements GarbageCollectable."
+  [{:keys [create-system close!]}]
+  (let [sys (create-system)]
+    (try
+      (satisfies? p/GarbageCollectable sys)
+      (finally (close! sys)))))
+
+(defn test-gc-roots [{:keys [create-system mutate commit close!] :as fix}]
+  (when (gc-capable? fix)
+    (testing "gc-roots returns set of live snapshot-ids"
+      (let [sys (create-system)]
+        (try
+          (let [sys (-> sys mutate (commit "first commit"))
+                roots (p/gc-roots sys)]
+            (is (set? roots) "gc-roots should return a set")
+            (is (contains? roots (p/snapshot-id sys))
+                "gc-roots should include the current branch head"))
+          (finally (close! sys)))))))
+
+(defn test-gc-roots-multi-branch [{:keys [create-system mutate commit close!] :as fix}]
+  (when (and (gc-capable? fix) (has-capability? fix :branchable))
+    (testing "gc-roots includes heads from all branches"
+      (let [sys (create-system)]
+        (try
+          (let [sys (-> sys mutate (commit "base"))
+                sys (p/branch! sys :feature)
+                sys (-> sys (p/checkout :feature) mutate (commit "feature commit"))
+                feat-head (p/snapshot-id sys)
+                sys (p/checkout sys :main)
+                roots (p/gc-roots sys)]
+            (is (>= (count roots) 2)
+                "gc-roots should include heads from both branches"))
+          (finally (close! sys)))))))
+
+(defn test-gc-sweep [{:keys [create-system mutate commit close!] :as fix}]
+  (when (gc-capable? fix)
+    (testing "gc-sweep! returns new system"
+      (let [sys (create-system)]
+        (try
+          (let [sys (-> sys mutate (commit "commit"))
+                result (p/gc-sweep! sys #{"nonexistent-id"})]
+            (is (some? result) "gc-sweep! should return a system"))
+          (finally (close! sys)))))))
+
+;; ============================================================
 ;; Full test suite
 ;; ============================================================
 
@@ -707,6 +756,9 @@
    :mergeable [test-merge
                test-merge-parent-ids
                test-conflicts-empty-for-compatible]
+   :garbage-collectable [test-gc-roots
+                         test-gc-roots-multi-branch
+                         test-gc-sweep]
    :concurrent [test-concurrent-commits
                 test-concurrent-branch-creation
                 test-concurrent-readers]

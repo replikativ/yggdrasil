@@ -25,6 +25,7 @@
      (p/checkout sys :main)
      (p/merge! sys :feature {:root \"QmMerged...\" :message \"Merge feature\"})"
   (:require [yggdrasil.protocols :as p]
+            [yggdrasil.types :as t]
             [clojure.java.shell :refer [sh]]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -223,12 +224,7 @@
   (system-type [_] :ipfs)
   (system-id [_] system-name)
   (capabilities [_]
-    {:snapshotable true
-     :branchable true
-     :graphable true
-     :mergeable true
-     :overlayable false
-     :watchable true})
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -475,6 +471,27 @@
   (diff [_ a b _opts]
     ;; Placeholder: could use ipfs dag diff in future
     {:a a :b b :note "IPFS dag diff not yet implemented"})
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    ;; All branch head CIDs are GC roots
+    (let [state @state-atom]
+      (->> (:branches state)
+           (map (fn [[_ branch-data]] (:last-resolved-cid branch-data)))
+           (remove nil?)
+           set)))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    ;; Unpin CIDs and run repo GC to reclaim storage
+    (doseq [cid snapshot-ids]
+      (try
+        (ipfs "pin" "rm" (str cid))
+        (catch Exception _)))
+    (try
+      (ipfs "repo" "gc")
+      (catch Exception _))
+    this)
 
   p/Watchable
   (watch! [this callback] (p/watch! this callback nil))

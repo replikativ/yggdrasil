@@ -10,13 +10,14 @@
         (checkout :feature)
         ...)
 
-  Six layers, each optional:
-    1. Snapshotable - point-in-time immutable snapshots
-    2. Branchable   - named references (value-semantic)
-    3. Graphable    - history/DAG traversal
-    4. Mergeable    - combine lineages (value-semantic)
-    5. Overlayable  - live fork with observation modes
-    6. Watchable    - state change observation"
+  Seven layers, each optional:
+    1. Snapshotable        - point-in-time immutable snapshots
+    2. Branchable          - named references (value-semantic)
+    3. Graphable           - history/DAG traversal
+    4. Mergeable           - combine lineages (value-semantic)
+    5. Overlayable         - live fork with observation modes
+    6. Watchable           - state change observation
+    7. GarbageCollectable  - coordinated cross-system GC"
   (:refer-clojure :exclude [ancestors]))
 
 ;; ============================================================
@@ -185,6 +186,28 @@
 
   (unwatch! [this watch-id] [this watch-id opts]
     "Stop watching. Removes callback and cleans up if last watcher.
+     opts: {:sync? true} — when false, returns channel/promise."))
+
+;; ============================================================
+;; Layer 7: GarbageCollectable (optional, coordinated GC)
+;; ============================================================
+
+(defprotocol GarbageCollectable
+  "Coordinated garbage collection support. Systems implement this
+   to participate in cross-system GC via the registry.
+
+   The GC coordinator calls gc-roots to discover live references,
+   then gc-sweep! to delete unreachable snapshots. Each system
+   performs deletion using its native mechanism."
+
+  (gc-roots [this]
+    "Return set of snapshot-ids that are live roots (branch heads, etc.).
+     These snapshots and their ancestors will not be collected.")
+
+  (gc-sweep! [this snapshot-ids] [this snapshot-ids opts]
+    "Delete the given snapshots from the system's native storage.
+     Only deletes snapshots that are safe to remove per the system's logic.
+     Returns new system with snapshots removed.
      opts: {:sync? true} — when false, returns channel/promise."))
 
 ;; ============================================================

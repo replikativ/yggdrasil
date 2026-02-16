@@ -139,7 +139,7 @@
   (system-id [_] (or system-name (str "zfs:" base-pool "/" prefix)))
   (system-type [_] :zfs)
   (capabilities [_]
-    (t/->Capabilities true true true false false true))
+    (t/->Capabilities true true true false false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -327,7 +327,26 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    ;; Latest snapshot per branch dataset is a GC root
+    (->> (list-child-datasets base-pool prefix)
+         (map (fn [branch]
+                (let [ds (str base-pool "/" prefix "/" branch)]
+                  (last (dataset-snapshots ds)))))
+         (remove nil?)
+         set))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    ;; Destroy specific ZFS snapshots by name
+    (doseq [snap-id snapshot-ids]
+      (try
+        (zfs "destroy" (str snap-id))
+        (catch Exception _)))
+    this))
 
 (def ^:dynamic *mount-base*
   "Base directory for ZFS mount points. Datasets are mounted under

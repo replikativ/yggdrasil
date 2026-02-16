@@ -55,6 +55,13 @@
    Set to 0 to disable pruning. Default 50."
   50)
 
+(def ^:dynamic *prune-check-fn*
+  "When set, called with snapshot-id before pruning.
+   Return false to prevent pruning (snapshot is referenced externally).
+   Signature: (fn [snapshot-id] -> boolean)
+   The workspace binds this to a registry-aware check."
+  nil)
+
 ;; ============================================================
 ;; CLI helpers
 ;; ============================================================
@@ -172,7 +179,8 @@
 
 (defn- prune-snapshots!
   "Delete oldest snapshot subvolumes when count exceeds max.
-   Keeps commit entries in EDN for history tracking."
+   Keeps commit entries in EDN for history tracking.
+   When *prune-check-fn* is bound, consults it before each deletion."
   [base-path branch-name max-snaps]
   (when (pos? max-snaps)
     (let [commits (read-commits base-path branch-name)
@@ -180,9 +188,14 @@
       (when (> (count commits) max-snaps)
         (let [to-prune (take (- (count commits) max-snaps) commits)]
           (doseq [c to-prune]
-            (let [snap-path (str snap-dir "/" (:id c))]
-              (try (delete-subvolume! snap-path)
-                   (catch Exception _)))))))))
+            (let [snap-id (:id c)
+                  prunable? (if *prune-check-fn*
+                              (*prune-check-fn* snap-id)
+                              true)]
+              (when prunable?
+                (let [snap-path (str snap-dir "/" snap-id)]
+                  (try (delete-subvolume! snap-path)
+                       (catch Exception _)))))))))))
 
 ;; ============================================================
 ;; Lock helpers
@@ -251,7 +264,7 @@
   (system-id [_] (or system-name (str "btrfs:" base-path)))
   (system-type [_] :btrfs)
   (capabilities [_]
-    (t/->Capabilities true true true true false true))
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -554,7 +567,36 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    ;; All branch heads are GC roots
+    (let [dir (File. (str base-path "/branches"))]
+      (if (.exists dir)
+        (->> (.listFiles dir)
+             (filter #(.isDirectory %))
+             (map #(.getName %))
+             (map #(:id (latest-commit base-path %)))
+             (remove nil?)
+             set)
+        #{})))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    ;; Delete snapshot subvolumes for the given IDs across all branches
+    (let [all-branches (->> (File. (str base-path "/branches"))
+                            (.listFiles)
+                            (filter #(.isDirectory %))
+                            (map #(.getName %)))]
+      (doseq [branch all-branches]
+        (let [snap-dir (snapshots-path base-path branch)]
+          (doseq [snap-id snapshot-ids]
+            (let [snap-path (str snap-dir "/" snap-id)]
+              (when (subvolume-exists? snap-path)
+                (try (delete-subvolume! snap-path)
+                     (catch Exception _))))))))
+    this))
 
 ;; ============================================================
 ;; Factory functions

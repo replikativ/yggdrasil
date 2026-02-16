@@ -60,7 +60,10 @@
 
 (defn snapshot-refs
   "Collect current SnapshotRefs from multiple systems.
-   Useful for recording a cross-system checkpoint."
+   Useful for recording a cross-system checkpoint.
+
+   For registry integration, use workspace/manage! or
+   workspace/coordinated-commit! instead."
   [systems]
   (into {}
         (map (fn [sys]

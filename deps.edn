@@ -1,7 +1,10 @@
 {:paths ["src"]
 
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
-        cheshire/cheshire {:mvn/version "5.11.0"}}
+        cheshire/cheshire {:mvn/version "5.11.0"}
+        org.replikativ/konserve {:mvn/version "0.9.345"}
+        org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
+        org.clojure/core.async {:mvn/version "1.6.681"}}
 
  :aliases
  {:test {:extra-paths ["test"]

@@ -71,12 +71,13 @@
 ;; ============================================================
 
 (defrecord Capabilities
-           [snapshotable    ; Boolean
-            branchable      ; Boolean
-            graphable       ; Boolean
-            mergeable       ; Boolean
-            overlayable     ; Boolean
-            watchable])     ; Boolean
+           [snapshotable         ; Boolean
+            branchable           ; Boolean
+            graphable            ; Boolean
+            mergeable            ; Boolean
+            overlayable          ; Boolean
+            watchable            ; Boolean
+            garbage-collectable]) ; Boolean
 
 ;; ============================================================
 ;; Conflict descriptor
@@ -87,6 +88,19 @@
             base            ; value in common ancestor
             ours            ; value in local branch
             theirs])        ; value in remote branch
+
+;; ============================================================
+;; Registry entry - cross-system snapshot tracking
+;; ============================================================
+
+(defrecord RegistryEntry
+           [snapshot-id     ; String - native ID from the system
+            system-id       ; String - p/system-id
+            branch-name     ; String - branch name
+            hlc             ; HLC - causal timestamp
+            content-hash    ; String? - optional dedup hash
+            parent-ids      ; #{String} - parent snapshot IDs
+            metadata])      ; Map - message, author, etc.
 
 ;; ============================================================
 ;; JSON serialization

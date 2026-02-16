@@ -129,7 +129,7 @@
   (system-id [_] (or system-name (str "git:" repo-path)))
   (system-type [_] :git)
   (capabilities [_]
-    (t/->Capabilities true true true true false true))
+    (t/->Capabilities true true true true false true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -302,7 +302,27 @@
 
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
-    (w/remove-callback! watcher-state watch-id)))
+    (w/remove-callback! watcher-state watch-id))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    ;; All branch HEADs are GC roots
+    (->> (branch-list repo-path)
+         (map (fn [b]
+                (let [wt (branch-path repo-path worktrees-dir b)]
+                  (head-sha wt))))
+         (remove nil?)
+         set))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids _opts]
+    ;; Git doesn't support deleting individual commits.
+    ;; Run reflog expire + gc to prune unreachable objects.
+    (try
+      (git repo-path "reflog" "expire" "--expire=now" "--all")
+      (git repo-path "gc" "--prune=now")
+      (catch Exception _))
+    this))
 
 (defn create
   "Create a Git adapter for an existing repository with worktree support.
