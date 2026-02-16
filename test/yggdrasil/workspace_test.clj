@@ -224,8 +224,8 @@
     (let [w (ws/create-workspace)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"System not found"
                             (ws/commit-with-hlc! w "nonexistent"
-                                                  (t/hlc-now)
-                                                  identity)))
+                                                 (t/hlc-now)
+                                                 identity)))
       (ws/close! w))))
 
 ;; ============================================================
@@ -307,7 +307,7 @@
         (is (some? (:hlc result)))
         ;; Git entry should be in registry
         (is (seq (reg/snapshot-refs (:registry w)
-                                   (:snapshot-id (get (:results result) "git:repo1"))))))
+                                    (:snapshot-id (get (:results result) "git:repo1"))))))
 
       (ws/close! w))))
 
@@ -424,7 +424,7 @@
 
 (defn- temp-dir []
   (str (Files/createTempDirectory "yggdrasil-ws-test-"
-                                   (make-array FileAttribute 0))))
+                                  (make-array FileAttribute 0))))
 
 (defn- delete-dir-recursive [path]
   (let [dir (java.io.File. path)]

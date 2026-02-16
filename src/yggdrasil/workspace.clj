@@ -375,7 +375,7 @@
             (let [existing (reg/snapshot-refs (:registry workspace) (str snap-id))]
               ;; Only register if not already tracked
               (when-not (some #(and (= (:system-id %) system-id)
-                                   (= (:branch-name %) branch-name))
+                                    (= (:branch-name %) branch-name))
                               existing)
                 (let [meta (when (satisfies? p/Snapshotable checked-out)
                              (p/snapshot-meta checked-out snap-id))

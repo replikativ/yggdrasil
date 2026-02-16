@@ -63,8 +63,8 @@
   (testing "register-batch adds multiple entries"
     (let [r (reg/create-registry)
           entries (mapv #(make-entry (str "snap-" %)
-                                    "sys-1" "main"
-                                    (* % 1000))
+                                     "sys-1" "main"
+                                     (* % 1000))
                         (range 1 6))]
       (reg/register-batch! r entries)
       (is (= 5 (reg/entry-count r)))
@@ -119,8 +119,8 @@
   (testing "entries-in-range returns entries within HLC range"
     (let [r (reg/create-registry)
           entries (mapv #(make-entry (str "snap-" %)
-                                    "sys-1" "main"
-                                    (* % 1000))
+                                     "sys-1" "main"
+                                     (* % 1000))
                         (range 1 11))]
       (reg/register-batch! r entries)
 
@@ -161,8 +161,8 @@
   (testing "system-history respects :limit option"
     (let [r (reg/create-registry)
           entries (mapv #(make-entry (str "snap-" %)
-                                    "git:repo1" "main"
-                                    (* % 1000))
+                                     "git:repo1" "main"
+                                     (* % 1000))
                         (range 1 11))]
       (reg/register-batch! r entries)
 
@@ -232,9 +232,9 @@
   (testing "all three indices contain the same entries"
     (let [r (reg/create-registry)
           entries (mapv #(make-entry (str "snap-" %)
-                                    (str "sys-" (mod % 3))
-                                    (if (even? %) "main" "feature")
-                                    (* % 1000))
+                                     (str "sys-" (mod % 3))
+                                     (if (even? %) "main" "feature")
+                                     (* % 1000))
                         (range 1 21))]
       (reg/register-batch! r entries)
 
@@ -407,9 +407,9 @@
     (with-temp-store
       (fn [path]
         (let [entries (mapv #(make-entry (str "snap-" %)
-                                        (str "sys-" (mod % 5))
-                                        (nth ["main" "dev" "staging"] (mod % 3))
-                                        (* % 100))
+                                         (str "sys-" (mod % 5))
+                                         (nth ["main" "dev" "staging"] (mod % 3))
+                                         (* % 100))
                             (range 1 1001))]
           ;; Create and persist
           (let [r (reg/create-registry {:store-path path})]

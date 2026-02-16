@@ -121,7 +121,7 @@
       ;; snap-3 is the head (reachable), snap-1 and snap-2 are old
       (let [reachable #{"snap-2" "snap-3"}
             candidates (gc/gc-candidates r reachable
-                                          (* 7 24 60 60 1000))]
+                                         (* 7 24 60 60 1000))]
         ;; Only snap-1 should be a candidate (old + unreachable)
         (is (= 1 (count candidates)))
         (is (= "snap-1" (:snapshot-id (first candidates)))))
@@ -251,7 +251,7 @@
 
 (defn- temp-dir []
   (str (Files/createTempDirectory "yggdrasil-gc-e2e-"
-                                   (make-array FileAttribute 0))))
+                                  (make-array FileAttribute 0))))
 
 (defn- delete-dir-recursive [path]
   (let [dir (java.io.File. path)]

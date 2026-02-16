@@ -43,11 +43,11 @@
   (fn [a b]
     (let [c (hlc-cmp (:hlc a) (:hlc b))]
       (if-not (zero? c) c
-        (let [c (safe-compare (:system-id a) (:system-id b))]
-          (if-not (zero? c) c
-            (let [c (safe-compare (:branch-name a) (:branch-name b))]
-              (if-not (zero? c) c
-                (safe-compare (:snapshot-id a) (:snapshot-id b))))))))))
+              (let [c (safe-compare (:system-id a) (:system-id b))]
+                (if-not (zero? c) c
+                        (let [c (safe-compare (:branch-name a) (:branch-name b))]
+                          (if-not (zero? c) c
+                                  (safe-compare (:snapshot-id a) (:snapshot-id b))))))))))
 
 ;; ============================================================
 ;; Probe entries for range queries
@@ -235,7 +235,7 @@
        (if roots
          ;; Restore from existing root
          (let [idx (pss/restore-by tsbs-comparator (:tsbs roots) storage
-                                    {:branching-factor 64})]
+                                   {:branching-factor 64})]
            (->Registry (atom idx) kv-store storage (atom false)))
          ;; Fresh registry with storage
          (let [idx (build-index tsbs-comparator [] storage)]
