@@ -264,7 +264,7 @@
   (system-id [_] (or system-name (str "btrfs:" base-path)))
   (system-type [_] :btrfs)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -568,6 +568,36 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Addressable
+  (working-path [_]
+    (branch-path base-path current-branch))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (with-branch-lock* branch-locks current-branch
+      (fn []
+        (let [branch current-branch
+              commit-id (str (UUID/randomUUID))
+              commits (read-commits base-path branch)
+              parent-ids (if-let [prev (last commits)]
+                           #{(:id prev)}
+                           #{})
+              commit {:id commit-id
+                      :parent-ids parent-ids
+                      :message (or message "")
+                      :timestamp (str (Instant/now))
+                      :branch branch}
+              branch-subvol (branch-path base-path branch)
+              snap-dir (snapshots-path base-path branch)
+              snap-path (str snap-dir "/" commit-id)]
+          (write-commits! base-path branch (conj commits commit))
+          (ensure-dirs! snap-dir)
+          (btrfs "subvolume" "snapshot" "-r" branch-subvol snap-path)
+          (prune-snapshots! base-path branch (or max-snapshots *max-snapshots*))
+          this))))
 
   p/GarbageCollectable
   (gc-roots [_]

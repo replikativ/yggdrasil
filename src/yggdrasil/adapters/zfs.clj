@@ -139,7 +139,7 @@
   (system-id [_] (or system-name (str "zfs:" base-pool "/" prefix)))
   (system-type [_] :zfs)
   (capabilities [_]
-    (t/->Capabilities true true true false false true true))
+    (t/->Capabilities true true true false false true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -328,6 +328,26 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Addressable
+  (working-path [_]
+    (dataset-mount-point (str base-pool "/" prefix "/" current-branch)))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (with-branch-lock* branch-locks current-branch
+      (fn []
+        (let [ds (str base-pool "/" prefix "/" current-branch)
+              snap-name (str (java.util.UUID/randomUUID))
+              snap-full (str ds "@" snap-name)
+              msg (or message "")]
+          (zfs "snapshot" snap-full)
+          (try
+            (zfs "set" (str "yggdrasil:message=" msg) snap-full)
+            (catch Exception _))
+          this))))
 
   p/GarbageCollectable
   (gc-roots [_]

@@ -49,14 +49,7 @@
                (spit f (str (System/nanoTime)))
                sys))
    :commit (fn [sys msg]
-             (let [ds (str (:base-pool sys) "/" (:prefix sys) "/" (:current-branch sys))
-                   snap-name (str (java.util.UUID/randomUUID))
-                   full-snap (str ds "@" snap-name)]
-               (zfs-cmd "snapshot" full-snap)
-               (when (and msg (not (str/blank? msg)))
-                 (try (zfs-cmd "set" (str "yggdrasil:message=" msg) full-snap)
-                      (catch Exception _)))
-               sys))
+             (p/commit! sys msg))
    :close! (fn [sys]
              (zfs/destroy! sys))
    :write-entry (fn [sys key value]

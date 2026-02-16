@@ -28,8 +28,7 @@
                               (str (System/nanoTime)))
              sys)
    :commit (fn [sys msg]
-             (ofs/commit! sys msg)
-             sys)
+             (p/commit! sys msg))
    :close! (fn [sys]
              (ofs/destroy! sys)
              (delete-dir-recursive (:base-path sys)))

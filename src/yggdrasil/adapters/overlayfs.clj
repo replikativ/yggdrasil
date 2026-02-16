@@ -246,7 +246,7 @@
   (system-id [_] (or system-name (str "overlayfs:" workspace-path)))
   (system-type [_] :overlayfs)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -534,6 +534,33 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Addressable
+  (working-path [_]
+    (upper-dir workspace-path current-branch))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (let [branch current-branch
+          upper (upper-dir workspace-path branch)
+          commit-id (str (UUID/randomUUID))
+          commits (read-commits workspace-path branch)
+          parent-ids (if-let [prev (last commits)]
+                       #{(:id prev)}
+                       #{})
+          commit {:id commit-id
+                  :parent-ids parent-ids
+                  :message (or message "")
+                  :timestamp (str (Instant/now))
+                  :branch branch}
+          snap-dir (str (snapshots-dir workspace-path branch) "/" commit-id)]
+      (ensure-dirs! snap-dir)
+      (when (.exists (File. upper))
+        (copy-recursive! upper snap-dir))
+      (write-commits! workspace-path branch (conj commits commit))
+      this))
 
   p/GarbageCollectable
   (gc-roots [_]

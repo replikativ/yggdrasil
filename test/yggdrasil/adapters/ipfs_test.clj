@@ -113,8 +113,7 @@
                ;; Create dummy data and commit
                (let [data (str "data-" (:_mutation-count sys 0))
                      root-cid (add-to-ipfs data)]
-                 (ipfs/commit! sys msg {:root root-cid})
-                 sys))
+                 (p/commit! sys msg {:root root-cid})))
      :close! (fn [sys]
                (try
                  ;; Don't delete keys - they're shared across tests

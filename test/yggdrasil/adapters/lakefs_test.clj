@@ -9,7 +9,7 @@
   (:require [clojure.test :refer [deftest testing use-fixtures]]
             [yggdrasil.adapters.lakefs :as lfs]
             [yggdrasil.compliance :as compliance]
-            [yggdrasil.protocols]
+            [yggdrasil.protocols :as p]
             [clojure.java.shell :refer [sh]])
   (:import [java.io File]
            [java.net Socket]))
@@ -143,8 +143,7 @@
                  sys))
      :commit (fn [sys msg]
                (binding [lfs/*lakectl-config* (:_config sys)]
-                 (lfs/commit! sys msg)
-                 sys))
+                 (p/commit! sys msg)))
      :close! (fn [sys]
                (binding [lfs/*lakectl-config* (:_config sys)]
                  (lfs/destroy! sys)))
@@ -164,11 +163,11 @@
                        sys))
      :branch! (fn [sys branch]
                 (binding [lfs/*lakectl-config* (:_config sys)]
-                  (yggdrasil.protocols/branch! sys branch)
+                  (p/branch! sys branch)
                   sys))
      :checkout (fn [sys branch]
                  (binding [lfs/*lakectl-config* (:_config sys)]
-                   (assoc (yggdrasil.protocols/checkout sys branch)
+                   (assoc (p/checkout sys branch)
                           :_config (:_config sys))))
      :supports-concurrent? false}))
 

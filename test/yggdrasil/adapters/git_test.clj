@@ -41,10 +41,7 @@
                (spit f (str (System/nanoTime)))
                sys))
    :commit (fn [sys msg]
-             (let [wt (wt-path sys)]
-               (git-cmd wt "add" "-A")
-               (git-cmd wt "commit" "-m" (or msg "commit") "--allow-empty")
-               sys))
+             (p/commit! sys msg))
    :close! (fn [sys]
              (delete-dir-recursive (:repo-path sys))
              (delete-dir-recursive (:worktrees-dir sys)))

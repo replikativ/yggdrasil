@@ -77,7 +77,9 @@
             mergeable            ; Boolean
             overlayable          ; Boolean
             watchable            ; Boolean
-            garbage-collectable]) ; Boolean
+            garbage-collectable  ; Boolean
+            addressable          ; Boolean
+            committable])        ; Boolean
 
 ;; ============================================================
 ;; Conflict descriptor

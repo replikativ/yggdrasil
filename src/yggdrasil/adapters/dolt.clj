@@ -160,7 +160,7 @@
   (system-id [_] (or system-name (str "dolt:" repo-path)))
   (system-type [_] :dolt)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -357,6 +357,24 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Addressable
+  (working-path [_] repo-path)
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (with-branch-lock* branch-locks current-branch
+      (fn []
+        (let [[author-name author-email] (parse-author *author*)
+              msg (or message "commit")]
+          (dolt repo-path "checkout" current-branch)
+          (dolt repo-path "add" ".")
+          (dolt repo-path "commit" "-m" msg
+                "--author" (str author-name " <" author-email ">")
+                "--allow-empty")
+          this))))
 
   p/GarbageCollectable
   (gc-roots [_]

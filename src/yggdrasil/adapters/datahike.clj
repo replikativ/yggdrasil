@@ -89,7 +89,7 @@
         (str "datahike:" (get-in @conn [:config :store :id]))))
   (system-type [_] :datahike)
   (capabilities [_]
-    (t/->Capabilities true true true true false false true))
+    (t/->Capabilities true true true true false false true false false))
 
   p/Snapshotable
   (snapshot-id [_]

@@ -31,6 +31,8 @@ pip install yggdrasil-protocols
 | 5 | `Overlayable` | Live forks with observation modes |
 | 6 | `Watchable` | State change observation (polling) |
 | 7 | `GarbageCollectable` | Coordinated cross-system GC (optional) |
+| - | `Addressable` | Filesystem working path (optional) |
+| - | `Committable` | Explicit commit operations (optional) |
 
 ### Snapshotable
 
@@ -88,19 +90,19 @@ pip install yggdrasil-protocols
 
 ### Capabilities Matrix
 
-| Adapter | Snapshot | Branch | Graph | Merge | Overlay | Watch | GC |
-|---------|----------|--------|-------|-------|---------|-------|----|
-| Git | commits | branches (worktrees) | full DAG | 3-way | - | poll | yes |
-| ZFS | snapshots | clones | linear | - | - | poll | yes |
-| Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll | yes |
-| IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes |
-| Iceberg | snapshots | branches | full DAG | manual | - | poll | yes |
-| Datahike | commit-id | branch! | full DAG | merge! | - | listen | yes |
-| Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes |
-| OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes |
-| Podman | image layers | containers | full DAG | diff+apply | - | poll | yes |
-| LakeFS | commits | branches | full DAG | 3-way | - | poll | yes |
-| Dolt | commits | branches | full DAG | 3-way | - | poll | yes |
+| Adapter | Snapshot | Branch | Graph | Merge | Overlay | Watch | GC | Addressable | Committable |
+|---------|----------|--------|-------|-------|---------|-------|----|-------------|-------------|
+| Git | commits | branches (worktrees) | full DAG | 3-way | - | poll | yes | yes | yes |
+| ZFS | snapshots | clones | linear | - | - | poll | yes | yes | yes |
+| Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll | yes | yes | yes |
+| IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes | - | yes |
+| Iceberg | snapshots | branches | full DAG | manual | - | poll | yes | - | yes |
+| Datahike | commit-id | branch! | full DAG | merge! | - | listen | yes | - | - |
+| Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes | yes | yes |
+| OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes | yes | yes |
+| Podman | image layers | containers | full DAG | diff+apply | - | poll | yes | - | yes |
+| LakeFS | commits | branches | full DAG | 3-way | - | poll | yes | - | yes |
+| Dolt | commits | branches | full DAG | 3-way | - | poll | yes | yes | yes |
 
 ### Git Adapter
 
@@ -508,8 +510,9 @@ Causal ordering without synchronized clocks:
 ### Capabilities
 
 ```clojure
-(t/->Capabilities true true true false false true true)
-;; snapshotable, branchable, graphable, mergeable, overlayable, watchable, garbage-collectable
+(t/->Capabilities true true true false false true true true true)
+;; snapshotable, branchable, graphable, mergeable, overlayable, watchable,
+;; garbage-collectable, addressable, committable
 ```
 
 ## Composition

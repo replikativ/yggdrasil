@@ -224,7 +224,7 @@
   (system-type [_] :ipfs)
   (system-id [_] system-name)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true false true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -471,6 +471,22 @@
   (diff [_ a b _opts]
     ;; Placeholder: could use ipfs dag diff in future
     {:a a :b b :note "IPFS dag diff not yet implemented"})
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message opts]
+    (when-not (:root opts)
+      (throw (ex-info "Commit requires :root CID in opts" {})))
+    (let [state @state-atom
+          current-cid (get-branch-head state current-branch)
+          parents (if current-cid [current-cid] [])
+          commit-obj (create-commit-object
+                      (merge opts {:parents parents :message (or message "commit")}))
+          commit-cid (store-commit! commit-obj)]
+      (swap! state-atom update-branch! current-branch commit-cid)
+      (save-state! @state-atom)
+      this))
 
   p/GarbageCollectable
   (gc-roots [_]

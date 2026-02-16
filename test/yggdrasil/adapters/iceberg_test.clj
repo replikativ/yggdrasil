@@ -10,6 +10,7 @@
   (:require [clojure.test :refer [deftest testing use-fixtures is]]
             [yggdrasil.adapters.iceberg :as ice]
             [yggdrasil.compliance :as compliance]
+            [yggdrasil.protocols :as p]
             [clojure.java.shell :refer [sh]]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -200,8 +201,7 @@
                      base-entries (get @branch-base branch {})]
                  ;; Save committed state for this branch
                  (swap! committed-state assoc branch (merge base-entries own-entries)))
-               (ice/commit! sys msg)
-               sys)
+               (p/commit! sys msg))
      :close! (fn [sys]
                (try
                  (ice/destroy! sys)

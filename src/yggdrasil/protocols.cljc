@@ -211,6 +211,28 @@
      opts: {:sync? true} — when false, returns channel/promise."))
 
 ;; ============================================================
+;; Addressable (filesystem-backed systems)
+;; ============================================================
+
+(defprotocol Addressable
+  "Systems with a filesystem working directory for the current branch.
+   Not all systems are addressable — e.g. IPFS, Datahike, LakeFS are not."
+
+  (working-path [this]
+    "Filesystem path (String) for the current branch's writable directory."))
+
+;; ============================================================
+;; Committable (explicit commit operations)
+;; ============================================================
+
+(defprotocol Committable
+  "Create commits/snapshots. Systems that support explicit commit operations."
+
+  (commit! [this] [this message] [this message opts]
+    "Create a commit on the current branch. Returns new system value.
+     opts map is system-specific (e.g. IPFS requires :root CID)."))
+
+;; ============================================================
 ;; System identity
 ;; ============================================================
 

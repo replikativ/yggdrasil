@@ -129,7 +129,7 @@
   (system-id [_] (or system-name (str "git:" repo-path)))
   (system-type [_] :git)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -303,6 +303,20 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Addressable
+  (working-path [_]
+    (branch-path repo-path worktrees-dir current-branch))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (let [wt (current-wt repo-path worktrees-dir current-branch)]
+      (with-branch-lock branch-locks current-branch
+        (git wt "add" "-A")
+        (git wt "commit" "-m" (or message "") "--allow-empty"))
+      this))
 
   p/GarbageCollectable
   (gc-roots [_]

@@ -245,7 +245,7 @@
   (system-id [_] (or system-name (str "lakefs:" repo-name)))
   (system-type [_] :lakefs)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true false true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -461,6 +461,17 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (with-branch-lock* branch-locks current-branch
+      (fn []
+        (let [branch current-branch
+              msg (or message "commit")]
+          (lakectl "commit" (branch-uri repo-name branch) "-m" msg)
+          this))))
 
   p/GarbageCollectable
   (gc-roots [_]

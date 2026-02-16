@@ -22,6 +22,7 @@
     (deftest compliance
       (compliance/run-compliance-tests my-fixture-map))"
   (:require [clojure.test :refer [is testing]]
+            [clojure.string]
             [yggdrasil.protocols :as p]))
 
 ;; ============================================================
@@ -730,6 +731,45 @@
           (finally (close! sys)))))))
 
 ;; ============================================================
+;; Addressable tests
+;; ============================================================
+
+(defn test-working-path [{:keys [create-system close!] :as fix}]
+  (when (has-capability? fix :addressable)
+    (testing "working-path returns a non-blank string"
+      (let [sys (create-system)]
+        (try
+          (let [path (p/working-path sys)]
+            (is (string? path) "working-path should return a string")
+            (is (not (clojure.string/blank? path))
+                "working-path should not be blank"))
+          (finally (close! sys)))))))
+
+;; ============================================================
+;; Committable tests
+;; ============================================================
+
+(defn test-commit-via-protocol [{:keys [create-system mutate commit close!] :as fix}]
+  (when (has-capability? fix :committable)
+    (testing "commit! via protocol changes snapshot-id"
+      (let [sys (create-system)]
+        (try
+          ;; Use fixture's commit fn which delegates to p/commit! with
+          ;; adapter-specific opts (e.g. IPFS requires :root CID)
+          (let [sys (mutate sys)
+                sys (commit sys "protocol commit")
+                sid (p/snapshot-id sys)]
+            (is (some? sid) "snapshot-id should be non-nil after commit!")
+            ;; Second commit should change snapshot-id
+            (let [sys (mutate sys)
+                  sys (commit sys "second protocol commit")
+                  sid2 (p/snapshot-id sys)]
+              (is (some? sid2) "snapshot-id should be non-nil after second commit!")
+              (is (not= sid sid2)
+                  "snapshot-id should change after second commit!")))
+          (finally (close! sys)))))))
+
+;; ============================================================
 ;; Full test suite
 ;; ============================================================
 
@@ -759,6 +799,8 @@
    :garbage-collectable [test-gc-roots
                          test-gc-roots-multi-branch
                          test-gc-sweep]
+   :addressable [test-working-path]
+   :committable [test-commit-via-protocol]
    :concurrent [test-concurrent-commits
                 test-concurrent-branch-creation
                 test-concurrent-readers]

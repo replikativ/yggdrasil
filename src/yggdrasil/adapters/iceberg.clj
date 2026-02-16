@@ -269,7 +269,7 @@
   (system-id [_] (or system-name (str "iceberg:" namespace "." table)))
   (system-type [_] :iceberg)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true false true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -540,6 +540,45 @@
                     :from (:timestamp-ms snap-a)
                     :to (:timestamp-ms snap-b)}]
                   [])}))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (binding [*rest-endpoint* (or (:rest-endpoint opts) (:rest-endpoint (:opts this)) *rest-endpoint*)
+              *s3-endpoint* (or (:s3-endpoint opts) (:s3-endpoint (:opts this)) *s3-endpoint*)
+              *s3-access-key* (or (:s3-access-key opts) (:s3-access-key (:opts this)) *s3-access-key*)
+              *s3-secret-key* (or (:s3-secret-key opts) (:s3-secret-key (:opts this)) *s3-secret-key*)]
+      (with-branch-lock* branch-locks current-branch
+        (fn []
+          (let [msg (or message "commit")
+                table-meta (load-table-metadata namespace table)
+                current-snap-id (get-current-snapshot-id table-meta)
+                new-snap-id (System/currentTimeMillis)
+                current-seq (or (get-in table-meta [:metadata :last-sequence-number])
+                                (get table-meta :last-sequence-number)
+                                0)
+                next-seq (inc current-seq)
+                manifest-list (str "s3://warehouse/" namespace "/" table "/metadata/empty-manifest-list.avro")
+                parents (when (and current-snap-id (not= -1 current-snap-id))
+                          [(str current-snap-id)])
+                snapshot-data (cond-> {:snapshot-id new-snap-id
+                                       :timestamp-ms (System/currentTimeMillis)
+                                       :sequence-number next-seq
+                                       :manifest-list manifest-list
+                                       :summary (merge {"operation" "yggdrasil-commit"}
+                                                       (yggdrasil-metadata msg (if parents {:parents parents} {})))}
+                                (and current-snap-id (not= -1 current-snap-id))
+                                (assoc :parent-snapshot-id current-snap-id))
+                updates [{:action "add-snapshot"
+                          :snapshot snapshot-data}
+                         {:action "set-snapshot-ref"
+                          :ref-name (name current-branch)
+                          :snapshot-id new-snap-id
+                          :type "branch"}]]
+            (update-table! namespace table updates)
+            (swap! logical-branches-atom disj (keyword current-branch))
+            this)))))
 
   p/GarbageCollectable
   (gc-roots [_]

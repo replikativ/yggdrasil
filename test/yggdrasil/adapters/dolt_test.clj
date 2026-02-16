@@ -25,8 +25,7 @@
                                 (str (System/nanoTime)))
              sys)
    :commit (fn [sys msg]
-             (dolt/commit! sys msg)
-             sys)
+             (p/commit! sys msg))
    :close! (fn [sys]
              (dolt/destroy! sys))
    :write-entry (fn [sys key value]

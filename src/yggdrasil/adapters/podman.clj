@@ -198,7 +198,7 @@
   (system-id [_] system-id)
   (system-type [_] :podman)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true))
+    (t/->Capabilities true true true true false true true false true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -512,6 +512,28 @@
   (unwatch! [this watch-id] (p/unwatch! this watch-id nil))
   (unwatch! [_ watch-id _opts]
     (w/remove-callback! watcher-state watch-id))
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (let [branch current-branch
+          cname (container-name system-id branch)
+          commit-id (str (UUID/randomUUID))
+          commits (read-commits workspace-path branch)
+          parent-ids (if-let [prev (last commits)]
+                       #{(:id prev)}
+                       #{})
+          commit {:id commit-id
+                  :parent-ids parent-ids
+                  :message (or message "")
+                  :timestamp (str (Instant/now))
+                  :branch branch}
+          img (image-name system-id branch commit-id)]
+      (podman "commit" cname img)
+      (podman "tag" img (image-name system-id branch))
+      (write-commits! workspace-path branch (conj commits commit))
+      this))
 
   p/GarbageCollectable
   (gc-roots [_]
