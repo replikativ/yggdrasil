@@ -169,6 +169,7 @@ pip install yggdrasil-protocols
 | Podman | image layers | containers | full DAG | diff+apply | - | poll | yes | - | yes |
 | LakeFS | commits | branches | full DAG | 3-way | - | poll | yes | - | yes |
 | Dolt | commits | branches | full DAG | 3-way | - | poll | yes | yes | yes |
+| **Composite** | composite UUID | intersection | composite DAG | per-system | - | - | union | - | delegates |
 
 ### Git Adapter
 
@@ -582,6 +583,62 @@ Each HLC has a `physical` (millis since epoch) and a `logical` counter. The phys
 ;; garbage-collectable, addressable, committable
 ```
 
+## Composite Systems (Pullback)
+
+The `yggdrasil.composite` namespace provides a `CompositeSystem` that wraps N sub-systems into a single logical unit. Categorically, this is a **fiber product (pullback)** over the shared branch space — all protocol operations are applied componentwise, constrained to preserve the fiber condition.
+
+```clojure
+(require '[yggdrasil.composite :as composite])
+(require '[yggdrasil.protocols :as p])
+
+;; Strict: all sub-systems must be on the same branch
+(def sys (composite/pullback [git-sys db-sys]
+           :name "my-workspace"))
+
+;; Lenient: sub-systems may have different native branch names
+;; (e.g. datahike defaults to :db, scriptum to "main")
+(def sys (composite/composite [dh-sys sc-sys]
+           :name "briefkasten"
+           :branch :main))
+
+;; All protocol operations coordinate across sub-systems
+(p/system-id sys)        ;; => "my-workspace"
+(p/snapshot-id sys)      ;; => deterministic UUID from sub-system states
+(p/branches sys)         ;; => intersection of sub-system branches
+(p/current-branch sys)   ;; => :main
+
+;; Branch, commit, merge — all applied to every sub-system
+(def branched (p/branch! sys :experiment))
+(def committed (p/commit! sys "checkpoint"))
+(p/parent-ids committed)  ;; => #{<previous-composite-id>}
+
+;; History walks the composite parent chain
+(p/history committed)     ;; => [current-id parent-id ...]
+
+;; Access individual sub-systems
+(composite/get-subsystem sys "my-repo")  ;; => the git system
+```
+
+### Constructors
+
+| Function | Branch check | Use case |
+|----------|-------------|----------|
+| `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `:branch` to override | Systems with matching branch names |
+| `composite` | None — accepts explicit `:branch` (default `:main`) | Systems with different branch naming conventions |
+
+### Aggregation strategies
+
+| Protocol operation | Strategy |
+|-------------------|----------|
+| `branches` | Intersection (only branches valid in ALL sub-systems) |
+| `gc-roots` | Union (any sub-system root is a composite root) |
+| `conflicts` | Union (any sub-system conflict is a composite conflict) |
+| `snapshot-id` | Deterministic UUID from sorted `[system-id snapshot-id]` pairs |
+
+### Categorical note
+
+The construction is monoidal: `pullback(pullback(A,B), C) ≅ pullback(A,B,C)`. See [CATEGORICAL_SEMANTICS.md](docs/CATEGORICAL_SEMANTICS.md) for the formal treatment of pullbacks and their relationship to pushout-based merge.
+
 ## Composition
 
 The `yggdrasil.compose` namespace provides multi-system coordination:
@@ -758,6 +815,7 @@ src/yggdrasil/
   storage.clj          # IStorage for PSS B-tree nodes in konserve
   gc.clj               # Coordinated cross-system garbage collection
   hooks.clj            # Extension point for adapter-specific commit hooks
+  composite.clj        # CompositeSystem — pullback over shared branch space
   adapters/
     git.clj            # Git adapter (worktree-based)
     ipfs.clj           # IPFS adapter (P2P content-addressed)
@@ -773,6 +831,7 @@ test/yggdrasil/
   workspace_test.clj   # Workspace coordination tests
   registry_test.clj    # Registry index tests
   gc_test.clj          # GC integration tests
+  composite_test.clj   # CompositeSystem tests
   adapters/
     git_test.clj       # Git compliance tests
     ipfs_test.clj      # IPFS compliance tests

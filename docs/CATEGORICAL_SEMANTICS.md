@@ -236,7 +236,137 @@ The pushout is defined by its **universal property**, not its construction algor
 
 ---
 
-## 3. Comparison with Patch-First Models
+## 3. Pullback as Composition (CompositeSystem)
+
+### The Composition Problem
+
+Many real systems consist of **multiple heterogeneous stores** that must branch, commit, and merge **in lockstep**. For example, briefkasten couples:
+
+- **Datahike** (metadata DB, branch space includes `:db`)
+- **Scriptum** (fulltext index, branch space includes `"main"`)
+
+These are independent systems with their own snapshot categories, but they share a common **branch space** through which they must be coordinated.
+
+### Fiber Product Definition
+
+Given two systems A and B with branch projections into a shared branch space S:
+
+```
+    A ×_S B
+     / \
+  π₁/   \π₂
+   /     \
+  A       B
+   \     /
+  b_A\   /b_B
+     \ /
+      S
+```
+
+The **fiber product** (pullback) `A ×_S B` is the universal object such that:
+
+1. **Square commutes**: `b_A ∘ π₁ = b_B ∘ π₂` — both projections agree on which branch we're on
+2. **Universal property**: For any system C with morphisms `f: C → A` and `g: C → B` satisfying `b_A ∘ f = b_B ∘ g`, there exists a unique morphism `u: C → A ×_S B`
+
+**Fiber condition**: At any point, `b_A(a) = b_B(b)` — both sub-systems must be on the same logical branch. This is enforced by `pullback` but relaxed by `composite` (which maps different native branch names to a shared logical branch).
+
+### Yggdrasil Implementation
+
+The `CompositeSystem` record implements the fiber product:
+
+```clojure
+(require '[yggdrasil.composite :as yc])
+
+;; Strict pullback — enforces fiber condition
+(def pb (yc/pullback [sys-a sys-b] :name "my-pullback"))
+
+;; Lenient composite — maps different branch names to shared logical branch
+(def comp (yc/composite [dh-sys sc-sys]
+                         :name "briefkasten-account"
+                         :branch :main))
+```
+
+### Protocol Aggregation Strategies
+
+Each protocol on the composite is derived from the sub-systems via a specific **aggregation functor**:
+
+| Protocol | Strategy | Categorical Interpretation |
+|----------|----------|---------------------------|
+| **snapshot-id** | Deterministic UUID from sorted `[sys-id, snap-id]` pairs | Product of objects |
+| **parent-ids** | Previous composite snapshot | Morphism in composite category |
+| **branches** | Intersection of sub-system branches | Fiber over shared branch space |
+| **branch!** | Branch ALL sub-systems | Functorial lift of branch morphism |
+| **commit!** | Commit each sub-system in order | Product of morphisms |
+| **history** | Walk composite parent chain | Morphism chain in composite category |
+| **gc-roots** | Union of sub-system roots | Coproduct of root sets |
+| **conflicts** | Union of sub-system conflicts | Coproduct of conflict sets |
+| **diff** | Per-system diffs `{sys-id → diff}` | Component-wise in product category |
+| **capabilities** | Intersection (logical AND) | Meet in capability lattice |
+
+### Monoidal Property
+
+The pullback construction is **monoidal** (associative with unit):
+
+```
+pullback(A, B, C) ≅ pullback(pullback(A, B), C)
+```
+
+This means:
+- **Flat composition**: `(yc/pullback [a b c])` creates a single composite with 3 sub-systems
+- **Nested composition**: Pullback of pullbacks is well-defined (though the flat form is preferred for simplicity)
+- **Unit**: A single system wrapped in a composite behaves identically to the original
+
+### Relationship to Pushout (Merge)
+
+Pullback and pushout are **dual** constructions:
+
+- **Pullback** (this section): Composition of systems — "these systems evolve together"
+- **Pushout** (§2): Merge of branches — "these divergent histories converge"
+
+When a `CompositeSystem` merges, it constructs a pushout on **each sub-system** independently, then combines the results into a composite pushout. The commutative square is preserved component-wise:
+
+```
+For each sub-system i:
+
+      base_i
+      /    \
+   f_i      g_i
+    /        \
+  A_i        B_i
+    \        /
+   f'_i    g'_i
+      \    /
+       M_i
+
+Composite merge M = (M₁, M₂, ..., Mₙ)
+with composite-snapshot-id = hash([(id₁, snap(M₁)), (id₂, snap(M₂)), ...])
+```
+
+### Example: Briefkasten
+
+```clojure
+;; datahike system (branch :db)
+(def dh-sys (ydh/create conn {:system-name "briefkasten-dh-acct"}))
+
+;; scriptum system (branch "main")
+(def sc-sys (sy/->ScriptumSystem path {"main" writer} "main" "briefkasten-sc-acct"))
+
+;; Composite: maps both to logical branch :main
+(def acct (yc/composite [dh-sys sc-sys]
+                         :name "briefkasten-acct"
+                         :branch :main))
+
+;; All operations coordinate both sub-systems:
+(p/commit! acct "add email")     ; commits datahike AND scriptum
+(p/branch! acct :experiment)     ; branches both
+(p/checkout acct :experiment)    ; checks out both
+```
+
+The fiber condition ensures that after any operation, both stores are on the same logical branch, even though their native branch representations differ (`:db` vs `"main"`).
+
+---
+
+## 4. Comparison with Patch-First Models
 
 ### Darcs & Pijul
 
@@ -301,7 +431,7 @@ These are **dual perspectives** on the same problem. The choice depends on domai
 
 ---
 
-## 4. Protocol Mapping to Category Theory
+## 5. Protocol Mapping to Category Theory
 
 ### Snapshotable Protocol
 
@@ -365,7 +495,7 @@ For adapters where Yggdrasil knows semantics (Git, Datahike), merge may be autom
 
 ---
 
-## 5. Implications for Design
+## 6. Implications for Design
 
 ### Why Current Protocols are Sound
 
@@ -375,6 +505,8 @@ For adapters where Yggdrasil knows semantics (Git, Datahike), merge may be autom
 4. **Mergeable**: Implements pushout ✓
 
 All fundamental categorical constructions are supported.
+
+5. **CompositeSystem**: Implements pullback (fiber product) ✓
 
 ### Why Optional Protocols are Truly Optional
 
@@ -410,7 +542,7 @@ Yggdrasil's role is to **track the merge in the DAG**, not to compute it.
 
 ---
 
-## 6. References
+## 7. References
 
 ### Patch Theory
 
@@ -442,6 +574,7 @@ Yggdrasil implements a **snapshot-first categorical model** appropriate for larg
 
 - **Objects**: Snapshots (primitive, cheap to create)
 - **Morphisms**: Deltas (derived, expensive to compute)
+- **Composition**: Pullback / fiber product (multiple systems evolve in lockstep)
 - **Merge**: Pushout (manual construction by user/tools)
 - **Soundness**: Satisfies all category axioms and universal properties
 
