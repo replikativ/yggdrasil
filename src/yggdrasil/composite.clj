@@ -478,10 +478,10 @@
         [kv-store storage index] (init-index store-path)
         index-atom (atom index)
         sys (->CompositeSystem
-              sys-map
-              resolved-branch
-              (or name (str "pullback:" (str/join "×" (sort (keys sys-map)))))
-              index-atom kv-store storage)]
+             sys-map
+             resolved-branch
+             (or name (str "pullback:" (str/join "×" (sort (keys sys-map)))))
+             index-atom kv-store storage)]
     ;; Record initial composite snapshot (idempotent on reopen)
     (register-initial-snapshot! index-atom kv-store storage
                                 sys-map (p/snapshot-id sys))
@@ -504,10 +504,10 @@
         [kv-store storage index] (init-index store-path)
         index-atom (atom index)
         sys (->CompositeSystem
-              sys-map
-              branch
-              (or name (str "composite:" (str/join "+" (sort (keys sys-map)))))
-              index-atom kv-store storage)]
+             sys-map
+             branch
+             (or name (str "composite:" (str/join "+" (sort (keys sys-map)))))
+             index-atom kv-store storage)]
     ;; Record initial composite snapshot (idempotent on reopen)
     (register-initial-snapshot! index-atom kv-store storage
                                 sys-map (p/snapshot-id sys))

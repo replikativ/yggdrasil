@@ -309,9 +309,9 @@
         (let [a2 (make-mock "sys-a" final-snap-a)
               b2 (make-mock "sys-b" final-snap-b)
               c-reopened (composite/composite [a2 b2]
-                                             :name "test-persist"
-                                             :branch :main
-                                             :store-path dir)
+                                              :name "test-persist"
+                                              :branch :main
+                                              :store-path dir)
               hist-after (p/history c-reopened)
               graph-after (p/commit-graph c-reopened)]
           (composite/close! c-reopened)
@@ -377,9 +377,9 @@
         (let [a2 (make-mock "sys-a" final-snap-a)
               b2 (make-mock "sys-b" final-snap-b)
               c-reopened (composite/composite [a2 b2]
-                                             :name "test-info"
-                                             :branch :main
-                                             :store-path dir)
+                                              :name "test-info"
+                                              :branch :main
+                                              :store-path dir)
               info-after (p/commit-info c-reopened snap1)]
           (composite/close! c-reopened)
 
