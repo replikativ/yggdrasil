@@ -619,12 +619,43 @@ The `yggdrasil.composite` namespace provides a `CompositeSystem` that wraps N su
 (composite/get-subsystem sys "my-repo")  ;; => the git system
 ```
 
+### Persistent History
+
+By default, composite history is ephemeral (in-memory only). Pass `:store-path` to persist the history index across restarts using a PSS (persistent sorted set) backed by konserve — the same pattern used by the snapshot registry.
+
+```clojure
+;; Create a persistent composite — history survives process restarts
+(def sys (composite/composite [dh-sys sc-sys]
+           :name "briefkasten"
+           :branch :main
+           :store-path "/var/lib/myapp/composite"))
+
+;; Commit as usual — index is persisted on every commit
+(def c1 (p/commit! sys "sync checkpoint"))
+(def c2 (p/commit! c1 "second sync"))
+
+;; Close when done (flushes index to disk)
+(composite/close! sys)
+
+;; On restart: reopen sub-systems, create composite with same :store-path
+;; History, commit-graph, commit-info all restored from disk
+(def sys2 (composite/composite [dh-sys2 sc-sys2]
+            :name "briefkasten"
+            :branch :main
+            :store-path "/var/lib/myapp/composite"))
+(p/history sys2)  ;; => full history chain including c1, c2
+```
+
+The PSS index stores entries sorted by composite snapshot ID with lazy-loading from konserve. This scales to thousands of commits without loading the entire history into memory. When `:store-path` is `nil` (default), a plain in-memory sorted set is used instead.
+
 ### Constructors
 
 | Function | Branch check | Use case |
 |----------|-------------|----------|
 | `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `:branch` to override | Systems with matching branch names |
 | `composite` | None — accepts explicit `:branch` (default `:main`) | Systems with different branch naming conventions |
+
+Both constructors accept `:store-path` for persistent history.
 
 ### Aggregation strategies
 

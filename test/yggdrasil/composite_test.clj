@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest testing is]]
             [yggdrasil.composite :as composite]
             [yggdrasil.protocols :as p]
-            [yggdrasil.types :as t]))
+            [yggdrasil.types :as t])
+  (:import [java.io File]))
 
 ;; ============================================================
 ;; Mock system — value-semantic, branchable, committable
@@ -268,3 +269,124 @@
       (is (= "sys-a" (p/system-id (composite/get-subsystem c "sys-a"))))
       (is (= "sys-b" (p/system-id (composite/get-subsystem c "sys-b"))))
       (is (nil? (composite/get-subsystem c "nonexistent"))))))
+
+;; ============================================================
+;; Persistence tests
+;; ============================================================
+
+(defn- delete-recursive
+  "Recursively delete a file or directory."
+  [^File f]
+  (when (.isDirectory f)
+    (doseq [child (.listFiles f)]
+      (delete-recursive child)))
+  (.delete f))
+
+(deftest test-persistent-round-trip
+  (let [dir (str (System/getProperty "java.io.tmpdir")
+                 "/yggdrasil-composite-test-" (System/nanoTime))]
+    (try
+      ;; Phase 1: create persistent composite, commit 3 times
+      (let [a (make-mock "sys-a" "snap-a0")
+            b (make-mock "sys-b" "snap-b0")
+            c (composite/composite [a b]
+                                   :name "test-persist"
+                                   :branch :main
+                                   :store-path dir)
+            c1 (p/commit! c "first")
+            c2 (p/commit! c1 "second")
+            c3 (p/commit! c2 "third")
+            final-snap-a (p/snapshot-id (composite/get-subsystem c3 "sys-a"))
+            final-snap-b (p/snapshot-id (composite/get-subsystem c3 "sys-b"))
+            hist-before (p/history c3)
+            graph-before (p/commit-graph c3)]
+        (composite/close! c3)
+
+        (testing "history has 4 entries (initial + 3 commits)"
+          (is (= 4 (count hist-before))))
+
+        ;; Phase 2: reopen with same sub-system states
+        (let [a2 (make-mock "sys-a" final-snap-a)
+              b2 (make-mock "sys-b" final-snap-b)
+              c-reopened (composite/composite [a2 b2]
+                                             :name "test-persist"
+                                             :branch :main
+                                             :store-path dir)
+              hist-after (p/history c-reopened)
+              graph-after (p/commit-graph c-reopened)]
+          (composite/close! c-reopened)
+
+          (testing "history survives reopen"
+            (is (= (count hist-before) (count hist-after)))
+            (is (= hist-before hist-after)))
+
+          (testing "commit-graph survives reopen"
+            (is (= (count (:nodes graph-before))
+                   (count (:nodes graph-after))))
+            (is (= (:roots graph-before) (:roots graph-after))))))
+
+      (finally
+        (delete-recursive (File. dir))))))
+
+(deftest test-persistent-initial-snapshot-idempotent
+  (let [dir (str (System/getProperty "java.io.tmpdir")
+                 "/yggdrasil-composite-idem-" (System/nanoTime))]
+    (try
+      ;; Create, close, reopen — should not duplicate the initial entry
+      (let [a (make-mock "sys-a" "snap-a0")
+            b (make-mock "sys-b" "snap-b0")
+            c (composite/composite [a b]
+                                   :name "test-idem"
+                                   :branch :main
+                                   :store-path dir)]
+        (composite/close! c)
+
+        (let [a2 (make-mock "sys-a" "snap-a0")
+              b2 (make-mock "sys-b" "snap-b0")
+              c2 (composite/composite [a2 b2]
+                                      :name "test-idem"
+                                      :branch :main
+                                      :store-path dir)
+              hist (p/history c2)]
+          (composite/close! c2)
+
+          (testing "no duplicate initial snapshot after reopen"
+            (is (= 1 (count hist)))
+            (is (= (count (distinct hist)) (count hist))))))
+
+      (finally
+        (delete-recursive (File. dir))))))
+
+(deftest test-persistent-commit-info-survives
+  (let [dir (str (System/getProperty "java.io.tmpdir")
+                 "/yggdrasil-composite-info-" (System/nanoTime))]
+    (try
+      (let [a (make-mock "sys-a" "snap-a0")
+            b (make-mock "sys-b" "snap-b0")
+            c (composite/composite [a b]
+                                   :name "test-info"
+                                   :branch :main
+                                   :store-path dir)
+            c1 (p/commit! c "first commit")
+            snap1 (p/snapshot-id c1)
+            info-before (p/commit-info c1 snap1)
+            final-snap-a (p/snapshot-id (composite/get-subsystem c1 "sys-a"))
+            final-snap-b (p/snapshot-id (composite/get-subsystem c1 "sys-b"))]
+        (composite/close! c1)
+
+        (let [a2 (make-mock "sys-a" final-snap-a)
+              b2 (make-mock "sys-b" final-snap-b)
+              c-reopened (composite/composite [a2 b2]
+                                             :name "test-info"
+                                             :branch :main
+                                             :store-path dir)
+              info-after (p/commit-info c-reopened snap1)]
+          (composite/close! c-reopened)
+
+          (testing "commit-info metadata survives reopen"
+            (is (= "first commit" (:message info-after)))
+            (is (= (:parent-ids info-before) (:parent-ids info-after)))
+            (is (= (:sub-snapshots info-before) (:sub-snapshots info-after))))))
+
+      (finally
+        (delete-recursive (File. dir))))))
