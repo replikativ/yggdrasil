@@ -42,7 +42,7 @@ This is a one-time requirement.
 **Why a CLA?**
 
 The CLA grants replikativ the right to:
-- Distribute your contributions under EPL-2.0 (the project's open source license)
+- Distribute your contributions under Apache-2.0 (the project's open source license)
 - Offer your contributions under commercial license terms (for customers who prefer them)
 
 **Our commitment to you:**
@@ -89,5 +89,5 @@ Add tests for new functionality when possible.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under EPL-2.0
+By contributing, you agree that your contributions will be licensed under Apache-2.0
 and may be included in commercially licensed distributions per the CLA.

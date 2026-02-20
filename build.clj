@@ -30,10 +30,10 @@
                       :tag (str "v" version)}
                 :pom-data [[:description "Unified copy-on-write memory model protocols for heterogeneous storage systems"]
                            [:url "https://github.com/replikativ/yggdrasil"]
-                           [:licenses
-                            [:license
-                             [:name "Eclipse Public License 2.0"]
-                             [:url "https://www.eclipse.org/legal/epl-2.0/"]]]
+[:licenses
+                             [:license
+                              [:name "Apache License 2.0"]
+                              [:url "https://www.apache.org/licenses/LICENSE-2.0"]]]
                            [:developers
                             [:developer
                              [:id "whilo"]
