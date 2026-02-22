@@ -15,7 +15,8 @@
             [konserve.core :as k]
             [datahike.api :as d]
             [datahike.experimental.versioning :as dv]
-            [datahike.writing :as dw]))
+            [datahike.writing :as dw])
+  (:import [yggdrasil.types DatahikeDiff DiffError]))
 
 ;; ============================================================
 ;; Internal helpers
@@ -251,7 +252,25 @@
 
   (diff [this a b] (p/diff this a b nil))
   (diff [_ a b _opts]
-    {:from a :to b :diff :not-implemented}))
+    (let [store (store-of conn)
+          resolve-db (fn [x]
+                       (cond
+                         (keyword? x) (dv/branch-as-db store x)
+                         (uuid? x)    (dv/commit-as-db store x)
+                         :else        (when-let [u (parse-uuid (str x))]
+                                        (dv/commit-as-db store u))))
+          db-a (resolve-db a)
+          db-b (resolve-db b)]
+      (if (and db-a db-b)
+        (let [added   (compute-branch-diff db-b db-a)
+              removed (compute-branch-diff db-a db-b)]
+          (t/->DatahikeDiff
+            a b added removed
+            {:added-datoms (count added)
+             :removed-datoms (count removed)
+             :entities-touched (count (into (set (map second added))
+                                            (map second removed)))}))
+        (t/->DiffError a b "Could not resolve branch/snapshot")))))
 
 ;; ============================================================
 ;; Constructor

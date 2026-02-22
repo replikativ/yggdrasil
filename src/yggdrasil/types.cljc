@@ -99,6 +99,29 @@
             theirs])        ; value in remote branch
 
 ;; ============================================================
+;; Diff results - typed return values from Mergeable/diff
+;; ============================================================
+
+(defrecord GitDiff
+           [snapshot-a      ; String - from ref
+            snapshot-b      ; String - to ref
+            stat            ; String - git diff --stat output
+            patch           ; String - unified diff (-p) output
+            files])         ; [{:status :added|:modified|:deleted, :path "..."}]
+
+(defrecord DatahikeDiff
+           [from            ; keyword/UUID - source branch/commit
+            to              ; keyword/UUID - target branch/commit
+            added           ; [[:db/add e a v] ...] - datoms in 'to' not in 'from'
+            removed         ; [[:db/add e a v] ...] - datoms in 'from' not in 'to'
+            summary])       ; {:added-datoms n, :removed-datoms n, :entities-touched n}
+
+(defrecord DiffError
+           [from            ; source ref
+            to              ; target ref
+            error])         ; String - error message
+
+;; ============================================================
 ;; Registry entry - cross-system snapshot tracking
 ;; ============================================================
 
