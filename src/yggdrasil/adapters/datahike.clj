@@ -265,11 +265,11 @@
         (let [added   (compute-branch-diff db-b db-a)
               removed (compute-branch-diff db-a db-b)]
           (t/->DatahikeDiff
-            a b added removed
-            {:added-datoms (count added)
-             :removed-datoms (count removed)
-             :entities-touched (count (into (set (map second added))
-                                            (map second removed)))}))
+           a b added removed
+           {:added-datoms (count added)
+            :removed-datoms (count removed)
+            :entities-touched (count (into (set (map second added))
+                                           (map second removed)))}))
         (t/->DiffError a b "Could not resolve branch/snapshot")))))
 
 ;; ============================================================

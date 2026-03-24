@@ -287,16 +287,16 @@
   (diff [_ a b _opts]
     (let [a-str (str a) b-str (str b)]
       (t/->GitDiff
-        a-str
-        b-str
-        (try (git repo-path "diff" "--stat" a-str b-str) (catch Exception _ ""))
-        (try (git repo-path "diff" "-p" a-str b-str) (catch Exception _ ""))
-        (try (->> (git-lines repo-path "diff" "--name-status" a-str b-str)
-                  (mapv (fn [line]
-                          (let [[status path] (str/split line #"\t" 2)]
-                            {:status (case status "A" :added "M" :modified "D" :deleted status)
-                             :path path}))))
-             (catch Exception _ [])))))
+       a-str
+       b-str
+       (try (git repo-path "diff" "--stat" a-str b-str) (catch Exception _ ""))
+       (try (git repo-path "diff" "-p" a-str b-str) (catch Exception _ ""))
+       (try (->> (git-lines repo-path "diff" "--name-status" a-str b-str)
+                 (mapv (fn [line]
+                         (let [[status path] (str/split line #"\t" 2)]
+                           {:status (case status "A" :added "M" :modified "D" :deleted status)
+                            :path path}))))
+            (catch Exception _ [])))))
 
   p/Watchable
   (watch! [this callback] (p/watch! this callback {}))
