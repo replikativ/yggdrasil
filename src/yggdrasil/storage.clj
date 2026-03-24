@@ -13,25 +13,33 @@
      :registry/roots   - root addresses of the three indices
      :registry/freed   - map of freed addresses to timestamps"
   (:require [konserve.core :as k]
-            [konserve.filestore :refer [connect-fs-store]]
+            [konserve.store :as kstore]
             [clojure.core.async :refer [<!!]]
             [yggdrasil.types :as t])
-  (:import [java.io File]
-           [org.replikativ.persistent_sorted_set
+  (:import [org.replikativ.persistent_sorted_set
             ANode Branch IStorage Leaf Settings]))
 
 ;; ============================================================
 ;; Store lifecycle
 ;; ============================================================
 
-(defn create-store
-  "Create a konserve file store at the given path.
-   Creates the directory if it doesn't exist."
-  [path]
-  (let [dir (File. (str path))]
-    (when-not (.exists dir)
-      (.mkdirs dir)))
-  (<!! (connect-fs-store path)))
+(defn open-store
+  "Open or create a konserve store from a store-config map.
+
+   Uses the konserve unified store factory (konserve.store).
+   Tries connect-store first (existing store); falls back to
+   create-store if the store does not exist yet.
+
+   store-config must include :backend and :id, e.g.:
+     {:backend :file :id #uuid \"...\" :path \"/tmp/yggdrasil\"}
+     {:backend :memory :id #uuid \"...\"}
+
+   Returns a konserve store instance."
+  [store-config]
+  (let [opts {:sync? true}]
+    (if (kstore/store-exists? store-config opts)
+      (kstore/connect-store store-config opts)
+      (kstore/create-store store-config opts))))
 
 ;; ============================================================
 ;; Record ↔ map conversion for safe serialization
@@ -122,12 +130,12 @@
 ;; ============================================================
 
 (defn save-roots!
-  "Persist the root addresses of the three indices."
+  "Persist the root addresses of the indices."
   [kv-store roots]
   (<!! (k/assoc kv-store :registry/roots roots)))
 
 (defn load-roots
-  "Load the root addresses of the three indices.
+  "Load the root addresses of the indices.
    Returns nil if no roots stored."
   [kv-store]
   (<!! (k/get kv-store :registry/roots)))
@@ -164,6 +172,8 @@
 ;; ============================================================
 
 (defn close!
-  "Close the store. Currently a no-op for file stores."
-  [_store]
-  nil)
+  "Close the store via konserve release.
+   Safe to call on any store type."
+  [store store-config]
+  (when (and store store-config)
+    (kstore/release-store store-config store {:sync? true})))

@@ -432,12 +432,19 @@
       (doseq [f (reverse (file-seq dir))]
         (.delete f)))))
 
+(defn- file-store-config
+  "Create a file-backed store config for testing."
+  [path]
+  {:store-config {:backend :file
+                  :id (java.util.UUID/randomUUID)
+                  :path path}})
+
 (deftest test-workspace-persistence
-  (testing "workspace with :store-path persists registry across close/reopen"
+  (testing "workspace with :store-config persists registry across close/reopen"
     (let [store-path (temp-dir)]
       (try
         ;; Create workspace with persistence, add system, commit
-        (let [w (ws/create-workspace {:store-path store-path})
+        (let [w (ws/create-workspace (file-store-config store-path))
               sys (make-mock-system "git:repo1" "main" ["snap-0"])]
           (ws/add-system! w sys)
           (ws/commit-with-hlc! w "git:repo1"
@@ -449,12 +456,39 @@
           (ws/close! w))
 
         ;; Reopen workspace from same store path
-        (let [w2 (ws/create-workspace {:store-path store-path})]
+        (let [w2 (ws/create-workspace (file-store-config store-path))]
           (is (= 2 (reg/entry-count (:registry w2)))
               "Persisted registry should have 2 entries after reopen")
           ;; snap-0 should still be findable
           (is (seq (reg/snapshot-refs (:registry w2) "snap-0"))
               "Original snapshot should be in persisted registry")
           (ws/close! w2))
+        (finally
+          (delete-dir-recursive store-path))))))
+
+(deftest test-workspace-hlc-restoration
+  (testing "workspace HLC is restored from persisted registry on restart"
+    (let [store-path (temp-dir)]
+      (try
+        ;; Phase 1: create workspace, add entries with known HLCs
+        (let [w (ws/create-workspace (file-store-config store-path))
+              sys (make-mock-system "git:repo1" "main" ["snap-0"])]
+          (ws/add-system! w sys)
+          ;; Do several ticks to advance HLC
+          (dotimes [_ 10] (ws/tick! w))
+          (let [hlc-before-close (ws/current-hlc w)]
+            (ws/close! w)
+
+            ;; Phase 2: reopen — HLC should be at least as high
+            (let [w2 (ws/create-workspace (file-store-config store-path))
+                  hlc-after-reopen (ws/current-hlc w2)]
+              ;; The restored HLC should be >= the last persisted entry's HLC
+              ;; (It may be higher than hlc-before-close because ticks don't
+              ;; register entries, but it must be >= the max entry HLC)
+              (let [max-entry-hlc (reg/max-hlc (:registry w2))]
+                (when max-entry-hlc
+                  (is (>= 0 (t/hlc-compare max-entry-hlc hlc-after-reopen))
+                      "Restored HLC must be >= max persisted entry HLC")))
+              (ws/close! w2))))
         (finally
           (delete-dir-recursive store-path))))))

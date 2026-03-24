@@ -26,8 +26,10 @@ A typical workflow: fork isolated branches across a Git repo and a Datahike data
 (require '[yggdrasil.adapters.git :as git])
 (require '[yggdrasil.adapters.datahike :as dh])
 
-;; 1. Create a workspace and add systems
-(def w (ws/create-workspace))
+;; 1. Create a workspace with persistent registry
+(def w (ws/create-workspace {:store-config {:backend :file
+                                            :id #uuid "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+                                            :path "/var/lib/myapp/registry"}}))
 (def git-sys (git/create "/path/to/repo" {:system-name "my-repo"}))
 (def db-sys  (dh/create conn {:system-name "my-db"}))
 (ws/manage! w git-sys)
@@ -64,10 +66,7 @@ A typical workflow: fork isolated branches across a Git repo and a Datahike data
 
 Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.replikativ/yggdrasil.svg)](https://clojars.org/org.replikativ/yggdrasil)
 
-**Python:**
-```bash
-pip install yggdrasil-protocols
-```
+> **Note:** A Python binding (`py/`) exists with protocol definitions and types, but it has not been updated since the initial release and is missing newer protocols (GarbageCollectable, Addressable, Committable) and coordination features (workspace, registry, composite). Use it as a reference, not a production dependency.
 
 ## Protocol Layers
 
@@ -583,7 +582,28 @@ Each HLC has a `physical` (millis since epoch) and a `logical` counter. The phys
 ;; garbage-collectable, addressable, committable
 ```
 
-## Composite Systems (Pullback)
+## Multi-System Coordination
+
+Yggdrasil provides two mechanisms for working with multiple systems together. They solve different problems at different levels:
+
+| | **Workspace** | **Composite** |
+|---|---|---|
+| **What it is** | Coordination layer — observes independent systems | A system itself — implements all protocols |
+| **Systems aware of each other?** | No — each evolves independently | No — but constrained to move together |
+| **Tracks time?** | Yes — HLC-indexed registry | No — only its own DAG |
+| **Tracks DAG?** | No — only a temporal log | Yes — composite parent chain |
+| **Branch model** | Each system branches independently | All sub-systems branch/checkout together |
+| **Commit model** | `coordinated-commit!` with per-system fns | `(p/commit! composite)` delegates to all |
+| **Query model** | `as-of-world(T)` — world state at time T | `(p/history composite)` — DAG walk |
+| **Use case** | Loose coordination, temporal queries, GC | Tight coupling, N systems as one unit |
+
+**Use a workspace** when systems evolve somewhat independently but you need temporal correlation — "show me the git state and database state as they were last Tuesday." Systems can be on different branches. Commits can happen at different times.
+
+**Use a composite** when N systems should behave as a single logical unit — "this database and this file store are always branched/committed/merged together." One call to `commit!` commits all sub-systems. One call to `branch!` branches all of them.
+
+They compose naturally: you can `manage!` a composite inside a workspace. The workspace then tracks the composite's commits in its registry alongside other independent systems.
+
+### Composite Systems (Pullback)
 
 The `yggdrasil.composite` namespace provides a `CompositeSystem` that wraps N sub-systems into a single logical unit. Categorically, this is a **fiber product (pullback)** over the shared branch space — all protocol operations are applied componentwise, constrained to preserve the fiber condition.
 
@@ -621,14 +641,16 @@ The `yggdrasil.composite` namespace provides a `CompositeSystem` that wraps N su
 
 ### Persistent History
 
-By default, composite history is ephemeral (in-memory only). Pass `:store-path` to persist the history index across restarts using a PSS (persistent sorted set) backed by konserve — the same pattern used by the snapshot registry.
+By default, composite history is ephemeral (in-memory only). Pass `:store-config` to persist the history index across restarts using a PSS (persistent sorted set) backed by konserve — the same pattern used by the snapshot registry. Any konserve backend works (file, memory, S3, LMDB, etc.).
 
 ```clojure
 ;; Create a persistent composite — history survives process restarts
 (def sys (composite/composite [dh-sys sc-sys]
            :name "briefkasten"
            :branch :main
-           :store-path "/var/lib/myapp/composite"))
+           :store-config {:backend :file
+                          :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                          :path "/var/lib/myapp/composite"}))
 
 ;; Commit as usual — index is persisted on every commit
 (def c1 (p/commit! sys "sync checkpoint"))
@@ -637,16 +659,18 @@ By default, composite history is ephemeral (in-memory only). Pass `:store-path` 
 ;; Close when done (flushes index to disk)
 (composite/close! sys)
 
-;; On restart: reopen sub-systems, create composite with same :store-path
+;; On restart: reopen sub-systems, create composite with same :store-config
 ;; History, commit-graph, commit-info all restored from disk
 (def sys2 (composite/composite [dh-sys2 sc-sys2]
             :name "briefkasten"
             :branch :main
-            :store-path "/var/lib/myapp/composite"))
+            :store-config {:backend :file
+                           :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                           :path "/var/lib/myapp/composite"}))
 (p/history sys2)  ;; => full history chain including c1, c2
 ```
 
-The PSS index stores entries sorted by composite snapshot ID with lazy-loading from konserve. This scales to thousands of commits without loading the entire history into memory. When `:store-path` is `nil` (default), a plain in-memory sorted set is used instead.
+The PSS index stores entries sorted by composite snapshot ID with lazy-loading from konserve. This scales to thousands of commits without loading the entire history into memory. Without `:store-config`, a plain in-memory sorted set is used instead.
 
 ### Constructors
 
@@ -655,7 +679,7 @@ The PSS index stores entries sorted by composite snapshot ID with lazy-loading f
 | `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `:branch` to override | Systems with matching branch names |
 | `composite` | None — accepts explicit `:branch` (default `:main`) | Systems with different branch naming conventions |
 
-Both constructors accept `:store-path` for persistent history.
+Both constructors accept `:store-config` for persistent history (any konserve backend).
 
 ### Aggregation strategies
 
@@ -670,9 +694,9 @@ Both constructors accept `:store-path` for persistent history.
 
 The construction is monoidal: `pullback(pullback(A,B), C) ≅ pullback(A,B,C)`. See [CATEGORICAL_SEMANTICS.md](docs/CATEGORICAL_SEMANTICS.md) for the formal treatment of pullbacks and their relationship to pushout-based merge.
 
-## Composition
+### Overlay Composition
 
-The `yggdrasil.compose` namespace provides multi-system coordination:
+The `yggdrasil.compose` namespace provides overlay-based multi-system transactions (prepare/commit/discard):
 
 ```clojure
 (require '[yggdrasil.compose :as compose])
@@ -690,23 +714,23 @@ The `yggdrasil.compose` namespace provides multi-system coordination:
 (compose/snapshot-refs [sys-a sys-b])
 ```
 
-## Coordination Layer
-
-The coordination layer provides cross-system snapshot tracking, temporal queries, and garbage collection. It sits above individual adapters and below the orchestrating runtime (e.g., Spindel).
-
 ### Workspace
 
-The `yggdrasil.workspace` namespace is the primary coordination API. A workspace holds system refs, coordinates HLC timestamps, and manages the snapshot registry.
+The workspace is the **temporal coordination layer**. It doesn't compose systems into one — it *observes* them independently, assigning shared HLC timestamps and recording snapshots in a registry. This lets you answer "what was the state of all my systems at time T?" without the systems knowing about each other.
+
+Workspaces require an explicit persistence choice — there is no silent default. This ensures users are aware whether their cross-system temporal data survives restarts.
 
 ```clojure
 (require '[yggdrasil.workspace :as ws])
 (require '[yggdrasil.protocols :as p])
 
-;; Create a workspace (in-memory registry)
-(def w (ws/create-workspace))
+;; Persistent registry backed by any konserve store (file, S3, LMDB, ...)
+(def w (ws/create-workspace {:store-config {:backend :file
+                                            :id #uuid "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+                                            :path "/var/lib/yggdrasil/registry"}}))
 
-;; Or with persistent registry (survives restarts)
-(def w (ws/create-workspace {:store-path "/var/lib/yggdrasil/registry"}))
+;; Or explicit ephemeral (in-memory only, data lost on close)
+(def w (ws/create-workspace {:ephemeral true}))
 
 ;; Add systems with auto-registration of commits
 (def git-sys (git/create "/path/to/repo" {:system-name "my-repo"}))
@@ -752,20 +776,35 @@ The `yggdrasil.workspace` namespace is the primary coordination API. A workspace
 
 ### Snapshot Registry
 
-The `yggdrasil.registry` namespace maintains a persistent sorted-set (PSS) index over `RegistryEntry` records, sorted by `[hlc system-id branch-name snapshot-id]`. Backed by konserve for durable, lazy-loading from disk.
+The `yggdrasil.registry` namespace maintains a persistent sorted-set (PSS) index over `RegistryEntry` records, sorted by `[hlc system-id branch-name snapshot-id]`. Backed by any konserve store for durable, lazy-loading from disk.
 
 ```clojure
 (require '[yggdrasil.registry :as reg])
 
+;; Create a persistent registry (usually done via workspace)
+(def r (reg/create-registry {:store-config {:backend :file
+                                            :id (java.util.UUID/randomUUID)
+                                            :path "/tmp/my-registry"}}))
+
+;; Or ephemeral
+(def r (reg/create-registry {:ephemeral true}))
+
 ;; Query: all entries for a system/branch
-(reg/system-history registry "my-repo" "main" {:limit 10})
+(reg/system-history r "my-repo" "main" {:limit 10})
 
 ;; Query: who references a snapshot?
-(reg/snapshot-refs registry "abc123")
+(reg/snapshot-refs r "abc123")
 
 ;; Query: temporal range
-(reg/entries-in-range registry from-hlc to-hlc)
+(reg/entries-in-range r from-hlc to-hlc)
+
+;; Query: max HLC in registry (for clock restoration)
+(reg/max-hlc r)
 ```
+
+**HLC monotonicity**: On restart, the workspace restores its HLC clock from the maximum persisted HLC in the registry. This ensures new entries are always strictly ordered after existing ones, even if the wall clock has regressed (NTP step-back, VM migration).
+
+**Flush semantics**: The registry is automatically flushed after each workspace mutation (add-system, commit, hold-ref, managed hook). This minimizes the crash window where data could be lost.
 
 ### Garbage Collection
 
@@ -843,7 +882,7 @@ src/yggdrasil/
   compliance.clj       # Protocol compliance test suite
   workspace.clj        # Multi-system workspace with HLC coordination
   registry.clj         # Snapshot registry (PSS index in konserve)
-  storage.clj          # IStorage for PSS B-tree nodes in konserve
+  storage.clj          # IStorage for PSS B-tree nodes (any konserve backend)
   gc.clj               # Coordinated cross-system garbage collection
   hooks.clj            # Extension point for adapter-specific commit hooks
   composite.clj        # CompositeSystem — pullback over shared branch space

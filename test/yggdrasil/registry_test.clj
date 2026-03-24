@@ -22,6 +22,13 @@
                      (t/->HLC physical-ts 0)
                      nil nil metadata))
 
+(defn- file-store-config
+  "Create a file-backed store config for testing."
+  [path]
+  {:store-config {:backend :file
+                  :id (java.util.UUID/randomUUID)
+                  :path path}})
+
 ;; ============================================================
 ;; Registry CRUD tests
 ;; ============================================================
@@ -283,6 +290,27 @@
       (reg/close! r))))
 
 ;; ============================================================
+;; Max HLC tests
+;; ============================================================
+
+(deftest test-max-hlc
+  (testing "max-hlc returns nil for empty registry"
+    (let [r (reg/create-registry)]
+      (is (nil? (reg/max-hlc r)))
+      (reg/close! r)))
+
+  (testing "max-hlc returns highest HLC in registry"
+    (let [r (reg/create-registry)
+          e1 (make-entry "snap-1" "sys-1" "main" 1000)
+          e2 (make-entry "snap-2" "sys-1" "main" 5000)
+          e3 (make-entry "snap-3" "sys-2" "main" 3000)]
+      (reg/register-batch! r [e1 e2 e3])
+      (let [m (reg/max-hlc r)]
+        (is (= 5000 (:physical m)))
+        (is (= 0 (:logical m))))
+      (reg/close! r))))
+
+;; ============================================================
 ;; Persistence round-trip tests
 ;; ============================================================
 
@@ -304,7 +332,7 @@
     (with-temp-store
       (fn [path]
         ;; Create registry, add entries, flush, close
-        (let [r (reg/create-registry {:store-path path})
+        (let [r (reg/create-registry (file-store-config path))
               e1 (make-entry "snap-1" "git:repo1" "main" 1000)
               e2 (make-entry "snap-2" "git:repo1" "main" 2000)
               e3 (make-entry "snap-a" "zfs:pool1" "main" 1500)]
@@ -313,7 +341,7 @@
           (reg/close! r))
 
         ;; Reopen and verify entries are restored
-        (let [r (reg/create-registry {:store-path path})]
+        (let [r (reg/create-registry (file-store-config path))]
           (is (= 3 (reg/entry-count r)))
 
           ;; TSBS: as-of query
@@ -337,21 +365,21 @@
     (with-temp-store
       (fn [path]
         ;; Phase 1: create and persist
-        (let [r (reg/create-registry {:store-path path})]
+        (let [r (reg/create-registry (file-store-config path))]
           (reg/register! r (make-entry "snap-1" "sys-1" "main" 1000))
           (reg/register! r (make-entry "snap-2" "sys-1" "main" 2000))
           (reg/flush! r)
           (reg/close! r))
 
         ;; Phase 2: reopen, add more, flush
-        (let [r (reg/create-registry {:store-path path})]
+        (let [r (reg/create-registry (file-store-config path))]
           (is (= 2 (reg/entry-count r)))
           (reg/register! r (make-entry "snap-3" "sys-1" "main" 3000))
           (reg/flush! r)
           (reg/close! r))
 
         ;; Phase 3: verify all 3 entries survive
-        (let [r (reg/create-registry {:store-path path})]
+        (let [r (reg/create-registry (file-store-config path))]
           (is (= 3 (reg/entry-count r)))
           (let [history (reg/system-history r "sys-1" "main")]
             (is (= ["snap-3" "snap-2" "snap-1"]
@@ -362,7 +390,7 @@
   (testing "deregistered entries are gone after flush/reopen"
     (with-temp-store
       (fn [path]
-        (let [r (reg/create-registry {:store-path path})
+        (let [r (reg/create-registry (file-store-config path))
               e1 (make-entry "snap-1" "sys-1" "main" 1000)
               e2 (make-entry "snap-2" "sys-1" "main" 2000)]
           (reg/register-batch! r [e1 e2])
@@ -370,7 +398,7 @@
           (reg/flush! r)
           (reg/close! r))
 
-        (let [r (reg/create-registry {:store-path path})]
+        (let [r (reg/create-registry (file-store-config path))]
           (is (= 1 (reg/entry-count r)))
           (is (nil? (reg/snapshot-refs r "snap-1")))
           (is (seq (reg/snapshot-refs r "snap-2")))
@@ -380,7 +408,7 @@
   (testing "markFreed tracks freed B-tree node addresses"
     (with-temp-store
       (fn [path]
-        (let [r (reg/create-registry {:store-path path})]
+        (let [r (reg/create-registry (file-store-config path))]
           ;; Register entries to create B-tree nodes
           (reg/register-batch! r
                                (mapv #(make-entry (str "snap-" %)
@@ -412,13 +440,13 @@
                                          (* % 100))
                             (range 1 1001))]
           ;; Create and persist
-          (let [r (reg/create-registry {:store-path path})]
+          (let [r (reg/create-registry (file-store-config path))]
             (reg/register-batch! r entries)
             (reg/flush! r)
             (reg/close! r))
 
           ;; Restore and verify
-          (let [r (reg/create-registry {:store-path path})]
+          (let [r (reg/create-registry (file-store-config path))]
             (is (= 1000 (reg/entry-count r)))
 
             ;; Verify a temporal query
@@ -433,3 +461,9 @@
             (is (seq (reg/snapshot-refs r "snap-500")))
 
             (reg/close! r)))))))
+
+(deftest test-explicit-config-required
+  (testing "empty opts throws with helpful message"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"explicit persistence"
+                          (reg/create-registry {})))))

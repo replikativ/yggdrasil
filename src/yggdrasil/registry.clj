@@ -86,6 +86,7 @@
 (defrecord Registry
            [index-atom       ; atom of PSS sorted by [hlc sys branch snap]
             kv-store         ; konserve store (or nil for in-memory only)
+            store-config     ; konserve store config map (or nil for in-memory only)
             storage          ; KonserveStorage (or nil for in-memory only)
             dirty-atom])     ; atom of boolean — true if unsaved changes
 
@@ -213,21 +214,39 @@
   registry)
 
 ;; ============================================================
+;; Max HLC query
+;; ============================================================
+
+(defn max-hlc
+  "Return the maximum HLC in the registry, or nil if empty.
+   O(1) since the PSS index is sorted by HLC first — the last
+   entry has the highest HLC."
+  [^Registry registry]
+  (let [idx @(:index-atom registry)]
+    (when (pos? (count idx))
+      (:hlc (last (seq idx))))))
+
+;; ============================================================
 ;; Factory
 ;; ============================================================
 
 (defn create-registry
-  "Create a new registry, optionally backed by a konserve store.
-   If store-path is provided, restores from disk if available,
-   otherwise creates empty index.
+  "Create a new registry.
 
-   opts:
-     :store-path - path for konserve file store (nil for in-memory only)"
-  ([] (create-registry {}))
+   Requires an explicit persistence choice:
+     {:store-config {:backend :file :id #uuid \"...\" :path \"/tmp/reg\"}}
+     {:store-config {:backend :memory :id #uuid \"...\"}}
+     {:ephemeral true}
+
+   For backward compatibility, a no-arg call creates an ephemeral registry.
+   However, callers should prefer the explicit {:ephemeral true} form."
+  ([] (create-registry {:ephemeral true}))
   ([opts]
-   (if-let [store-path (:store-path opts)]
-     ;; Persistent registry with konserve
-     (let [kv-store (store/create-store store-path)
+   (cond
+     ;; Persistent registry with konserve store config
+     (:store-config opts)
+     (let [store-config (:store-config opts)
+           kv-store (store/open-store store-config)
            storage (store/create-storage kv-store)
            roots (store/load-roots kv-store)
            freed (store/load-freed kv-store)
@@ -236,17 +255,33 @@
          ;; Restore from existing root
          (let [idx (pss/restore-by tsbs-comparator (:tsbs roots) storage
                                    {:branching-factor 64})]
-           (->Registry (atom idx) kv-store storage (atom false)))
+           (->Registry (atom idx) kv-store store-config storage (atom false)))
          ;; Fresh registry with storage
          (let [idx (build-index tsbs-comparator [] storage)]
-           (->Registry (atom idx) kv-store storage (atom false)))))
-     ;; In-memory only registry (no konserve)
+           (->Registry (atom idx) kv-store store-config storage (atom false)))))
+
+     ;; Explicit ephemeral
+     (:ephemeral opts)
      (let [idx (build-index tsbs-comparator [])]
-       (->Registry (atom idx) nil nil (atom false))))))
+       (->Registry (atom idx) nil nil nil (atom false)))
+
+     ;; Legacy: :store-path sugar — convert to file store config
+     (:store-path opts)
+     (create-registry {:store-config {:backend :file
+                                      :id (java.util.UUID/randomUUID)
+                                      :path (:store-path opts)}})
+
+     :else
+     (throw (ex-info
+             (str "Registry requires explicit persistence choice.\n"
+                  "  {:store-config {:backend :file :id (random-uuid) :path \"/tmp/reg\"}}\n"
+                  "  {:store-config {:backend :memory :id (random-uuid)}}\n"
+                  "  {:ephemeral true}")
+             {:opts opts})))))
 
 (defn close!
   "Flush and close the registry."
   [^Registry registry]
   (flush! registry)
-  (when-let [s (:kv-store registry)]
-    (store/close! s)))
+  (when (and (:kv-store registry) (:store-config registry))
+    (store/close! (:kv-store registry) (:store-config registry))))

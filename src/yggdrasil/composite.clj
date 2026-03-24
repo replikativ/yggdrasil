@@ -18,8 +18,8 @@
    Uses VALUE SEMANTICS: mutating operations return new CompositeSystem values.
 
    History persistence uses a persistent-sorted-set (PSS) backed by
-   konserve via KonserveStorage, following the same pattern as the
-   yggdrasil registry. When :store-path is provided, the index is
+   konserve via CompositeStorage, following the same pattern as the
+   yggdrasil registry. When :store-config is provided, the index is
    lazy-loaded from disk; otherwise it's purely in-memory (ephemeral)."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
@@ -29,8 +29,7 @@
             [clojure.set :as set]
             [clojure.string :as str]
             [org.replikativ.persistent-sorted-set :as pss])
-  (:import [java.io File]
-           [org.replikativ.persistent_sorted_set
+  (:import [org.replikativ.persistent_sorted_set
             ANode Branch IStorage Leaf Settings]))
 
 ;; ============================================================
@@ -150,22 +149,22 @@
 
 (defn- init-index
   "Initialize the PSS index for composite history.
-   When store-path is provided, creates a konserve-backed PSS with lazy loading.
-   Returns [kv-store storage index]."
-  [store-path]
-  (if store-path
-    (let [kv (store/create-store store-path)
+   When store-config is provided, creates a konserve-backed PSS with lazy loading.
+   Returns [kv-store store-config storage index]."
+  [store-config]
+  (if store-config
+    (let [kv (store/open-store store-config)
           stg (create-composite-storage kv)
           root (<!! (k/get kv :composite/root))
           freed (or (<!! (k/get kv :composite/freed)) {})]
       (reset! (:freed-atom stg) freed)
       (if root
-        [kv stg (pss/restore-by entry-comparator root stg
-                                {:branching-factor 64})]
-        [kv stg (pss/sorted-set* {:comparator entry-comparator
-                                  :storage stg
-                                  :branching-factor 64})]))
-    [nil nil (pss/sorted-set-by entry-comparator)]))
+        [kv store-config stg (pss/restore-by entry-comparator root stg
+                                             {:branching-factor 64})]
+        [kv store-config stg (pss/sorted-set* {:comparator entry-comparator
+                                               :storage stg
+                                               :branching-factor 64})]))
+    [nil nil nil (pss/sorted-set-by entry-comparator)]))
 
 (defn- persist-index!
   "Persist the PSS index root and freed nodes to konserve.
@@ -200,7 +199,8 @@
             composite-name       ;; string — system-id for the composite
             index-atom           ;; atom of PSS sorted by composite-snap-id
             kv-store             ;; konserve store (nil for ephemeral)
-            storage]             ;; KonserveStorage (nil for ephemeral)
+            store-config         ;; konserve store config (nil for ephemeral)
+            storage]             ;; CompositeStorage (nil for ephemeral)
 
   p/SystemIdentity
   (system-id [_] composite-name)
@@ -433,7 +433,7 @@
 
 (defn flush!
   "Persist current composite history index to disk.
-   No-op when the composite is ephemeral (no :store-path)."
+   No-op when the composite is ephemeral (no :store-config)."
   [composite]
   (persist-index! (:kv-store composite) (:storage composite)
                   (:index-atom composite)))
@@ -442,7 +442,9 @@
   "Flush and close the composite's persistent store.
    Safe to call on ephemeral composites (no-op)."
   [composite]
-  (flush! composite))
+  (flush! composite)
+  (when (and (:kv-store composite) (:store-config composite))
+    (store/close! (:kv-store composite) (:store-config composite))))
 
 ;; ============================================================
 ;; Constructor
@@ -458,14 +460,20 @@
 
    systems-seq: seq of yggdrasil systems
    opts:
-     :name       — composite system name (default: auto-generated)
-     :branch     — explicit logical branch name. When provided, sub-systems may
-                   have different native branch names (e.g. datahike uses :db,
-                   scriptum uses \"main\"). When omitted, all sub-systems must
-                   report the same current-branch.
-     :store-path — directory for konserve persistence (nil = ephemeral)"
-  [systems-seq & {:keys [name branch store-path]}]
-  (let [sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
+     :name         — composite system name (default: auto-generated)
+     :branch       — explicit logical branch name. When provided, sub-systems may
+                     have different native branch names (e.g. datahike uses :db,
+                     scriptum uses \"main\"). When omitted, all sub-systems must
+                     report the same current-branch.
+     :store-config — konserve store config map for persistence (nil = ephemeral)
+     :store-path   — (legacy) directory for file store persistence"
+  [systems-seq & {:keys [name branch store-config store-path]}]
+  (let [store-config (or store-config
+                         (when store-path
+                           {:backend :file
+                            :id (java.util.UUID/randomUUID)
+                            :path store-path}))
+        sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
         resolved-branch (if branch
                           branch
                           (let [branches-list (map p/current-branch (vals sys-map))
@@ -475,13 +483,13 @@
                                               {:branches (into {} (map (fn [s] [(p/system-id s) (p/current-branch s)])
                                                                        (vals sys-map)))})))
                             first-branch))
-        [kv-store storage index] (init-index store-path)
+        [kv-store resolved-config storage index] (init-index store-config)
         index-atom (atom index)
         sys (->CompositeSystem
              sys-map
              resolved-branch
              (or name (str "pullback:" (str/join "×" (sort (keys sys-map)))))
-             index-atom kv-store storage)]
+             index-atom kv-store resolved-config storage)]
     ;; Record initial composite snapshot (idempotent on reopen)
     (register-initial-snapshot! index-atom kv-store storage
                                 sys-map (p/snapshot-id sys))
@@ -496,18 +504,24 @@
 
    systems-seq: seq of yggdrasil systems
    opts:
-     :name       — composite system name (default: auto-generated)
-     :branch     — explicit branch keyword (default: :main)
-     :store-path — directory for konserve persistence (nil = ephemeral)"
-  [systems-seq & {:keys [name branch store-path] :or {branch :main}}]
-  (let [sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
-        [kv-store storage index] (init-index store-path)
+     :name         — composite system name (default: auto-generated)
+     :branch       — explicit branch keyword (default: :main)
+     :store-config — konserve store config map for persistence (nil = ephemeral)
+     :store-path   — (legacy) directory for file store persistence"
+  [systems-seq & {:keys [name branch store-config store-path] :or {branch :main}}]
+  (let [store-config (or store-config
+                         (when store-path
+                           {:backend :file
+                            :id (java.util.UUID/randomUUID)
+                            :path store-path}))
+        sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
+        [kv-store resolved-config storage index] (init-index store-config)
         index-atom (atom index)
         sys (->CompositeSystem
              sys-map
              branch
              (or name (str "composite:" (str/join "+" (sort (keys sys-map)))))
-             index-atom kv-store storage)]
+             index-atom kv-store resolved-config storage)]
     ;; Record initial composite snapshot (idempotent on reopen)
     (register-initial-snapshot! index-atom kv-store storage
                                 sys-map (p/snapshot-id sys))

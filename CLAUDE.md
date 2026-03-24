@@ -54,6 +54,9 @@ The protocol stack builds from basic to advanced capabilities:
 - **Value semantics**: All mutations return new system values (Clojure-style immutability)
 - **Protocol composition**: Adapters implement only the protocols they support
 - **Cross-platform**: Core files use `.cljc` for ClojureScript compatibility where possible
+- **Explicit persistence**: Workspace and registry require explicit store config (`{:store-config {...}}` or `{:ephemeral true}`)
+- **HLC monotonicity**: On restart, the workspace clock is restored from the max persisted HLC to prevent ordering violations
+- **Backend-agnostic storage**: Registry and composite use konserve's unified store factory — any backend (file, memory, S3, LMDB, etc.) works via `{:backend :file/:memory/... :id #uuid "..." ...}`
 
 ### Adapter Implementations (src/yggdrasil/adapters/)
 

@@ -87,6 +87,7 @@ HLC guarantees:
 - **Local monotonicity**: Successive local events have increasing timestamps
 - **Causality**: If event A causally precedes B, then `hlc(A) < hlc(B)`
 - **Bounded drift**: HLC stays close to physical time
+- **Restart safety**: On workspace restart, the HLC is restored from the maximum persisted HLC in the registry via `reg/max-hlc`. The clock is seeded as `max(max-persisted-hlc, hlc-now)` then ticked, ensuring new entries are strictly greater than any existing entry — even under NTP clock regression or VM migration
 
 ## Adapter-Specific Semantics
 

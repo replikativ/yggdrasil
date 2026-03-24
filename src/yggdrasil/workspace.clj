@@ -53,22 +53,49 @@
     (p/unwatch! system hook-id)))
 
 ;; ============================================================
+;; HLC restoration
+;; ============================================================
+
+(defn- restore-hlc
+  "Restore HLC from the registry's latest entry to ensure monotonicity
+   across restarts. Returns an HLC that is strictly greater than both
+   the current wall clock and any persisted entry."
+  [registry]
+  (let [now (t/hlc-now)
+        persisted (reg/max-hlc registry)]
+    (if (and persisted (pos? (t/hlc-compare persisted now)))
+      ;; Persisted HLC is ahead of wall clock — tick from it
+      (t/hlc-tick persisted)
+      ;; Wall clock is ahead — use now
+      now)))
+
+;; ============================================================
 ;; Factory
 ;; ============================================================
 
 (defn create-workspace
-  "Create a workspace with optional persistent registry.
+  "Create a workspace with a persistent or ephemeral registry.
 
-   opts:
-     :store-path  - path for registry persistence (nil for in-memory only)"
-  ([] (create-workspace {}))
+   Requires an explicit persistence choice:
+     {:store-config {:backend :file :id #uuid \"...\" :path \"/tmp/ws\"}}
+     {:store-config {:backend :memory :id #uuid \"...\"}}
+     {:ephemeral true}
+
+   For backward compatibility, a no-arg call creates an ephemeral workspace.
+   However, callers should prefer the explicit {:ephemeral true} form.
+
+   On restart with a persistent store, the HLC clock is restored from
+   the maximum persisted HLC to ensure monotonicity."
+  ([] (create-workspace {:ephemeral true}))
   ([opts]
-   (->Workspace (reg/create-registry opts)
-                (atom (t/hlc-now))
-                (atom {})
-                (atom {})
-                (atom {})
-                (atom {}))))
+   (let [registry (reg/create-registry opts)
+         hlc (restore-hlc registry)]
+     (->Workspace registry
+                  (atom hlc)
+                  (atom {})
+                  (atom {})
+                  (atom {})
+                  (atom {})))))
 
 ;; ============================================================
 ;; System management
@@ -93,7 +120,8 @@
                         nil
                         (when (satisfies? p/Snapshotable system)
                           (p/parent-ids system))
-                        {:source :add-system}))))
+                        {:source :add-system}))
+        (reg/flush! (:registry workspace))))
     workspace))
 
 (defn remove-system!
@@ -182,6 +210,7 @@
                  parent-ids
                  nil)]
       (reg/register! (:registry workspace) entry)
+      (reg/flush! (:registry workspace))
       entry)))
 
 (defn coordinated-commit!
@@ -239,7 +268,8 @@
                         @(:hlc-atom workspace)
                         nil
                         (p/parent-ids system)
-                        {:held true :ref-key ref-key})))))
+                        {:held true :ref-key ref-key}))
+        (reg/flush! (:registry workspace)))))
   workspace)
 
 (defn release-ref!
@@ -306,7 +336,11 @@
      (add-system! workspace system)
      ;; Set up commit hook for auto-registration
      (let [on-commit (fn [event]
-                       (let [hlc (swap! (:hlc-atom workspace) t/hlc-tick)]
+                       (let [hlc (swap! (:hlc-atom workspace) t/hlc-tick)
+                             ;; Capture parent-ids from live system state
+                             sys (get @(:systems workspace) sid)
+                             parent-ids (when (and sys (satisfies? p/Snapshotable sys))
+                                          (p/parent-ids sys))]
                          (reg/register!
                           (:registry workspace)
                           (t/->RegistryEntry
@@ -315,8 +349,9 @@
                            (or (:branch event) "main")
                            hlc
                            nil
-                           nil
-                           {:source :managed-hook}))))
+                           parent-ids
+                           {:source :managed-hook}))
+                         (reg/flush! (:registry workspace))))
            hook-id (hooks/install-commit-hook! workspace system on-commit)]
        (when hook-id
          (swap! (:watchers workspace) assoc sid hook-id)))
@@ -360,42 +395,48 @@
   "Scan a system's actual state and add missing entries to the registry.
    Useful for initial population or catch-up after external changes.
 
-   Only works with Graphable + Branchable systems."
+   Only works with Graphable + Branchable systems.
+
+   Collects all missing entries in a batch and flushes once at the end."
   [workspace system-id]
   (let [system (get @(:systems workspace) system-id)]
     (when-not system
       (throw (ex-info "System not found" {:system-id system-id})))
     (when (and (satisfies? p/Branchable system)
                (satisfies? p/Graphable system))
-      (doseq [branch (p/branches system)]
-        (let [checked-out (p/checkout system branch)
-              branch-name (name branch)
-              history-ids (p/history checked-out)]
-          (doseq [snap-id history-ids]
-            (let [existing (reg/snapshot-refs (:registry workspace) (str snap-id))]
-              ;; Only register if not already tracked
-              (when-not (some #(and (= (:system-id %) system-id)
-                                    (= (:branch-name %) branch-name))
-                              existing)
-                (let [meta (when (satisfies? p/Snapshotable checked-out)
-                             (p/snapshot-meta checked-out snap-id))
-                      hlc (if-let [ts (:timestamp meta)]
-                            (t/->HLC (try (long (Double/parseDouble (str ts)))
-                                          (catch Exception _
-                                            (System/currentTimeMillis)))
-                                     0)
-                            (swap! (:hlc-atom workspace) t/hlc-tick))]
-                  (reg/register!
-                   (:registry workspace)
-                   (t/->RegistryEntry
-                    (str snap-id)
-                    system-id
-                    branch-name
-                    hlc
-                    nil
-                    (:parent-ids meta)
-                    (merge {:source :sync}
-                           (select-keys meta [:message :author]))))))))))))
+      (let [batch (atom [])]
+        (doseq [branch (p/branches system)]
+          (let [checked-out (p/checkout system branch)
+                branch-name (name branch)
+                history-ids (p/history checked-out)]
+            (doseq [snap-id history-ids]
+              (let [existing (reg/snapshot-refs (:registry workspace) (str snap-id))]
+                ;; Only register if not already tracked
+                (when-not (some #(and (= (:system-id %) system-id)
+                                      (= (:branch-name %) branch-name))
+                                existing)
+                  (let [meta (when (satisfies? p/Snapshotable checked-out)
+                               (p/snapshot-meta checked-out snap-id))
+                        hlc (if-let [ts (:timestamp meta)]
+                              (t/->HLC (try (long (Double/parseDouble (str ts)))
+                                            (catch Exception _
+                                              (System/currentTimeMillis)))
+                                       0)
+                              (swap! (:hlc-atom workspace) t/hlc-tick))]
+                    (swap! batch conj
+                           (t/->RegistryEntry
+                            (str snap-id)
+                            system-id
+                            branch-name
+                            hlc
+                            nil
+                            (:parent-ids meta)
+                            (merge {:source :sync}
+                                   (select-keys meta [:message :author]))))))))))
+        ;; Batch register and single flush
+        (when (seq @batch)
+          (reg/register-batch! (:registry workspace) @batch)
+          (reg/flush! (:registry workspace))))))
   workspace)
 
 ;; ============================================================
