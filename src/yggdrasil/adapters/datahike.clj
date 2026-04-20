@@ -14,7 +14,7 @@
             [yggdrasil.hooks :as hooks]
             [konserve.core :as k]
             [datahike.api :as d]
-            [datahike.experimental.versioning :as dv]
+            [datahike.versioning :as dv]
             [datahike.writing :as dw])
   (:import [yggdrasil.types DatahikeDiff DiffError]))
 
