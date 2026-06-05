@@ -143,6 +143,16 @@
   [index-atom snap-id]
   (:sub-snapshots (lookup-entry @index-atom (str snap-id))))
 
+(defn- resolve-ref
+  "Resolve a composite-level ref `x` to the ref to hand sub-system `sid`:
+   a known composite snapshot-id → that system's snapshot-id (from the stored
+   `:sub-snapshots`); a branch keyword or any unknown id → passed through
+   unchanged (branch names are shared across sub-systems under the pullback)."
+  [index-atom sid x]
+  (if-let [sub (resolve-sub-snapshots index-atom x)]
+    (get sub sid x)
+    x))
+
 ;; ============================================================
 ;; Persistence helpers (following registry.clj / storage.clj)
 ;; ============================================================
@@ -398,17 +408,34 @@
       (assoc this :systems new-systems)))
 
   (conflicts [this a b] (p/conflicts this a b nil))
-  (conflicts [_ _a _b _opts]
-    ;; Sub-systems use their own snapshot IDs, not composite IDs.
-    ;; Conflict detection delegates per-system when needed.
-    [])
+  (conflicts [_ a b opts]
+    ;; Composite conflict = the UNION of every sub-system's conflicts (any
+    ;; sub-system conflict makes the composite merge non-trivial). Each
+    ;; conflict is tagged with its `:system` so callers can route it.
+    (into []
+          (mapcat (fn [[sid sys]]
+                    (when (satisfies? p/Mergeable sys)
+                      (map (fn [c] (assoc c :system sid))
+                           (p/conflicts sys
+                                        (resolve-ref index-atom sid a)
+                                        (resolve-ref index-atom sid b)
+                                        (or opts {}))))))
+          systems))
 
   (diff [this a b] (p/diff this a b nil))
-  (diff [_ _a _b _opts]
-    ;; Per-system diff requires resolving composite snap-ids to sub-system snap-ids.
-    ;; Callers should use sub-system diffs directly for detailed results.
+  (diff [_ a b opts]
+    ;; Fan out to each Mergeable sub-system, keyed by system-id. Branch
+    ;; keywords pass straight through (shared branch space); composite
+    ;; snapshot-ids resolve to per-system snapshot-ids. Each value is the
+    ;; sub-system's TYPED delta (GitDiff / DatahikeDiff / …) — use those for
+    ;; detail; non-Mergeable systems are omitted.
     (into {}
-          (map (fn [[sid sys]] [sid {:diff :composite-level}]))
+          (keep (fn [[sid sys]]
+                  (when (satisfies? p/Mergeable sys)
+                    [sid (p/diff sys
+                                 (resolve-ref index-atom sid a)
+                                 (resolve-ref index-atom sid b)
+                                 (or opts {}))])))
           systems))
 
   p/GarbageCollectable

@@ -100,6 +100,25 @@
 (defn- make-mock [id initial-snap]
   (->MockSystem id "main" (atom [initial-snap]) (atom #{:main})))
 
+;; A minimal Mergeable system that always reports one conflict — to exercise
+;; the composite's conflict union + per-system tagging.
+(defn- conflict-mock [id]
+  (reify
+    p/SystemIdentity
+    (system-id [_] id)
+    (system-type [_] :conflict-mock)
+    (capabilities [_] (t/->Capabilities true true true true false false true false true))
+    p/Snapshotable
+    (snapshot-id [_] (str id "-snap"))
+    (parent-ids [_] #{})
+    (as-of [_ s] s) (as-of [_ s _] s)
+    (snapshot-meta [_ s] {}) (snapshot-meta [_ s _] {})
+    p/Mergeable
+    (merge! [this _] this) (merge! [this _ _] this)
+    (conflicts [_ a b] [(t/->Conflict [:x] :base a b)])
+    (conflicts [_ a b _] [(t/->Conflict [:x] :base a b)])
+    (diff [_ a b] {:from a :to b}) (diff [_ a b _] {:from a :to b})))
+
 ;; ============================================================
 ;; Tests
 ;; ============================================================
@@ -225,6 +244,31 @@
       (is (= 2 (count view)))
       (is (contains? view "sys-a"))
       (is (contains? view "sys-b")))))
+
+(deftest test-composite-diff-fans-out
+  (testing "diff returns a per-system map keyed by system-id; branch refs pass
+            straight through to each sub-system"
+    (let [a (make-mock "sys-a" "snap-a0")
+          b (make-mock "sys-b" "snap-b0")
+          c (composite/pullback [a b])
+          d (p/diff c :main :feature)]
+      (is (= #{"sys-a" "sys-b"} (set (keys d))) "one delta per sub-system")
+      ;; MockSystem/diff echoes {:from a :to b} — confirms the branch refs were
+      ;; forwarded unchanged to each sub-system.
+      (is (= {:from :main :to :feature} (get d "sys-a")))
+      (is (= {:from :main :to :feature} (get d "sys-b"))))))
+
+(deftest test-composite-conflicts-union-tagged
+  (testing "conflicts are the union across sub-systems, each tagged :system;
+            a clean composite has none"
+    (let [clean (composite/composite [(make-mock "sys-a" "s0")
+                                      (make-mock "sys-b" "s0")])
+          confs (composite/composite [(conflict-mock "c1")
+                                      (conflict-mock "c2")])
+          cs    (p/conflicts confs :main :feature)]
+      (is (empty? (p/conflicts clean :main :feature)) "no conflicts when clean")
+      (is (= 2 (count cs)) "one conflict per conflicting sub-system")
+      (is (= #{"c1" "c2"} (set (map :system cs))) "each conflict tagged with its system"))))
 
 (deftest test-monoid-associativity
   (testing "pullback is monoidal: pullback([a, b, c]) works"
