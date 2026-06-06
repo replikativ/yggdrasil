@@ -59,6 +59,32 @@
           (is (contains? ids "B") "sibling B survived — NOT clobbered by A's merge")
           (is (= #{"base" "A" "B"} ids) "clean union of both siblings"))))))
 
+(deftest conflicts-detects-3way-field-clash
+  (testing "two branches changing the SAME cardinality-one attr to DIFFERENT
+            values = a conflict; one-sided changes are not"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id   :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :note/text :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "n" :note/text "base"} {:note/id "m" :note/text "m-base"}])
+      (p/branch! sys :ours)
+      (p/branch! sys :theirs)
+      (let [osys (p/checkout sys :ours)
+            tsys (p/checkout sys :theirs)]
+        ;; both change n's text differently (CONFLICT); only ours changes m (no conflict)
+        (d/transact (:conn osys) [{:note/id "n" :note/text "ours-val"}
+                                  {:note/id "m" :note/text "m-ours"}])
+        (d/transact (:conn tsys) [{:note/id "n" :note/text "theirs-val"}])
+        (let [confs (p/conflicts osys (p/snapshot-id osys) (p/snapshot-id tsys))]
+          (is (= 1 (count confs)) "exactly one conflict (n's text), not m")
+          (let [c (first confs)]
+            (is (= [:note/id "n"] (:entity c)))
+            (is (= :note/text (:attr c)))
+            (is (= "base" (:base c)))
+            (is (= "ours-val" (:ours c)))
+            (is (= "theirs-val" (:theirs c)))))))))
+
 (deftest common-ancestor-resolves-merge-base
   (testing "common-ancestor finds the fork point across a branch + divergence"
     (let [sys (dha/create *conn* {:system-name "test-db"})]

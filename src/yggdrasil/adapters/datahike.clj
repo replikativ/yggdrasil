@@ -107,6 +107,49 @@
     (let [m (prep (d/pull db '[*] e))]
       (when (some (fn [[k]] (contains? unique k)) m) m))))
 
+(defn- resolve-db
+  "Resolve a branch keyword / commit-uuid / snapshot-id string to a db value."
+  [store x]
+  (cond
+    (keyword? x) (dv/branch-as-db store x)
+    (uuid? x)    (dv/commit-as-db store x)
+    :else        (when-let [u (parse-uuid (str x))] (dv/commit-as-db store u))))
+
+(defn- card-one-attrs
+  "Cardinality-one, non-unique-identity attrs — the ones a 3-way merge can
+   genuinely conflict on (a unique id never conflicts; cardinality-many unions)."
+  [db]
+  (set (d/q '[:find [?id ...]
+              :where
+              [?a :db/ident ?id]
+              [(get-else $ ?a :db/cardinality :db.cardinality/one) ?c]
+              [(= ?c :db.cardinality/one)]
+              (not [?a :db/unique :db.unique/identity])]
+            db)))
+
+(defn- compute-conflicts
+  "3-way conflict set: for each identity-bearing entity present in base, ours,
+   AND theirs, a cardinality-one attr that ours and theirs BOTH changed (vs base)
+   to DIFFERENT values is a conflict. Returns
+   [{:entity [uattr uval] :attr a :base bv :ours ov :theirs tv} …]."
+  [base-db ours-db theirs-db]
+  (let [{:keys [unique]} (schema-attrs theirs-db)
+        cattrs (card-one-attrs theirs-db)
+        find-e (fn [db ua uv] (ffirst (d/q '[:find ?e :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv)))]
+    (vec
+     (for [ua unique
+           [_te uv] (d/q '[:find ?e ?uv :in $ ?ua :where [?e ?ua ?uv]] theirs-db ua)
+           :let  [eb (find-e base-db ua uv)
+                  eo (find-e ours-db ua uv)
+                  et (find-e theirs-db ua uv)]
+           :when (and eb eo et)
+           a     cattrs
+           :let  [bv (get (d/entity base-db eb) a)
+                  ov (get (d/entity ours-db eo) a)
+                  tv (get (d/entity theirs-db et) a)]
+           :when (and (not= ov bv) (not= tv bv) (not= ov tv))]
+       {:entity [ua uv] :attr a :base bv :ours ov :theirs tv}))))
+
 (defn- compute-merge-tx
   "Merge tx-data for datoms in source not in target:
    - entities carrying a `:db.unique/identity` attr are pulled and re-keyed by
@@ -341,8 +384,18 @@
       this))
 
   (conflicts [this a b] (p/conflicts this a b nil))
-  (conflicts [_ a b _opts]
-    [])
+  (conflicts [this a b _opts]
+    ;; 3-way: conflicts between `a` (ours) and `b` (theirs) relative to their
+    ;; merge-base. Identity-keyed additions union (not conflicts); only a
+    ;; cardinality-one attr that BOTH sides changed differently is a conflict.
+    (let [store   (store-of conn)
+          db-a    (resolve-db store a)
+          db-b    (resolve-db store b)
+          base-id (p/common-ancestor this a b)
+          db-base (when base-id (resolve-db store base-id))]
+      (if (and db-a db-b db-base)
+        (compute-conflicts db-base db-a db-b)
+        [])))
 
   (diff [this a b] (p/diff this a b nil))
   (diff [_ a b _opts]
