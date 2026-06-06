@@ -59,6 +59,32 @@
           (is (contains? ids "B") "sibling B survived — NOT clobbered by A's merge")
           (is (= #{"base" "A" "B"} ids) "clean union of both siblings"))))))
 
+(deftest merge-resolves-refs-among-co-created-entities
+  (testing "a fork adds a NEW entity AND another NEW entity that refs it; merging
+            both must resolve the ref intra-tx via shared tempids — not fail on a
+            lookup-ref to an entity being upserted in the same tx (the live
+            chat-ctx ← ledger/context merge failure)"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :box/id  :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :item/id :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :item/box :db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:box/id "seed"}])
+      (p/branch! sys :feat)
+      (let [fsys (p/checkout sys :feat)]
+        ;; both NEW in parent: a box and an item pointing at it (like a fork's new
+        ;; chat-context + the ledger rows that reference it)
+        (d/transact (:conn fsys) [{:box/id "b1"}])
+        (d/transact (:conn fsys) [{:item/id "i1" :item/box [:box/id "b1"]}])
+        (p/merge! sys :feat)
+        (let [db @*conn*]
+          (is (= #{"seed" "b1"} (set (d/q '[:find [?id ...] :where [_ :box/id ?id]] db))) "box merged")
+          (is (= #{"i1"} (set (d/q '[:find [?id ...] :where [_ :item/id ?id]] db))) "item merged")
+          (is (= "b1" (ffirst (d/q '[:find ?bid :where [?i :item/id "i1"] [?i :item/box ?b] [?b :box/id ?bid]] db)))
+              "item's ref resolved to the co-created box"))))))
+
 (deftest conflicts-detects-3way-field-clash
   (testing "two branches changing the SAME cardinality-one attr to DIFFERENT
             values = a conflict; one-sided changes are not"
