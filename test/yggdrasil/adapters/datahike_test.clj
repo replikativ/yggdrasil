@@ -35,6 +35,30 @@
         (is (every? string? hist) "every history entry is a string snapshot-id")
         (is (string? (p/snapshot-id sys)))))))
 
+(deftest sibling-merge-unions-by-identity
+  (testing "two SIBLING branches each add an entity from the same base; merging
+            both UNIONS them (no entity-id collision clobbering one) — the
+            Mannheim/San-Francisco data-loss scenario"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id   :db/valueType :db.type/string
+                            :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                           {:db/ident :note/text :db/valueType :db.type/string
+                            :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "base" :note/text "base"}])
+      (p/branch! sys :sib-a)
+      (p/branch! sys :sib-b)
+      (let [asys (p/checkout sys :sib-a)
+            bsys (p/checkout sys :sib-b)]
+        ;; both forks allocate "the next entity-id after base" for their note
+        (d/transact (:conn asys) [{:note/id "A" :note/text "mannheim"}])
+        (d/transact (:conn bsys) [{:note/id "B" :note/text "san-francisco"}])
+        (p/merge! sys :sib-a)
+        (p/merge! sys :sib-b)
+        (let [ids (set (d/q '[:find [?id ...] :where [_ :note/id ?id]] @*conn*))]
+          (is (contains? ids "A") "sibling A survived")
+          (is (contains? ids "B") "sibling B survived — NOT clobbered by A's merge")
+          (is (= #{"base" "A" "B"} ids) "clean union of both siblings"))))))
+
 (deftest common-ancestor-resolves-merge-base
   (testing "common-ancestor finds the fork point across a branch + divergence"
     (let [sys (dha/create *conn* {:system-name "test-db"})]

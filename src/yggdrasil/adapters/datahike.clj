@@ -54,6 +54,91 @@
                   source-db target-db)]
     (mapv (fn [[e a v]] [:db/add e a v]) diff)))
 
+;; --- identity-keyed merge (sibling-safe) ----------------------------------
+;; Raw [:db/add e a v] tx-data collides across SIBLING branches: each branch
+;; allocates entity-ids sequentially from the shared fork point, so two forks
+;; mint the SAME ?e for different entities → the second merge clobbers the
+;; first. The fix: address merged entities by their `:db.unique/identity`
+;; lookup-ref, so datahike unions them by SEMANTIC id. (Additions only here —
+;; append-only data like a conversation. Entities CHANGED on both sides are a
+;; 3-way conflict, surfaced via `conflicts` + reconciled by an agent.)
+
+(defn- schema-attrs
+  "{:unique #{idents} :ref #{idents} :component #{idents}} for db's schema."
+  [db]
+  (let [rows (d/q '[:find ?id ?uniq ?vt ?comp
+                    :where
+                    [?a :db/ident ?id]
+                    [(get-else $ ?a :db/unique :none) ?uniq]
+                    [(get-else $ ?a :db/valueType :none) ?vt]
+                    [(get-else $ ?a :db/isComponent false) ?comp]]
+                  db)]
+    {:unique    (set (keep (fn [[id u]]    (when (= u :db.unique/identity) id)) rows))
+     :ref       (set (keep (fn [[id _ vt]] (when (= vt :db.type/ref) id)) rows))
+     :component (set (keep (fn [[id _ _ c]] (when c id)) rows))}))
+
+(defn- entity-ident
+  "Lookup-ref [uattr uval] identifying entity `e`, or nil if it has none."
+  [db unique e]
+  (let [ent (d/entity db e)]
+    (some (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
+
+(defn- prepare-entity
+  "Pull entity `e` and return a tx-map keyed by its unique identity, with
+   non-component refs resolved to lookup-refs and components kept nested.
+   nil if `e` carries no unique identity."
+  [db {:keys [unique ref component] :as sch} e]
+  (letfn [(prep [m]
+            (into {}
+                  (keep (fn [[k v]]
+                          (cond
+                            (= k :db/id) nil
+                            (contains? ref k)
+                            (let [one (fn [x]
+                                        (cond
+                                          (contains? component k) (prep x) ; nested component
+                                          (map? x) (entity-ident db unique (:db/id x))
+                                          :else x))]
+                              (if (vector? v)
+                                (when-let [vs (seq (keep one v))] [k (vec vs)])
+                                (when-let [rv (one v)] [k rv])))
+                            :else [k v])))
+                  m))]
+    (let [m (prep (d/pull db '[*] e))]
+      (when (some (fn [[k]] (contains? unique k)) m) m))))
+
+(defn- compute-merge-tx
+  "Merge tx-data for datoms in source not in target:
+   - entities carrying a `:db.unique/identity` attr are pulled and re-keyed by
+     their lookup-ref, so concurrent sibling branches UNION by semantic id rather
+     than colliding on entity-id (their components ride along nested);
+   - anonymous entities (no identity, and not a component of an identity entity)
+     are carried via a fresh tempid so they're added without entity-id collision
+     (no semantic key to dedup on — degenerate but lossless)."
+  [source-db target-db]
+  (let [{:keys [unique component] :as sch} (schema-attrs source-db)
+        id-maps        (for [ua unique
+                             [e uv] (d/q '[:find ?e ?uv :in $ ?ua :where [?e ?ua ?uv]] source-db ua)
+                             :when  (empty? (d/q '[:find ?t :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv))]
+                         (prepare-entity source-db sch e))
+        ;; component entities are reached via their identity parent's pull
+        component-eids (set (when (seq component)
+                              (d/q '[:find [?c ...] :in $ [?ca ...] :where [_ ?ca ?c]] source-db (vec component))))
+        ref?           (:ref sch)
+        resolve-v      (fn [a v] (if (and (ref? a) (integer? v))
+                                   (or (entity-ident source-db unique v) v)
+                                   v))
+        anon-datoms    (->> (d/q '[:find ?e ?a ?v :in $ $2 :where
+                                   [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
+                                 source-db target-db)
+                            (remove (fn [[e]] (or (entity-ident source-db unique e)
+                                                  (component-eids e)))))
+        anon-tx        (->> (group-by first anon-datoms)
+                            (mapcat (fn [[e datoms]]
+                                      (let [tid (str "ygg-tmp-" e)]
+                                        (map (fn [[_ a v]] [:db/add tid a (resolve-v a v)]) datoms)))))]
+    (vec (concat (remove nil? id-maps) anon-tx))))
+
 ;; ============================================================
 ;; History traversal (synchronous, bounded)
 ;; ============================================================
@@ -249,7 +334,8 @@
                       (when source-branch
                         (let [source-db (dv/branch-as-db store source-branch)
                               target-db (db-of conn)]
-                          (compute-branch-diff source-db target-db)))
+                          ;; identity-keyed (sibling-safe), not raw [:db/add e a v]
+                          (compute-merge-tx source-db target-db)))
                       [])]
       (dv/merge! conn parents tx-data (:tx-meta opts))
       this))
