@@ -109,9 +109,18 @@
    to DIFFERENT values is a conflict. Returns
    [{:entity [uattr uval] :attr a :base bv :ours ov :theirs tv} …]."
   [base-db ours-db theirs-db]
-  (let [{:keys [unique]} (schema-attrs theirs-db)
+  (let [{:keys [unique ref]} (schema-attrs theirs-db)
         cattrs (card-one-attrs theirs-db)
-        find-e (fn [db ua uv] (ffirst (d/q '[:find ?e :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv)))]
+        find-e (fn [db ua uv] (ffirst (d/q '[:find ?e :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv)))
+        ;; A REF value is a datahike Entity — comparing Entity objects across DBs
+        ;; is ALWAYS unequal (different db), which would flag every unchanged ref
+        ;; (a message's :message/chat, a ledger row's :ledger/context …) as a
+        ;; bogus conflict. Compare refs by their TARGET's identity instead.
+        valof  (fn [db e a]
+                 (let [v (get (d/entity db e) a)]
+                   (if (and v (ref a))
+                     (entity-ident db unique (:db/id v))
+                     v)))]
     (vec
      (for [ua unique
            [_te uv] (d/q '[:find ?e ?uv :in $ ?ua :where [?e ?ua ?uv]] theirs-db ua)
@@ -120,10 +129,15 @@
                   et (find-e theirs-db ua uv)]
            :when (and eb eo et)
            a     cattrs
-           :let  [bv (get (d/entity base-db eb) a)
-                  ov (get (d/entity ours-db eo) a)
-                  tv (get (d/entity theirs-db et) a)]
-           :when (and (not= ov bv) (not= tv bv) (not= ov tv))]
+           :let  [bv (valof base-db eb a)
+                  ov (valof ours-db eo a)
+                  tv (valof theirs-db et a)]
+           ;; both sides changed it to different values …
+           :when (and (not= ov bv) (not= tv bv) (not= ov tv)
+                      ;; … but a temporal attr both sides merely advanced
+                      ;; (updated-at, last-seen) is churn, not a semantic clash —
+                      ;; the union takes the later value, no reconciliation needed.
+                      (not (and (inst? ov) (inst? tv))))]
        {:entity [ua uv] :attr a :base bv :ours ov :theirs tv}))))
 
 (defn- compute-merge-tx
@@ -138,22 +152,44 @@
    the ledger rows that point at it merge together, instead of the ledger's
    `[:chat/id …]` lookup-ref failing because datahike can't resolve a ref to an
    entity being upserted in the same tx. Components ride along as ordinary
-   tempid-addressed entities linked from their parent."
+   tempid-addressed entities linked from their parent.
+
+   An entity may carry SEVERAL unique-identity attrs (dvergr fuses `:chat/id` and
+   `:room/slug` on one entity). We address it by an ALREADY-EXISTING one when any
+   exists (so it resolves to that target entity), and we never re-assert identity
+   attrs on an existing subject — otherwise a divergence where the two unique
+   values point at DIFFERENT target entities would upsert the tempid to both
+   (`Conflicting upsert … resolves both to 300 and 320`)."
   [source-db target-db]
   (let [{:keys [unique ref]} (schema-attrs source-db)
         in-target? (fn [ua uv] (seq (d/q '[:find ?t :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv)))
+        idents     (fn [e] (let [ent (d/entity source-db e)]
+                             (keep (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
         addr       (fn [e]
-                     ;; existing-in-target identity → lookup-ref; else fresh tempid
-                     (let [vid (entity-ident source-db unique e)]
-                       (if (and vid (in-target? (first vid) (second vid)))
-                         (vec vid)
+                     ;; prefer an identity that ALREADY exists in target (→ that
+                     ;; entity); else a fresh tempid (new/anonymous)
+                     (let [ids (idents e)]
+                       (if-let [ex (first (filter (fn [[ua uv]] (in-target? ua uv)) ids))]
+                         (vec ex)
                          (str "ygg-tmp-" e))))
-        diff       (d/q '[:find ?e ?a ?v :in $ $2 :where
-                          [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
-                        source-db target-db)]
+        diff       (->> (d/q '[:find ?e ?a ?v :in $ $2 :where
+                               [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
+                             source-db target-db)
+                        ;; NEVER merge SCHEMA as data: a `:db/*` datom is an
+                        ;; attribute/enum definition (`:db/ident`, `:db/valueType`,
+                        ;; `:db/cardinality` …). Re-transacting it as flat data
+                        ;; upserts a schema entity to two existing ones and aborts
+                        ;; the whole merge. Schema is installed at startup and is
+                        ;; shared by parent + fork — leave it alone.
+                        (remove (fn [[_ a _]] (= "db" (namespace a)))))]
     (vec (for [[e a v] diff
-               :let [val (if (and (ref a) (integer? v)) (addr v) v)]]
-           [:db/add (addr e) a val]))))
+               :let  [subj (addr e)]
+               ;; on an EXISTING (lookup-ref) subject, never re-assign a unique
+               ;; identity attr — its identity is fixed; reassigning would move a
+               ;; unique value between entities and conflict on divergent data.
+               :when (not (and (vector? subj) (unique a)))
+               :let  [val (if (and (ref a) (integer? v)) (addr v) v)]]
+           [:db/add subj a val]))))
 
 ;; ============================================================
 ;; History traversal (synchronous, bounded)

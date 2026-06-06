@@ -85,6 +85,27 @@
           (is (= "b1" (ffirst (d/q '[:find ?bid :where [?i :item/id "i1"] [?i :item/box ?b] [?b :box/id ?bid]] db)))
               "item's ref resolved to the co-created box"))))))
 
+(deftest merge-ignores-schema-attrs-added-in-fork
+  (testing "a fork that registers a new SCHEMA attribute (a tool input schema) must
+            not abort the merge — :db/* datoms are schema, not data, and upserting
+            them as data resolves a tempid to two schema entities and rolls back"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :note/text :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "base" :note/text "base"}])
+      (p/branch! sys :feat)
+      (let [fsys (p/checkout sys :feat)]
+        ;; the fork registers a NEW attribute AND writes a note (data)
+        (d/transact (:conn fsys) [{:db/ident :note/tag :db/valueType :db.type/string
+                                   :db/cardinality :db.cardinality/one}])
+        (d/transact (:conn fsys) [{:note/id "n1" :note/text "hi" :note/tag "x"}])
+        (p/merge! sys :feat)            ; must not throw
+        (let [db @*conn*]
+          (is (= #{"base" "n1"} (set (d/q '[:find [?id ...] :where [_ :note/id ?id]] db)))
+              "the data note merged despite the fork-added schema attr"))))))
+
 (deftest conflicts-detects-3way-field-clash
   (testing "two branches changing the SAME cardinality-one attr to DIFFERENT
             values = a conflict; one-sided changes are not"
