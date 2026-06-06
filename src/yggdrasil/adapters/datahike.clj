@@ -151,19 +151,26 @@
        {:entity [ua uv] :attr a :base bv :ours ov :theirs tv}))))
 
 (defn- compute-merge-tx
-  "Merge tx-data for datoms in source not in target:
-   - entities carrying a `:db.unique/identity` attr are pulled and re-keyed by
-     their lookup-ref, so concurrent sibling branches UNION by semantic id rather
-     than colliding on entity-id (their components ride along nested);
-   - anonymous entities (no identity, and not a component of an identity entity)
-     are carried via a fresh tempid so they're added without entity-id collision
-     (no semantic key to dedup on — degenerate but lossless)."
+  "Merge tx-data for datoms in source not in target, addressed by SEMANTIC
+   identity so concurrent sibling branches union instead of colliding on
+   entity-id. Three cases:
+   - NEW identity entity (identity absent from target) → pulled + re-keyed by its
+     lookup-ref, components nested;
+   - EXISTING identity entity with changed/new attrs → flat
+     [:db/add lookup-ref a v] (so a fork's edit to an existing entity lands);
+   - anonymous entity (no identity, not a component of an identity entity) →
+     a fresh tempid (lossless add, nothing to dedup on)."
   [source-db target-db]
   (let [{:keys [unique component] :as sch} (schema-attrs source-db)
-        id-maps        (for [ua unique
-                             [e uv] (d/q '[:find ?e ?uv :in $ ?ua :where [?e ?ua ?uv]] source-db ua)
-                             :when  (empty? (d/q '[:find ?t :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv))]
-                         (prepare-entity source-db sch e))
+        in-target?     (fn [ua uv] (seq (d/q '[:find ?t :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv)))
+        new-eids       (volatile! #{})
+        ;; identity entities NEW in target → pull full (components nested)
+        id-maps        (doall
+                        (for [ua unique
+                              [e uv] (d/q '[:find ?e ?uv :in $ ?ua :where [?e ?ua ?uv]] source-db ua)
+                              :when  (not (in-target? ua uv))]
+                          (do (vswap! new-eids conj e)
+                              (prepare-entity source-db sch e))))
         ;; component entities are reached via their identity parent's pull
         component-eids (set (when (seq component)
                               (d/q '[:find [?c ...] :in $ [?ca ...] :where [_ ?ca ?c]] source-db (vec component))))
@@ -171,16 +178,15 @@
         resolve-v      (fn [a v] (if (and (ref? a) (integer? v))
                                    (or (entity-ident source-db unique v) v)
                                    v))
-        anon-datoms    (->> (d/q '[:find ?e ?a ?v :in $ $2 :where
-                                   [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
-                                 source-db target-db)
-                            (remove (fn [[e]] (or (entity-ident source-db unique e)
-                                                  (component-eids e)))))
-        anon-tx        (->> (group-by first anon-datoms)
-                            (mapcat (fn [[e datoms]]
-                                      (let [tid (str "ygg-tmp-" e)]
-                                        (map (fn [[_ a v]] [:db/add tid a (resolve-v a v)]) datoms)))))]
-    (vec (concat (remove nil? id-maps) anon-tx))))
+        diff           (d/q '[:find ?e ?a ?v :in $ $2 :where
+                              [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
+                            source-db target-db)
+        flat           (for [[e a v] diff
+                             :when (not (@new-eids e))        ; new entity → handled by its pull
+                             :when (not (component-eids e))   ; component → handled by parent pull
+                             :let  [eref (entity-ident source-db unique e)]]
+                         [:db/add (or eref (str "ygg-tmp-" e)) a (resolve-v a v)])]
+    (vec (concat (remove nil? id-maps) flat))))
 
 ;; ============================================================
 ;; History traversal (synchronous, bounded)
