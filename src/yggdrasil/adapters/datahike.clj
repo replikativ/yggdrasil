@@ -60,7 +60,15 @@
 
 (defn- walk-history
   "Walk commit graph from starting refs, collecting snapshot-ids.
-   Returns vector of commit UUIDs in traversal order."
+   Returns vector of commit-id STRINGS in traversal order.
+
+   The queue/visited carry the raw refs (branch keyword or commit UUID) so
+   konserve `k/get` can load each node, but the RESULT is stringified — the
+   protocol's snapshot-ids are strings (`snapshot-id` returns `(str …)`), and
+   every consumer (`ancestors`, `ancestor?`, `common-ancestor`, `commit-graph`)
+   compares with `(str …)`. Returning UUID objects here silently broke all of
+   them (a UUID never equals its own string in a set lookup → common-ancestor
+   always returned nil)."
   [store start-refs {:keys [limit] :or {limit 100}}]
   (loop [queue (vec start-refs)
          visited #{}
@@ -76,7 +84,7 @@
                   parents (parent-ids-of db)]
               (recur (into (vec rest) parents)
                      (conj visited current)
-                     (conj result (commit-id-of db))))
+                     (conj result (str (commit-id-of db)))))
             (recur (vec rest) (conj visited current) result)))))))
 
 ;; ============================================================
