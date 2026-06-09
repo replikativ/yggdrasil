@@ -41,9 +41,9 @@
             Mannheim/San-Francisco data-loss scenario"
     (let [sys (dha/create *conn* {:system-name "t"})]
       (d/transact *conn* [{:db/ident :note/id   :db/valueType :db.type/string
-                            :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
-                           {:db/ident :note/text :db/valueType :db.type/string
-                            :db/cardinality :db.cardinality/one}])
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :note/text :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
       (d/transact *conn* [{:note/id "base" :note/text "base"}])
       (p/branch! sys :sib-a)
       (p/branch! sys :sib-b)
