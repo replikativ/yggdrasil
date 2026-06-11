@@ -140,6 +140,37 @@
                       (not (and (inst? ov) (inst? tv))))]
        {:entity [ua uv] :attr a :base bv :ours ov :theirs tv}))))
 
+(defn- compute-conflicts-baseless
+  "Conservative 2-way conflict set, used when the merge-base is UNAVAILABLE — e.g.
+   its snapshot was reclaimed by a GC retention window, or the branches share no
+   common ancestor. Without a base we cannot tell WHICH side changed a value, so we
+   flag every cardinality-one attr whose value DIFFERS between the two heads for the
+   same identity-bearing entity. This OVER-flags (a one-sided change looks like a
+   clash) on purpose: better to escalate a stale-fork merge to review than to let
+   the conflict gate silently see `[]` and blind-merge. Entries are tagged
+   `:base :unavailable` so callers can tell this from a true 3-way result."
+  [ours-db theirs-db]
+  (let [{:keys [unique ref]} (schema-attrs theirs-db)
+        cattrs (card-one-attrs theirs-db)
+        find-e (fn [db ua uv] (ffirst (d/q '[:find ?e :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv)))
+        valof  (fn [db e a]
+                 (let [v (get (d/entity db e) a)]
+                   (if (and v (ref a)) (entity-ident db unique (:db/id v)) v)))]
+    (vec
+     (for [ua    unique
+           [_te uv] (d/q '[:find ?e ?uv :in $ ?ua :where [?e ?ua ?uv]] theirs-db ua)
+           :let  [eo (find-e ours-db ua uv)
+                  et (find-e theirs-db ua uv)]
+           :when (and eo et)
+           a     cattrs
+           :let  [ov (valof ours-db eo a)
+                  tv (valof theirs-db et a)]
+           ;; both heads carry a value and they DIFFER (temporal churn excepted —
+           ;; updated-at/last-seen just advance, the union takes the later one).
+           :when (and (some? ov) (some? tv) (not= ov tv)
+                      (not (and (inst? ov) (inst? tv))))]
+       {:entity [ua uv] :attr a :base :unavailable :ours ov :theirs tv}))))
+
 (defn- compute-merge-tx
   "Merge tx-data for datoms in source not in target, addressed by SEMANTIC
    identity so concurrent branches union instead of colliding on entity-id.
@@ -426,9 +457,15 @@
           db-b    (resolve-db store b)
           base-id (p/common-ancestor this a b)
           db-base (when base-id (resolve-db store base-id))]
-      (if (and db-a db-b db-base)
-        (compute-conflicts db-base db-a db-b)
-        [])))
+      (cond
+        ;; merge-base available → precise 3-way conflict detection.
+        (and db-a db-b db-base) (compute-conflicts db-base db-a db-b)
+        ;; base UNAVAILABLE (GC'd by retention, or no common ancestor) but both
+        ;; heads resolve → conservative 2-way fallback, NEVER a silent `[]` that
+        ;; would let the merge gate blind-merge a divergent stale fork.
+        (and db-a db-b)         (compute-conflicts-baseless db-a db-b)
+        ;; a head itself unresolvable → nothing to compare.
+        :else                   [])))
 
   (diff [this a b] (p/diff this a b nil))
   (diff [_ a b _opts]

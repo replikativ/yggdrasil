@@ -156,3 +156,68 @@
             ;; or an ancestor of it — never a post-fork commit.
             (is (or (= ca base-snap) (p/ancestor? fsys ca base-snap))
                 "merge-base is the fork point (or earlier), not a post-fork commit")))))))
+
+(deftest conflicts-survives-gc-of-merge-base
+  (testing "when retention GC reclaims the merge-base, conflict detection must NOT
+            silently return [] — it falls back to a conservative 2-way check so a
+            divergent stale fork still surfaces (never blind-merges)."
+    ;; FILE backend: gc-storage needs a flushed index (memory leaves it unflushed).
+    (let [dir (str (System/getProperty "java.io.tmpdir") "/ygg-gc-base-" (random-uuid))
+          cfg {:store {:backend :file :path dir :id (random-uuid)}
+               :keep-history? true :schema-flexibility :read}]
+      (d/create-database cfg)
+      (let [conn (d/connect cfg)]
+        (try
+          (let [sys (dha/create conn {:system-name "t"})]
+            (d/transact conn [{:db/ident :note/id   :db/valueType :db.type/string
+                               :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                              {:db/ident :note/text :db/valueType :db.type/string
+                               :db/cardinality :db.cardinality/one}])
+            ;; pad history so the fork point is an OLD intermediate commit
+            (dotimes [i 30] (d/transact conn [{:note/id "n" :note/text (str "v" i)}]))
+            (p/branch! sys :ours)
+            (p/branch! sys :theirs)
+            (let [osys (p/checkout sys :ours)
+                  tsys (p/checkout sys :theirs)]
+              (d/transact (:conn osys) [{:note/id "n" :note/text "ours-val"}])
+              (d/transact (:conn tsys) [{:note/id "n" :note/text "theirs-val"}])
+              ;; base present → precise 3-way = exactly the n clash
+              (is (= 1 (count (p/conflicts osys (p/snapshot-id osys) (p/snapshot-id tsys))))
+                  "3-way with base present finds exactly the n clash")
+              ;; reclaim everything before now (collapses old snapshots incl. fork point)
+              @(d/gc-storage conn (java.util.Date.))
+              (let [base  (p/common-ancestor osys (p/snapshot-id osys) (p/snapshot-id tsys))
+                    confs (p/conflicts osys (p/snapshot-id osys) (p/snapshot-id tsys))]
+                (println :BASE-AFTER-GC base :N-CONFS (count confs) :CONFS confs)
+                ;; THE INVARIANT (the whole point): the divergence is ALWAYS surfaced —
+                ;; never a silent [] that would let the merge gate blind-merge.
+                (is (seq confs) "divergence must surface even if the merge-base was GC'd")
+                (is (some #(= [:note/id "n"] (:entity %)) confs) "n's clash is flagged"))))
+          (finally (d/release conn) (d/delete-database cfg)))))))
+
+(deftest baseless-conflicts-over-flag-conservatively
+  (testing "the baseless fallback (used when the merge-base is unavailable) flags
+            EVERY card-one attr that differs between the heads — including a
+            one-sided change it can't prove is safe — so the merge gate escalates
+            rather than blind-merges. Deterministically exercises the path the GC
+            test can't (gc-storage keeps live branches' merge-base)."
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id   :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :note/text :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "n" :note/text "base"} {:note/id "m" :note/text "m-base"}])
+      (p/branch! sys :ours)
+      (p/branch! sys :theirs)
+      (let [osys (p/checkout sys :ours)
+            tsys (p/checkout sys :theirs)]
+        ;; n: both change differently (true clash). m: only ours changes (one-sided).
+        (d/transact (:conn osys) [{:note/id "n" :note/text "ours"} {:note/id "m" :note/text "m-ours"}])
+        (d/transact (:conn tsys) [{:note/id "n" :note/text "theirs"}])
+        (let [baseless (deref #'dha/compute-conflicts-baseless)
+              confs    (baseless @(:conn osys) @(:conn tsys))]
+          ;; over-flags: BOTH n (real) AND m (one-sided, can't prove safe w/o base)
+          (is (= #{[:note/id "n"] [:note/id "m"]} (set (map :entity confs)))
+              "flags the real clash AND conservatively the one-sided change")
+          (is (every? #(= :unavailable (:base %)) confs)
+              "entries tagged :base :unavailable (distinguishable from 3-way)"))))))
