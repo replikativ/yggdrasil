@@ -338,14 +338,33 @@
          set))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids _opts]
-    ;; Git doesn't support deleting individual commits.
-    ;; Run reflog expire + gc to prune unreachable objects.
-    (try
-      (git repo-path "reflog" "expire" "--expire=now" "--all")
-      (git repo-path "gc" "--prune=now")
-      (catch Exception _))
-    this))
+  (gc-sweep! [this _snapshot-ids opts]
+    ;; Git can't delete individual commits — it reclaims storage by pruning
+    ;; UNREACHABLE objects (e.g. left by a deleted fork branch). `git gc` already
+    ;; computes reachability from refs, so we ignore the coordinator's snapshot-ids.
+    ;; Conservative by default: plain `git gc` keeps git's built-in grace
+    ;; (gc.pruneExpire = 2.weeks.ago), so a just-deleted branch's objects aren't
+    ;; ripped out from under a concurrent reader.
+    ;;   :grace-period-ms <ms> — override the prune horizon (0 = prune now)
+    ;;   :dry-run?             — report loose-object count, prune nothing
+    (let [loose (fn [] (-> (git repo-path "count-objects" "-v")
+                           (->> (re-find #"count: (\d+)")) second
+                           (some-> Long/parseLong)))]
+      (if (:dry-run? opts)
+        {:system-id system-name :dry-run? true :loose-objects (try (loose) (catch Exception _ nil))}
+        (let [before   (try (loose) (catch Exception _ nil))
+              g        (:grace-period-ms opts)
+              horizon  (when g (.format (java.text.SimpleDateFormat. "yyyy-MM-dd'T'HH:mm:ss")
+                                        (java.util.Date. (- (System/currentTimeMillis) (long g)))))]
+          ;; When a grace is given, also expire reflog to that horizon — otherwise
+          ;; reflog entries keep just-unreachable objects pinned and `gc --prune`
+          ;; can't reclaim them. grace 0 ⇒ expire+prune "now" = immediate reclaim.
+          (when horizon
+            (try (git repo-path "reflog" "expire" (str "--expire=" horizon) "--all") (catch Exception _)))
+          (try (apply git repo-path "gc" (when horizon [(str "--prune=" horizon)]))
+               (catch Exception _))
+          (let [after (try (loose) (catch Exception _ nil))]
+            {:system-id system-name :pruned-loose (when (and before after) (- before after))}))))))
 
 (defn create
   "Create a Git adapter for an existing repository with worktree support.
@@ -378,3 +397,20 @@
      ;; Create entries directory (for data ops)
      (.mkdirs (java.io.File. (str path "/entries")))
      (create path opts))))
+
+(defn prune-orphan-branches!
+  "Delete every branch of `git-sys` (and its worktree) for which `(orphan? name)`
+   returns truthy — EXCEPT the current branch. A GC primitive for abandoned fork
+   branches whose live handle is gone after a crash/restart: the CALLER's predicate
+   decides orphan-ness (e.g. matches a fork-naming convention AND is absent from a
+   live registry AND past a TTL). Returns the vector of deleted branch names.
+   Best-effort: a branch that fails to delete is skipped, not fatal."
+  [git-sys orphan?]
+  (let [cur (name (p/current-branch git-sys))]
+    (->> (p/branches git-sys)
+         (map name)
+         (filter (fn [b] (and (not= b cur) (orphan? b))))
+         (reduce (fn [acc b]
+                   (if (try (p/delete-branch! git-sys b) true (catch Throwable _ false))
+                     (conj acc b) acc))
+                 []))))

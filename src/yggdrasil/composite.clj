@@ -446,13 +446,14 @@
               (map (fn [[_ sys]] (p/gc-roots sys)) systems))))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids _opts]
-    (let [new-systems (reduce-kv
-                       (fn [acc sid sys]
-                         (assoc acc sid (p/gc-sweep! sys snapshot-ids)))
-                       {}
-                       systems)]
-      (assoc this :systems new-systems))))
+  (gc-sweep! [_ snapshot-ids opts]
+    ;; Fan out to each sub-system, FORWARDING opts (retention/grace/dry-run) so
+    ;; per-adapter knobs like datahike's :remove-before reach the leaves. gc-sweep!
+    ;; reclaims storage without changing system identity, so it returns a
+    ;; reclamation REPORT, not the system — here {system-id → leaf report}.
+    (reduce-kv (fn [acc sid sys]
+                 (assoc acc sid (p/gc-sweep! sys snapshot-ids opts)))
+               {} systems)))
 
 ;; ============================================================
 ;; Lifecycle
