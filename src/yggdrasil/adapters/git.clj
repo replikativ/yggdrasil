@@ -378,3 +378,20 @@
      ;; Create entries directory (for data ops)
      (.mkdirs (java.io.File. (str path "/entries")))
      (create path opts))))
+
+(defn prune-orphan-branches!
+  "Delete every branch of `git-sys` (and its worktree) for which `(orphan? name)`
+   returns truthy — EXCEPT the current branch. A GC primitive for abandoned fork
+   branches whose live handle is gone after a crash/restart: the CALLER's predicate
+   decides orphan-ness (e.g. matches a fork-naming convention AND is absent from a
+   live registry AND past a TTL). Returns the vector of deleted branch names.
+   Best-effort: a branch that fails to delete is skipped, not fatal."
+  [git-sys orphan?]
+  (let [cur (name (p/current-branch git-sys))]
+    (->> (p/branches git-sys)
+         (map name)
+         (filter (fn [b] (and (not= b cur) (orphan? b))))
+         (reduce (fn [acc b]
+                   (if (try (p/delete-branch! git-sys b) true (catch Throwable _ false))
+                     (conj acc b) acc))
+                 []))))
