@@ -128,8 +128,9 @@
              (if (and sys (satisfies? p/GarbageCollectable sys))
                (let [snap-ids (set (map :snapshot-id entries))]
                  (try
-                   ;; Step 1: adapter deletes native snapshots
-                   (p/gc-sweep! sys snap-ids)
+                   ;; Step 1: adapter deletes native snapshots (forward opts so
+                   ;; per-adapter retention/grace/dry-run reach the leaf)
+                   (p/gc-sweep! sys snap-ids opts)
                    ;; Step 2: only deregister after adapter confirms success
                    (doseq [entry entries]
                      (reg/deregister! registry entry))
@@ -178,3 +179,26 @@
       :by-system (group-by :system-id candidates)
       :total-entries (reg/entry-count registry)
       :gc-eligible (count candidates)})))
+
+;; ============================================================
+;; Single-system GC (no coordinator/registry needed)
+;; ============================================================
+
+(defn gc-system!
+  "Reclaim unreachable storage for ONE GarbageCollectable system — datahike, git,
+   or a composite of them — without a coordinator or registry. The system uses its
+   OWN reachability (every branch head + that head's history is always kept), so
+   this is the ergonomic entry for storage-GC adapters: callers needn't import
+   yggdrasil.protocols nor build a workspace.
+
+   opts (all optional, adapter-specific):
+     :remove-before <java.util.Date> — datahike: also collapse snapshots before it
+                                       (default epoch = keep all history)
+     :grace-period-ms <ms>           — git: prune horizon (default git's 2 weeks)
+     :dry-run?                       — report without deleting
+
+   Returns the adapter's reclamation report; a composite returns {system-id → report}.
+   (Per-snapshot adapters that need the candidate set must use gc-sweep! with a
+   registry instead.)"
+  ([system] (gc-system! system {}))
+  ([system opts] (p/gc-sweep! system nil opts)))

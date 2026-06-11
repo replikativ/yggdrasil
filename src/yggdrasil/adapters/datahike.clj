@@ -369,10 +369,34 @@
            set)))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids _opts]
-    ;; Datahike manages its own GC internally.
-    ;; Actual storage reclamation happens through Datahike's gc-storage!.
-    this)
+  (gc-sweep! [_ _snapshot-ids opts]
+    ;; Reclaim unreachable datahike index blobs (orphaned hitchhiker-tree nodes
+    ;; left behind by every transaction). Datahike computes its OWN reachability
+    ;; — it always keeps every branch head + that head's history — so we ignore
+    ;; the coordinator's snapshot-ids and just forward the retention cutoff.
+    ;;   :remove-before <java.util.Date> — also collapse snapshots committed
+    ;;     before this instant. Default (Date. 0) = epoch = keep ALL history,
+    ;;     deleting only the orphaned rewrite garbage (safe to run anytime).
+    ;;   :dry-run?      — report nothing reclaimed without touching storage.
+    ;;   :gc-timeout-ms — bound the blocking wait (default 10 min); on expiry the
+    ;;                    GC keeps running in datahike's writer, we just stop waiting.
+    ;; BOUNDARY CALL — `d/gc-storage` returns datahike's async throwable-promise;
+    ;; we deref it WITH A TIMEOUT (never an unbounded @) so a stuck writer can't
+    ;; wedge the caller. Must be invoked from a dedicated/boundary thread, NOT a
+    ;; core.async dispatch thread or a reactive loop (it blocks that thread).
+    ;; Returns {:system-id … :reclaimed <key-count>} (or :timeout?/:dry-run?).
+    (if (:dry-run? opts)
+      {:system-id system-name :dry-run? true}
+      (let [remove-before (or (:remove-before opts) (java.util.Date. 0))
+            timeout-ms    (or (:gc-timeout-ms opts) 600000)
+            removed       (deref (d/gc-storage conn remove-before) timeout-ms ::timeout)]
+        (if (= removed ::timeout)
+          {:system-id system-name :timeout? true}
+          {:system-id system-name
+           :reclaimed (cond (number? removed) removed
+                            (counted? removed) (count removed)
+                            (seqable? removed) (count (seq removed))
+                            :else 0)}))))
 
   p/Mergeable
   (merge! [this source] (p/merge! this source {}))

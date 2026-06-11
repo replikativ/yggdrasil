@@ -205,10 +205,17 @@
      These snapshots and their ancestors will not be collected.")
 
   (gc-sweep! [this snapshot-ids] [this snapshot-ids opts]
-    "Delete the given snapshots from the system's native storage.
-     Only deletes snapshots that are safe to remove per the system's logic.
-     Returns new system with snapshots removed.
-     opts: {:sync? true} — when false, returns channel/promise."))
+    "Reclaim storage. `snapshot-ids` are candidate snapshots to delete (computed by
+     the coordinator); storage-GC adapters that compute their own reachability
+     (datahike, git) IGNORE it and reclaim everything unreachable from their branch
+     heads instead. Returns an adapter-specific reclamation REPORT (not the system),
+     e.g. {:system-id … :reclaimed n} — a composite returns {system-id → report}.
+     opts (all optional, adapter-specific):
+       :remove-before <java.util.Date> — datahike: also collapse snapshots before it
+                                         (default epoch = keep all history)
+       :grace-period-ms <ms>           — git: prune horizon (default git's 2 weeks)
+       :dry-run?                       — report without deleting
+       :sync?                          — when false, returns channel/promise"))
 
 ;; ============================================================
 ;; Addressable (filesystem-backed systems)

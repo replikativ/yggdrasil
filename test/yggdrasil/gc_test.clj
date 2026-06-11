@@ -312,9 +312,10 @@
                                     (+ old-time 1000))]
             (reg/register-batch! r [e-main e-feat1 e-feat2])
 
-            ;; 6. Run the GC coordinator
-            (let [result (gc/gc-sweep! r [sys]
-                                       {:grace-period-ms (* 7 24 60 60 1000)})]
+            ;; 6. Run the GC coordinator. grace 0 ⇒ expire reflog + prune "now" so
+            ;; the just-unreachable feature objects are reclaimed immediately (the
+            ;; conservative default keeps git's 2-week grace, retaining fresh objects).
+            (let [result (gc/gc-sweep! r [sys] {:grace-period-ms 0})]
               ;; Feature entries should be swept from registry
               (is (= 2 (count (:swept result)))
                   "Two feature entries should be swept")
@@ -345,3 +346,52 @@
         (finally
           (delete-dir-recursive path)
           (delete-dir-recursive (str path "-worktrees")))))))
+
+;; ============================================================
+;; Opts threading + report contract (regression for the GC-into-shape pass)
+;; ============================================================
+
+;; A GarbageCollectable that RECORDS the (snapshot-ids, opts) it was handed and
+;; returns a reclamation REPORT (the new contract), so we can assert opts reach it.
+(defrecord OptsRecorderSystem [id seen]
+  p/SystemIdentity (system-id [_] id) (system-type [_] :recorder)
+  p/Snapshotable
+  (snapshot-id [_] (str "snap-" id))
+  (snapshot-meta [_ _] nil)
+  p/GarbageCollectable
+  (gc-roots [_] #{})
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [_ snapshot-ids opts]
+    (reset! seen {:snapshot-ids snapshot-ids :opts opts})
+    {:system-id id :reclaimed 7}))
+
+(deftest test-composite-forwards-opts-and-returns-reports
+  (testing "CompositeSystem.gc-sweep! forwards opts to each leaf and returns {sid → report}"
+    (let [a (->OptsRecorderSystem "a" (atom nil))
+          b (->OptsRecorderSystem "b" (atom nil))
+          comp ((requiring-resolve 'yggdrasil.composite/composite) [a b])
+          opts {:remove-before (java.util.Date. 123) :dry-run? false}
+          report (p/gc-sweep! comp #{"snap-x"} opts)]
+      (is (= opts (:opts @(:seen a))) "leaf a received the forwarded opts")
+      (is (= opts (:opts @(:seen b))) "leaf b received the forwarded opts")
+      (is (= {:system-id "a" :reclaimed 7} (get report "a")) "report keyed by system-id")
+      (is (= {:system-id "b" :reclaimed 7} (get report "b"))))))
+
+(deftest test-coordinator-forwards-opts-to-adapter
+  (testing "yggdrasil.gc/gc-sweep! forwards opts down to the adapter"
+    (let [sys (->OptsRecorderSystem "git:r" (atom nil))
+          r   (reg/create-registry)
+          old (- (System/currentTimeMillis) (* 30 24 60 60 1000))]
+      (reg/register! r (make-entry "snap-old" "git:r" "main" old))
+      (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)
+                             :remove-before (java.util.Date. 99)})
+      (is (= (java.util.Date. 99) (:remove-before (:opts @(:seen sys))))
+          "adapter saw remove-before from the coordinator's opts"))))
+
+(deftest test-gc-system-convenience
+  (testing "yggdrasil.gc/gc-system! GCs one system (nil snapshot-ids) and returns its report"
+    (let [sys (->OptsRecorderSystem "s" (atom nil))
+          report (gc/gc-system! sys {:remove-before (java.util.Date. 5)})]
+      (is (= {:system-id "s" :reclaimed 7} report))
+      (is (nil? (:snapshot-ids @(:seen sys))) "single-system GC passes nil snapshot-ids")
+      (is (= (java.util.Date. 5) (:remove-before (:opts @(:seen sys))))))))
