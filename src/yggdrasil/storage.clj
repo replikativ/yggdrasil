@@ -14,7 +14,6 @@
      :registry/freed   - map of freed addresses to timestamps"
   (:require [konserve.core :as k]
             [konserve.store :as kstore]
-            [clojure.core.async :refer [<!!]]
             [yggdrasil.types :as t])
   (:import [org.replikativ.persistent_sorted_set
             ANode Branch IStorage Leaf Settings]))
@@ -85,13 +84,13 @@
                      :keys      (mapv entry->map (.keys node))
                      :addresses (when (instance? Branch node)
                                   (vec (.addresses ^Branch node)))}]
-      (<!! (k/assoc kv-store address node-data))
+      (k/assoc kv-store address node-data {:sync? true})
       (swap! cache assoc address node)
       address))
 
   (restore [_ address]
     (or (get @cache address)
-        (let [node-data (<!! (k/get kv-store address))
+        (let [node-data (k/get kv-store address nil {:sync? true})
               raw-keys (:keys node-data)
               keys (mapv map->entry raw-keys)
               addresses (:addresses node-data)
@@ -132,13 +131,13 @@
 (defn save-roots!
   "Persist the root addresses of the indices."
   [kv-store roots]
-  (<!! (k/assoc kv-store :registry/roots roots)))
+  (k/assoc kv-store :registry/roots roots {:sync? true}))
 
 (defn load-roots
   "Load the root addresses of the indices.
    Returns nil if no roots stored."
   [kv-store]
-  (<!! (k/get kv-store :registry/roots)))
+  (k/get kv-store :registry/roots nil {:sync? true}))
 
 ;; ============================================================
 ;; Freed node tracking
@@ -147,12 +146,12 @@
 (defn save-freed!
   "Persist freed node addresses with their timestamps."
   [kv-store freed]
-  (<!! (k/assoc kv-store :registry/freed freed)))
+  (k/assoc kv-store :registry/freed freed {:sync? true}))
 
 (defn load-freed
   "Load freed node addresses."
   [kv-store]
-  (or (<!! (k/get kv-store :registry/freed)) {}))
+  (or (k/get kv-store :registry/freed nil {:sync? true}) {}))
 
 (defn sweep-freed!
   "Delete freed nodes older than grace-period-ms from konserve.
@@ -163,7 +162,7 @@
         freed @freed-atom
         to-sweep (filter (fn [[_ ts]] (< ts cutoff)) freed)]
     (doseq [[address _] to-sweep]
-      (<!! (k/dissoc kv-store address)))
+      (k/dissoc kv-store address {:sync? true}))
     (swap! freed-atom #(apply dissoc % (map first to-sweep)))
     (count to-sweep)))
 

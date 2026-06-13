@@ -25,7 +25,6 @@
             [yggdrasil.types :as t]
             [yggdrasil.storage :as store]
             [konserve.core :as k]
-            [clojure.core.async :refer [<!!]]
             [clojure.set :as set]
             [clojure.string :as str]
             [org.replikativ.persistent-sorted-set :as pss])
@@ -81,13 +80,13 @@
                      :keys      (vec (.keys node))
                      :addresses (when (instance? Branch node)
                                   (vec (.addresses ^Branch node)))}]
-      (<!! (k/assoc kv-store address node-data))
+      (k/assoc kv-store address node-data {:sync? true})
       (swap! cache assoc address node)
       address))
 
   (restore [_ address]
     (or (get @cache address)
-        (let [node-data (<!! (k/get kv-store address))
+        (let [node-data (k/get kv-store address nil {:sync? true})
               keys      (vec (:keys node-data))
               addresses (:addresses node-data)
               node (if addresses
@@ -165,8 +164,8 @@
   (if store-config
     (let [kv (store/open-store store-config)
           stg (create-composite-storage kv)
-          root (<!! (k/get kv :composite/root))
-          freed (or (<!! (k/get kv :composite/freed)) {})]
+          root (k/get kv :composite/root nil {:sync? true})
+          freed (or (k/get kv :composite/freed nil {:sync? true}) {})]
       (reset! (:freed-atom stg) freed)
       (if root
         [kv store-config stg (pss/restore-by entry-comparator root stg
@@ -182,8 +181,8 @@
   [kv-store storage index-atom]
   (when storage
     (let [root (pss/store @index-atom storage)]
-      (<!! (k/assoc kv-store :composite/root root)))
-    (<!! (k/assoc kv-store :composite/freed @(:freed-atom storage)))))
+      (k/assoc kv-store :composite/root root {:sync? true}))
+    (k/assoc kv-store :composite/freed @(:freed-atom storage) {:sync? true})))
 
 (defn- register-initial-snapshot!
   "Record the initial composite snapshot if not already in the index.
