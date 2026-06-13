@@ -50,38 +50,42 @@
 ;; Record <-> map conversion for safe serialization (JVM records only)
 ;; ============================================================
 
-#?(:clj
-   (defn- entry->map [entry]
-     (when entry
-       {:snapshot-id  (:snapshot-id entry)
-        :system-id    (:system-id entry)
-        :branch-name  (:branch-name entry)
-        :hlc          (when-let [h (:hlc entry)]
-                        {:physical (:physical h) :logical (:logical h)})
-        :content-hash (:content-hash entry)
-        :parent-ids   (:parent-ids entry)
-        :metadata     (:metadata entry)})))
+;; The registry's element codec: RegistryEntry is a record, converted to/from a
+;; plain map at the node-key boundary so konserve round-trips it without
+;; fressian/transit handlers. Other element types (keywords, strings, vectors —
+;; e.g. a durable G-Set) are konserve-native and use the identity codec; see
+;; `create-storage`. Public + cljc so the registry can opt into them and cljs
+;; compiles the reference.
+(defn entry->map [entry]
+  (when entry
+    {:snapshot-id  (:snapshot-id entry)
+     :system-id    (:system-id entry)
+     :branch-name  (:branch-name entry)
+     :hlc          (when-let [h (:hlc entry)]
+                     {:physical (:physical h) :logical (:logical h)})
+     :content-hash (:content-hash entry)
+     :parent-ids   (:parent-ids entry)
+     :metadata     (:metadata entry)}))
 
-#?(:clj
-   (defn- map->entry [m]
-     (when m
-       (t/->RegistryEntry
-        (:snapshot-id m) (:system-id m) (:branch-name m)
-        (when-let [h (:hlc m)] (t/->HLC (:physical h) (:logical h)))
-        (:content-hash m) (:parent-ids m) (:metadata m)))))
+(defn map->entry [m]
+  (when m
+    (t/->RegistryEntry
+     (:snapshot-id m) (:system-id m) (:branch-name m)
+     (when-let [h (:hlc m)] (t/->HLC (:physical h) (:logical h)))
+     (:content-hash m) (:parent-ids m) (:metadata m))))
 
 ;; ============================================================
 ;; KonserveStorage — IStorage for PSS B-tree nodes
 ;; ============================================================
 
-(defrecord KonserveStorage [kv-store settings cache freed-atom]
+(defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode]
   IStorage
   #?@(:clj
       [(store [_ node]
          (let [^ANode node node
                address (random-uuid)
                node-data {:level     (.level node)
-                          :keys      (mapv entry->map (.keys node))
+                          :keys      (mapv key-encode (.keys node))
                           :addresses (when (instance? Branch node)
                                        (vec (.addresses ^Branch node)))}]
            (kb/k-assoc kv-store address node-data {:sync? true})
@@ -91,7 +95,7 @@
        (restore [_ address]
          (or (get @cache address)
              (let [node-data (kb/k-get kv-store address {:sync? true})
-                   keys (mapv map->entry (:keys node-data))
+                   keys (mapv key-decode (:keys node-data))
                    addresses (:addresses node-data)
                    node (if addresses
                           (Branch. (int (:level node-data))
@@ -113,7 +117,7 @@
                      (async
                       (let [address (random-uuid)
                             node-data {:level     (node/level node)
-                                       :keys      (vec (.-keys node))
+                                       :keys      (mapv key-encode (.-keys node))
                                        :addresses (when (instance? Branch node)
                                                     (vec (.-addresses node)))}]
                         (await (kb/k-assoc kv-store address node-data opts))
@@ -126,8 +130,8 @@
                       (or (get @cache address)
                           (let [node-data (await (kb/k-get kv-store address opts))
                                 node (if (:addresses node-data)
-                                       (branch/from-map (assoc node-data :settings settings))
-                                       (Leaf. (:keys node-data) settings (:measure node-data)))]
+                                       (branch/from-map (assoc node-data :keys (mapv key-decode (:keys node-data)) :settings settings))
+                                       (Leaf. (mapv key-decode (:keys node-data)) settings (:measure node-data)))]
                             (swap! cache assoc address node)
                             node)))))
 
@@ -138,11 +142,19 @@
        (freedInfo [_ address] (get @freed-atom address))]))
 
 (defn create-storage
-  "Create a KonserveStorage backed by a konserve store."
-  ([kv-store]
-   (create-storage kv-store #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0})))
-  ([kv-store settings]
-   (->KonserveStorage kv-store settings (atom {}) (atom {}))))
+  "Create a KonserveStorage backed by a konserve store.
+
+   `key-encode`/`key-decode` transcode element values at the node-key boundary
+   (default identity — for konserve-native values like keywords/strings/vectors,
+   e.g. a durable G-Set). The registry opts into `entry->map`/`map->entry`.
+   Pass nil for `settings` to get the platform default."
+  ([kv-store] (create-storage kv-store nil nil nil))
+  ([kv-store settings] (create-storage kv-store settings nil nil))
+  ([kv-store settings key-encode key-decode]
+   (->KonserveStorage kv-store
+                      (or settings #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
+                      (atom {}) (atom {})
+                      (or key-encode identity) (or key-decode identity))))
 
 ;; ============================================================
 ;; Index root + freed persistence — async+sync (sync on JVM, async on cljs)
