@@ -28,15 +28,27 @@
       (compare (:logical a) (:logical b))
       pc)))
 
+(defn now-ms
+  "Portable wall-clock millis since epoch (JVM + cljs).
+   NOTE (O5): for deterministic spindel replay the clock should be injectable;
+   a replay context must pass a fixed physical time rather than rely on this."
+  []
+  #?(:clj (System/currentTimeMillis)
+     :cljs (.getTime (js/Date.))))
+
+(def ^:private logical-max
+  #?(:clj Integer/MAX_VALUE
+     :cljs (.-MAX_SAFE_INTEGER js/Number)))
+
 (defn hlc-now
   "Create HLC from current time."
   []
-  (->HLC (System/currentTimeMillis) 0))
+  (->HLC (now-ms) 0))
 
 (defn hlc-tick
   "Advance HLC for local event."
   [hlc]
-  (let [now (System/currentTimeMillis)]
+  (let [now (now-ms)]
     (if (> now (:physical hlc))
       (->HLC now 0)
       (->HLC (:physical hlc) (inc (:logical hlc))))))
@@ -46,12 +58,12 @@
    Captures all events at or before this wall-clock time, including those
    with logical counter > 0 within the same millisecond."
   [physical-ms]
-  (->HLC physical-ms Integer/MAX_VALUE))
+  (->HLC physical-ms logical-max))
 
 (defn hlc-receive
   "Update HLC on receiving message with remote HLC."
   [local-hlc remote-hlc]
-  (let [now (System/currentTimeMillis)
+  (let [now (now-ms)
         max-physical (max now (:physical local-hlc) (:physical remote-hlc))]
     (if (= max-physical (:physical local-hlc) (:physical remote-hlc))
       (->HLC max-physical (inc (max (:logical local-hlc) (:logical remote-hlc))))
