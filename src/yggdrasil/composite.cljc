@@ -27,9 +27,10 @@
             [konserve.core :as k]
             [clojure.set :as set]
             [clojure.string :as str]
+            [hasch.core :as hasch]
             [org.replikativ.persistent-sorted-set :as pss])
-  (:import [org.replikativ.persistent_sorted_set
-            ANode Branch IStorage Leaf Settings]))
+  #?(:clj (:import [org.replikativ.persistent_sorted_set
+                    ANode Branch IStorage Leaf Settings])))
 
 ;; ============================================================
 ;; Composite snapshot-id
@@ -43,8 +44,7 @@
                        (map (fn [[sid sys]] [sid (p/snapshot-id sys)])
                             systems))
         content (pr-str pairs)]
-    (str (java.util.UUID/nameUUIDFromBytes
-          (.getBytes content "UTF-8")))))
+    (str (hasch/uuid content))))
 
 ;; ============================================================
 ;; Capability intersection
@@ -71,7 +71,11 @@
 ;; Unlike KonserveStorage in storage.clj (which converts keys to/from
 ;; RegistryEntry records), this stores plain Clojure maps directly.
 
-(defrecord CompositeStorage [kv-store ^Settings settings cache freed-atom]
+;; JVM-only: the durable PSS history index. On cljs the composite is ephemeral
+;; (in-memory index); durable composite on cljs is a later step (it would mirror
+;; storage.cljc's reader-conditional IStorage).
+#?(:clj
+   (defrecord CompositeStorage [kv-store ^Settings settings cache freed-atom]
   IStorage
   (store [_ node]
     (let [^ANode node node
@@ -103,18 +107,19 @@
 
   (markFreed [_ address]
     (when address
-      (swap! freed-atom assoc address (System/currentTimeMillis))))
+      (swap! freed-atom assoc address (t/now-ms))))
 
   (isFreed [_ address]
     (contains? @freed-atom address))
 
   (freedInfo [_ address]
-    (get @freed-atom address)))
+    (get @freed-atom address))))
 
-(defn- create-composite-storage
-  "Create a CompositeStorage backed by a konserve store."
-  [kv-store]
-  (->CompositeStorage kv-store (Settings.) (atom {}) (atom {})))
+#?(:clj
+   (defn- create-composite-storage
+     "Create a CompositeStorage backed by a konserve store."
+     [kv-store]
+     (->CompositeStorage kv-store (Settings.) (atom {}) (atom {}))))
 
 ;; ============================================================
 ;; PSS index helpers
@@ -161,19 +166,23 @@
    When store-config is provided, creates a konserve-backed PSS with lazy loading.
    Returns [kv-store store-config storage index]."
   [store-config]
-  (if store-config
-    (let [kv (store/open-store store-config)
-          stg (create-composite-storage kv)
-          root (k/get kv :composite/root nil {:sync? true})
-          freed (or (k/get kv :composite/freed nil {:sync? true}) {})]
-      (reset! (:freed-atom stg) freed)
-      (if root
-        [kv store-config stg (pss/restore-by entry-comparator root stg
-                                             {:branching-factor 64})]
-        [kv store-config stg (pss/sorted-set* {:comparator entry-comparator
-                                               :storage stg
-                                               :branching-factor 64})]))
-    [nil nil nil (pss/sorted-set-by entry-comparator)]))
+  #?(:clj
+     (if store-config
+       (let [kv (store/open-store store-config)
+             stg (create-composite-storage kv)
+             root (k/get kv :composite/root nil {:sync? true})
+             freed (or (k/get kv :composite/freed nil {:sync? true}) {})]
+         (reset! (:freed-atom stg) freed)
+         (if root
+           [kv store-config stg (pss/restore-by entry-comparator root stg
+                                                {:branching-factor 64})]
+           [kv store-config stg (pss/sorted-set* {:comparator entry-comparator
+                                                  :storage stg
+                                                  :branching-factor 64})]))
+       [nil nil nil (pss/sorted-set-by entry-comparator)])
+     ;; cljs: in-memory ephemeral index (durable composite on cljs is a later step)
+     :cljs
+     [nil nil nil (pss/sorted-set-by entry-comparator)]))
 
 (defn- persist-index!
   "Persist the PSS index root and freed nodes to konserve.
@@ -192,7 +201,7 @@
     (swap! index-atom conj
            {:composite-snap-id snap
             :parent-ids #{}
-            :timestamp (System/currentTimeMillis)
+            :timestamp (t/now-ms)
             :sub-snapshots (into {}
                                  (map (fn [[sid s]] [sid (p/snapshot-id s)]))
                                  sys-map)})
@@ -308,7 +317,7 @@
       (swap! index-atom conj
              {:composite-snap-id new-snap
               :parent-ids #{old-snap}
-              :timestamp (System/currentTimeMillis)
+              :timestamp (t/now-ms)
               :message message
               :sub-snapshots (into {}
                                    (map (fn [[sid sys]] [sid (p/snapshot-id sys)]))
@@ -498,7 +507,7 @@
   (let [store-config (or store-config
                          (when store-path
                            {:backend :file
-                            :id (java.util.UUID/randomUUID)
+                            :id (random-uuid)
                             :path store-path}))
         sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
         resolved-branch (if branch
@@ -539,7 +548,7 @@
   (let [store-config (or store-config
                          (when store-path
                            {:backend :file
-                            :id (java.util.UUID/randomUUID)
+                            :id (random-uuid)
                             :path store-path}))
         sys-map (into {} (map (fn [s] [(p/system-id s) s]) systems-seq))
         [kv-store resolved-config storage index] (init-index store-config)

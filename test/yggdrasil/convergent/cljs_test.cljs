@@ -3,7 +3,11 @@
    ClojureScript — i.e. yggdrasil's conflict-free systems run in the browser.
    Run: clojure -M:cljs-test (compiles to node, runs -main)."
   (:require [cljs.test :refer-macros [deftest is testing run-tests]]
-            [yggdrasil.storage] ;; force cljs compilation of the storage IStorage split (shadow)
+            ;; force cljs compilation of the cross-platform storage + index layer
+            [yggdrasil.storage]
+            [yggdrasil.registry]
+            [yggdrasil.composite]
+            [yggdrasil.workspace]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.gset :as gs]

@@ -54,7 +54,8 @@
 ;; ============================================================
 
 (def ^:private min-hlc (t/->HLC 0 0))
-(def ^:private max-hlc (t/->HLC Long/MAX_VALUE Integer/MAX_VALUE))
+(def ^:private max-hlc (t/->HLC #?(:clj Long/MAX_VALUE :cljs (.-MAX_SAFE_INTEGER js/Number))
+                                #?(:clj Integer/MAX_VALUE :cljs (.-MAX_SAFE_INTEGER js/Number))))
 (def ^:private max-str "\uffff")
 
 (defn- probe
@@ -268,7 +269,7 @@
      ;; Legacy: :store-path sugar — convert to file store config
      (:store-path opts)
      (create-registry {:store-config {:backend :file
-                                      :id (java.util.UUID/randomUUID)
+                                      :id (random-uuid)
                                       :path (:store-path opts)}})
 
      :else
