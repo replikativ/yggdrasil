@@ -248,7 +248,8 @@
      (:store-config opts)
      (let [store-config (:store-config opts)
            kv-store (store/open-store store-config)
-           storage (store/create-storage kv-store nil store/entry->map store/map->entry)
+           storage (store/create-storage kv-store {:key-encode store/entry->map
+                                                   :key-decode store/map->entry})
            roots (store/load-roots kv-store)
            freed (store/load-freed kv-store)
            _ (reset! (:freed-atom storage) freed)]

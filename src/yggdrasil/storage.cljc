@@ -19,6 +19,7 @@
    the storage boundary) and plain maps on cljs; the stored representation is a
    map either way."
   (:require [konserve.store :as kstore]
+            [hasch.core :as hasch]
             [yggdrasil.kbridge :as kb]
             [yggdrasil.types :as t]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
@@ -78,16 +79,21 @@
 ;; KonserveStorage — IStorage for PSS B-tree nodes
 ;; ============================================================
 
-(defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode]
+(defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode content-addressed?]
   IStorage
   #?@(:clj
       [(store [_ node]
          (let [^ANode node node
-               address (random-uuid)
                node-data {:level     (.level node)
                           :keys      (mapv key-encode (.keys node))
                           :addresses (when (instance? Branch node)
-                                       (vec (.addresses ^Branch node)))}]
+                                       (vec (.addresses ^Branch node)))}
+               ;; content-addressed: the address IS the hasch UUID of the node
+               ;; content. Branch content includes child addresses (themselves
+               ;; content hashes) ⇒ a Merkle tree: identical subtrees share an
+               ;; address, so successive versions ship incrementally and peers
+               ;; dedup. Else a random UUID (registry default — unchanged).
+               address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
            (kb/k-assoc kv-store address node-data {:sync? true})
            (swap! cache assoc address node)
            address))
@@ -115,11 +121,11 @@
       [(store [_ node opts]
          (async+sync (:sync? opts)
                      (async
-                      (let [address (random-uuid)
-                            node-data {:level     (node/level node)
+                      (let [node-data {:level     (node/level node)
                                        :keys      (mapv key-encode (.-keys node))
                                        :addresses (when (instance? Branch node)
-                                                    (vec (.-addresses node)))}]
+                                                    (vec (.-addresses node)))}
+                            address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
                         (await (kb/k-assoc kv-store address node-data opts))
                         (swap! cache assoc address node)
                         address))))
@@ -144,17 +150,24 @@
 (defn create-storage
   "Create a KonserveStorage backed by a konserve store.
 
-   `key-encode`/`key-decode` transcode element values at the node-key boundary
-   (default identity — for konserve-native values like keywords/strings/vectors,
-   e.g. a durable G-Set). The registry opts into `entry->map`/`map->entry`.
-   Pass nil for `settings` to get the platform default."
-  ([kv-store] (create-storage kv-store nil nil nil))
-  ([kv-store settings] (create-storage kv-store settings nil nil))
-  ([kv-store settings key-encode key-decode]
+   opts:
+     :key-encode / :key-decode  transcode element values at the node-key
+       boundary (default identity — for konserve-native values like
+       keywords/strings/vectors, e.g. a durable G-Set). The registry opts into
+       `entry->map`/`map->entry`.
+     :content-addressed?  when true (DEFAULT), a node's address is the hasch
+       UUID of its content (a Merkle tree) — required for clean cross-peer
+       merge + dedup + incremental sync. Set false for stores of heavy values
+       where hashing the content outweighs the dedup win (then addresses are
+       random UUIDs and only same-store structural sharing applies).
+     :settings  PSS settings (default = platform default)."
+  ([kv-store] (create-storage kv-store {}))
+  ([kv-store {:keys [settings key-encode key-decode content-addressed?]
+              :or {key-encode identity key-decode identity content-addressed? true}}]
    (->KonserveStorage kv-store
                       (or settings #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
                       (atom {}) (atom {})
-                      (or key-encode identity) (or key-decode identity))))
+                      key-encode key-decode content-addressed?)))
 
 ;; ============================================================
 ;; Index root + freed persistence — async+sync (sync on JVM, async on cljs)

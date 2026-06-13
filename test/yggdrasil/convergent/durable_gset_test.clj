@@ -60,6 +60,21 @@
       (is (contains? addrs root) "root is in the ship-set")
       (is (pos? (count addrs)) "ship-set is non-empty"))))
 
+(deftest content-addressed-nodes-dedup-cross-peer
+  (testing "two peers build the same set independently → identical root address"
+    ;; Merkle addressing: a node's address IS the hash of its content, so the
+    ;; SAME logical tree gets the SAME addresses on different peers/stores —
+    ;; this is what makes cross-peer merge dedup cleanly (the storage graph
+    ;; converges, not just the value).
+    (let [a (-> (g/durable-gset "kb" :store-config (mem)) (g/add :x) (g/add :y) (g/add :z))
+          b (-> (g/durable-gset "kb" :store-config (mem)) (g/add :x) (g/add :y) (g/add :z))
+          ra (d/store-set! (get @(:roots-atom a) (:current a)) (:storage a))
+          rb (d/store-set! (get @(:roots-atom b) (:current b)) (:storage b))]
+      (is (= ra rb) "identical content → identical content-addressed root")
+      ;; therefore shipping b's tree into a's store copies nothing
+      (is (zero? (d/ship! (:kv-store b) (:kv-store a) rb))
+          "content-addressed → cross-peer dedup, ship is a no-op"))))
+
 (deftest branch-is-an-independent-replica
   (testing "branch diverges locally; -join reconverges cleanly (conflict-free)"
     (let [sc (mem)
