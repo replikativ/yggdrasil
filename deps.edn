@@ -21,6 +21,12 @@
   :dev {:extra-paths ["dev"]
         :extra-deps {nrepl/nrepl {:mvn/version "1.1.0"}}}
 
+  ;; ClojureScript node test — proves the cljc core (CRDT catalog) runs on cljs.
+  :cljs-test {:extra-paths ["test"]
+              :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
+              :main-opts ["-m" "cljs.main" "-t" "node"
+                          "-m" "yggdrasil.convergent.cljs-test"]}
+
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
                  io.github.borkdude/gh-release-artifact {:git/sha "b946558225a7839f6a0f644834e838e190dc2262"}
