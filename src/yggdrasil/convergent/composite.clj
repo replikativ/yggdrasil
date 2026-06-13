@@ -22,11 +22,17 @@
                         (let [o (get others id)]
                           (cond
                             (nil? o) sys                       ; system only on `this`
-                            (c/convergent? sys) (c/-join sys o) ; CRDT: symmetric join
+                            (c/convergent? sys) (c/-join sys o) ; CRDT: symmetric 2-way join
+                            ;; versioned (datahike/git): 3-way merge — merge `other`'s
+                            ;; branch into `this`'s on the shared store. This IS the
+                            ;; per-system logic merge-to-parent! reimplements; conflicts
+                            ;; are surfaced via the composite's `conflicts` (the
+                            ;; merge-review seam), not auto-resolved here. Requires a
+                            ;; resolvable common ancestor (shared store / forked peer).
                             (satisfies? p/Mergeable sys)
-                            (throw (ex-info
-                                    "versioned sub-system peer-merge not yet wired (needs 3-way, L4)"
-                                    {:system-id id :system-type (p/system-type sys)}))
+                            (-> sys
+                                (p/checkout (p/current-branch sys))
+                                (p/merge! (p/current-branch o)))
                             :else sys)))
                       (:systems this))]
       (comp/composite (vec joined)
