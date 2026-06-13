@@ -1,0 +1,7 @@
+{
+  "name": "yggdrasil",
+  "private": true,
+  "devDependencies": {
+    "shadow-cljs": "3.1.7"
+  }
+}

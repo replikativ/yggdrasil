@@ -22,11 +22,17 @@
   :dev {:extra-paths ["dev"]
         :extra-deps {nrepl/nrepl {:mvn/version "1.1.0"}}}
 
-  ;; ClojureScript node test — proves the cljc core (CRDT catalog) runs on cljs.
+  ;; ClojureScript node test of the konserve-free catalog (bare cljs.main).
   :cljs-test {:extra-paths ["test"]
               :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
               :main-opts ["-m" "cljs.main" "-t" "node"
                           "-m" "yggdrasil.convergent.cljs-test"]}
+
+  ;; shadow-cljs node-test (konserve-backed storage). shadow-cljs brings its own
+  ;; current cljs (an old clojurescript pin is what breaks konserve's async+sync
+  ;; macro on cljs). Released deps only.
+  :shadow {:extra-paths ["test"]
+           :extra-deps {thheller/shadow-cljs {:mvn/version "2.28.21"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
