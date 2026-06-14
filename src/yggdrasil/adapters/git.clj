@@ -124,13 +124,38 @@
              :branch actual-branch}
      :events events}))
 
+;; ============================================================
+;; GitOverlay — worktree branch fork (Overlayable)
+;; ============================================================
+;; git is VERSIONED: its overlay is a native branch fork (its own worktree).
+;; `overlay` branches+checks-out a fresh overlay branch (a new worktree) as the
+;; writable system; `merge-down!` merges it back; `discard!` deletes the branch +
+;; worktree. (Same separate-record pattern as datahike; `local-writes` holds the
+;; forked system so the uniform `overlay-system` accessor works.)
+
+(defrecord GitOverlay [parent local-writes fork-branch parent-branch]
+  p/Overlayable
+  (base-ref [_] (p/snapshot-id parent))
+  (peek-parent [_] parent)
+  (peek-parent [_ _] parent)
+  (overlay-writes [_] (p/diff parent (p/snapshot-id parent) (p/snapshot-id @local-writes)))
+
+  (advance! [ov] (p/advance! ov nil))
+  (advance! [ov _] (reset! local-writes (p/merge! @local-writes parent-branch)) ov)
+
+  (merge-down! [ov] (p/merge-down! ov nil))
+  (merge-down! [_ _] (-> parent (p/checkout parent-branch) (p/merge! fork-branch)))
+
+  (discard! [_] (p/delete-branch! parent fork-branch) nil)
+  (discard! [_ _] (p/delete-branch! parent fork-branch) nil))
+
 (defrecord GitSystem [repo-path worktrees-dir current-branch
                       system-name watcher-state branch-locks]
   p/SystemIdentity
   (system-id [_] (or system-name (str "git:" repo-path)))
   (system-type [_] :git)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true true true))
+    (t/->Capabilities true true true true true true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -326,6 +351,16 @@
         (git wt "add" "-A")
         (git wt "commit" "-m" (or message "") "--allow-empty"))
       this))
+
+  p/Overlayable
+  ;; native worktree branch fork: branch+checkout a fresh overlay branch (its own
+  ;; worktree) as the writable system; `merge-down!` merges it back, `discard!`
+  ;; deletes branch + worktree.
+  (overlay [this _opts]
+    (let [pbranch (p/current-branch this)
+          fbranch (keyword (str "overlay-" (random-uuid)))
+          forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
+      (->GitOverlay this (atom forked) fbranch pbranch)))
 
   p/GarbageCollectable
   (gc-roots [_]
