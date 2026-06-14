@@ -36,14 +36,21 @@
                      :graphable false :overlayable false})
 
   p/Snapshotable
+  ;; snapshot-id = the content-addressed PSS ROOT of the current branch (an
+  ;; addressable value handle, stable across peers), NOT a bare content hash — so
+  ;; `as-of`/`branch!` can re-open it (freeze + run in isolation). Stores the
+  ;; current tree (idempotent, content-addressed) so the id names persisted data,
+  ;; the way datahike's snapshot-id names a committed db.
   (snapshot-id [_]
     (async+sync (:sync? opts)
-                (async (str (hash (await (d/set->clj (get @roots-atom current) opts)))))))
+                (async (str (await (d/store-set! (get @roots-atom current) storage opts))))))
   (parent-ids [_] #{})
-  (as-of [_ _]
+  (as-of [this snap-id] (p/as-of this snap-id nil))
+  (as-of [_ snap-id _opts]
+    ;; restore the immutable set rooted at `snap-id` (a content root address) —
+    ;; the FIXED value at that snapshot, not the live current branch.
     (async+sync (:sync? opts)
-                (async (await (d/set->clj (get @roots-atom current) opts)))))
-  (as-of [this t _] (p/as-of this t))
+                (async (await (d/set->clj (d/restore-set comparator (parse-uuid (str snap-id)) storage opts) opts)))))
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
   ;; structural ops — branch map only, sync on both platforms
@@ -54,10 +61,17 @@
   (branch! [this name] (swap! roots-atom assoc name
                               (get @roots-atom current (d/empty-set storage comparator)))
     this)
-  (branch! [this name from] (swap! roots-atom assoc name
-                                   (get @roots-atom from (d/empty-set storage comparator)))
+  (branch! [this name from] (p/branch! this name from nil))
+  ;; `from` = a branch keyword (branch off that head) OR a snapshot-id string
+  ;; (branch off a FIXED content root — the freeze+isolate primitive). The new
+  ;; branch shares the immutable content-addressed nodes; writes go to fresh
+  ;; nodes, so it is isolated by construction.
+  (branch! [this name from _]
+    (swap! roots-atom assoc name
+           (if (keyword? from)
+             (get @roots-atom from (d/empty-set storage comparator))
+             (d/restore-set comparator (parse-uuid (str from)) storage opts)))
     this)
-  (branch! [this name from _] (p/branch! this name from))
   (delete-branch! [this name] (swap! roots-atom dissoc name) this)
   (delete-branch! [this name _] (swap! roots-atom dissoc name) this)
   (checkout [this name] (assoc this :current name))

@@ -17,6 +17,26 @@
 (defn- tmpdir []
   (str (Files/createTempDirectory "ygg-dgset" (make-array FileAttribute 0))))
 
+(deftest snapshot-id-as-of-and-branch-from-snapshot
+  (testing "snapshot-id pins a content root; as-of + branch! re-open it (freeze + run isolated)"
+    (let [g   (-> (g/durable-gset "kb" :store-config (mem)) (g/add :x) (g/add :y))
+          sid (p/snapshot-id g)]                          ; FIX the value {:x :y}
+      (is (some? sid))
+      (g/add g :z)                                        ; evolve the live system → {:x :y :z}
+      (is (= #{:x :y :z} (g/elements g)))
+      ;; as-of the frozen snapshot returns the OLD value, not the current branch
+      (is (= #{:x :y} (p/as-of g sid)) "as-of re-opens the frozen value")
+      ;; branch FROM the snapshot-id → an isolated head at the frozen value
+      (let [iso (-> g (p/branch! :iso sid) (p/checkout :iso))]
+        (is (= #{:x :y} (g/elements iso)) "branch-from-snapshot is the frozen value")
+        (g/add iso :w)                                    ; evolve the isolated branch
+        (is (= #{:x :y :w} (g/elements iso)) "isolated branch evolves independently")
+        (is (= #{:x :y :z} (g/elements g)) "original main untouched by the isolated branch")))
+    (testing "content-addressed: equal content (any order, different store) → equal snapshot-id"
+      (let [a (p/snapshot-id (-> (g/durable-gset "a" :store-config (mem)) (g/add :x) (g/add :y)))
+            b (p/snapshot-id (-> (g/durable-gset "b" :store-config (mem)) (g/add :y) (g/add :x)))]
+        (is (= a b) "snapshot-id is a stable content handle, store-independent")))))
+
 (deftest shared-store-distinct-cells
   (testing "two CRDTs co-habit ONE store under distinct roots/freed cells — the
             single-causal-root composite (option a). Each is independently
