@@ -214,9 +214,12 @@
    mode, so all its ops are async too.)
 
      (durable-gset \"kb\" :store-config {:backend :memory :id (random-uuid)})"
-  [id & {:keys [store-config comparator branch sync?]
+  [id & {:keys [store-config comparator branch sync? kv-store roots-key freed-key]
          :or {comparator compare branch :main sync? true}}]
-  (let [opts {:sync? sync?}]
+  (let [opts (cond-> {:sync? sync?}
+               kv-store  (assoc :kv-store kv-store)
+               roots-key (assoc :roots-key roots-key)
+               freed-key (assoc :freed-key freed-key))]
     (async+sync sync?
                 (async
                  (let [{:keys [kv-store storage]} (await (d/open store-config opts))

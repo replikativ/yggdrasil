@@ -4,6 +4,7 @@
    substrate, lifted into a conflict-free system, converges and ships
    incrementally — the durable analogue of the in-memory catalog."
   (:require [clojure.test :refer [deftest is testing]]
+            [konserve.core :as k]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
@@ -15,6 +16,30 @@
 
 (defn- tmpdir []
   (str (Files/createTempDirectory "ygg-dgset" (make-array FileAttribute 0))))
+
+(deftest shared-store-distinct-cells
+  (testing "two CRDTs co-habit ONE store under distinct roots/freed cells — the
+            single-causal-root composite (option a). Each is independently
+            durable; reopening via its own roots-key restores only its state."
+    (let [sc {:backend :file :id (random-uuid) :path (tmpdir)}
+          a (-> (g/durable-gset "a" :store-config sc
+                                :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"])
+                (g/add :a1) (g/add :a2))
+          ;; b co-habits a's SAME kv-store, with its own cells
+          b (-> (g/durable-gset "b" :kv-store (:kv-store a)
+                                :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"])
+                (g/add :b1))]
+      (g/flush! a) (g/flush! b)
+      ;; both cells live side-by-side in the one store, no clobber
+      (is (some? (k/get (:kv-store a) [:crdt/roots "a"] nil {:sync? true})))
+      (is (some? (k/get (:kv-store a) [:crdt/roots "b"] nil {:sync? true})))
+      ;; reopen from the SAME store via each roots-key → independent restore
+      (let [a' (g/durable-gset "a" :store-config sc
+                               :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"])
+            b' (g/durable-gset "b" :kv-store (:kv-store a')
+                               :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"])]
+        (is (= #{:a1 :a2} (g/elements a')) "a restores only its own elements")
+        (is (= #{:b1} (g/elements b')) "b restores only its own elements")))))
 
 (deftest basic-add-and-read
   (let [a (-> (g/durable-gset "kb" :store-config (mem))

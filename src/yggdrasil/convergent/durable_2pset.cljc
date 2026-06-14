@@ -213,9 +213,12 @@
    :key-encode/:key-decode  node-key element codec (default identity; the
                             registry passes its entry<->map codec)
    Restores both halves from the store's :crdt/roots cell when present."
-  [id & {:keys [store-config comparator key-encode key-decode sync?]
+  [id & {:keys [store-config comparator key-encode key-decode sync? kv-store roots-key freed-key]
          :or {comparator compare sync? true}}]
-  (let [opts {:sync? sync?}]
+  (let [opts (cond-> {:sync? sync?}
+               kv-store  (assoc :kv-store kv-store)
+               roots-key (assoc :roots-key roots-key)
+               freed-key (assoc :freed-key freed-key))]
     (async+sync sync?
                 (async
                  (let [{:keys [kv-store storage]} (await (d/open store-config (assoc opts :key-encode key-encode

@@ -39,6 +39,15 @@
 (def ^:private freed-key :crdt/freed)
 (def ^:private branching-factor 64)
 
+;; When several CRDTs share ONE konserve store (the single-causal-root composite,
+;; option a — `:composite/root` as the lone gate, like datahike's `:db`), each
+;; needs its OWN roots/freed cells so they don't clobber each other. Pass
+;; `:roots-key`/`:freed-key` in opts (e.g. `[:crdt/roots sub-id]`); content-
+;; addressed nodes (uuid keys) are still safely shared (dedup across subs).
+;; Default = the single-store cells, so every existing CRDT is unchanged.
+(defn- rk [opts] (:roots-key opts roots-key))
+(defn- fk [opts] (:freed-key opts freed-key))
+
 ;; ============================================================
 ;; Store lifecycle
 ;; ============================================================
@@ -57,11 +66,13 @@
          {:keys [key-encode key-decode]} opts]
      (async+sync (:sync? opts)
                  (async
-                  (let [kv-store (await (store/open-store store-config opts))
+                  (let [;; reuse a pre-opened store (the single-store composite passes
+                        ;; its own kv-store so subs co-habit it) or open store-config.
+                        kv-store (or (:kv-store opts) (await (store/open-store store-config opts)))
                         storage  (store/create-storage kv-store {:content-addressed? true
                                                                  :key-encode key-encode
                                                                  :key-decode key-decode})
-                        freed    (or (await (kb/k-get kv-store freed-key opts)) {})]
+                        freed    (or (await (kb/k-get kv-store (fk opts) opts)) {})]
                     (reset! (:freed-atom storage) freed)
                     {:kv-store kv-store :store-config store-config :storage storage}))))))
 
@@ -145,7 +156,7 @@
   ([kv-store] (load-roots kv-store {:sync? true}))
   ([kv-store opts]
    (async+sync (:sync? opts)
-               (async (await (kb/k-get kv-store roots-key opts))))))
+               (async (await (kb/k-get kv-store (rk opts) opts))))))
 
 (defn save-roots!
   "MERGE `roots` into the {branch -> root-address} cell — a convergent (grow-map)
@@ -158,15 +169,16 @@
   ([kv-store roots opts]
    (async+sync (:sync? opts)
                (async
-                (let [existing (or (await (kb/k-get kv-store roots-key opts)) {})]
-                  (await (kb/k-assoc kv-store roots-key (merge existing roots) opts)))))))
+                (let [rkey (rk opts)
+                      existing (or (await (kb/k-get kv-store rkey opts)) {})]
+                  (await (kb/k-assoc kv-store rkey (merge existing roots) opts)))))))
 
 (defn save-freed!
   "Persist a KonserveStorage's freed-set under the CRDT freed cell (async+sync)."
   ([kv-store storage] (save-freed! kv-store storage {:sync? true}))
   ([kv-store storage opts]
    (async+sync (:sync? opts)
-               (async (await (kb/k-assoc kv-store freed-key @(:freed-atom storage) opts))))))
+               (async (await (kb/k-assoc kv-store (fk opts) @(:freed-atom storage) opts))))))
 
 ;; ============================================================
 ;; Reachability walk — the ship-set (delta-first sync primitive)
@@ -232,7 +244,12 @@
    (async+sync (:sync? opts)
                (async
                 (let [before (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
-                      reachable (loop [rs (seq roots) acc #{roots-key freed-key}]
+                      ;; NOTE: in a SHARED store (single-causal-root composite) this
+                      ;; sub's `roots` don't reach sibling subs' nodes, so a per-sub
+                      ;; gc! would delete them — the composite must instead sweep ONCE
+                      ;; over the UNION of every sub's roots. Standalone (own-store)
+                      ;; CRDTs are unaffected.
+                      reachable (loop [rs (seq roots) acc #{(rk opts) (fk opts)}]
                                   (if rs
                                     (recur (next rs)
                                            (into acc (await (reachable-addresses kv-store (first rs) opts))))
