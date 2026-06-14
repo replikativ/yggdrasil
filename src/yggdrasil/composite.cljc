@@ -47,6 +47,7 @@
             [yggdrasil.storage :as store]
             [yggdrasil.kbridge :as kb]
             [yggdrasil.convergent.durable :as d]
+            [yggdrasil.convergent.overlay :as ovl]
             [clojure.set :as set]
             [clojure.string :as str]
             [hasch.core :as hasch]
@@ -236,6 +237,54 @@
                                                   :freed-key composite-freed-key
                                                   :spare-keys spare)))]
                  {:deleted deleted}))))
+
+;; ============================================================
+;; CompositeOverlay — the composite's isolated workspace
+;; ============================================================
+;; A composite overlay is a MAP of per-sub overlays (not a single clone), so its
+;; methods fan out. `merge-down!` merges each sub-overlay down and assoc's the
+;; results back into the PARENT composite — preserving the parent's store + index
+;; (the convergent composite `-join` rebuilds an ephemeral composite, which would
+;; drop them, so we don't use it here).
+
+(defrecord CompositeOverlay [parent sub-overlays opts]
+  p/Overlayable
+  (base-ref [_] nil)
+  (peek-parent [ov] (:parent ov)) (peek-parent [ov _] (:parent ov))
+  (overlay-writes [ov] (:sub-overlays ov))
+
+  (advance! [ov] (p/advance! ov nil))
+  (advance! [ov _]
+    (async+sync (:sync? opts)
+                (async
+                 (loop [ss (seq sub-overlays)]
+                   (when ss (await (p/advance! (val (first ss)))) (recur (next ss))))
+                 ov)))
+
+  ;; merge each sub-overlay back into the parent's matching sub, keeping the
+  ;; parent composite's store/index. (CRDT sub-overlays -join, never fail; the
+  ;; staged-with-rollback compose helper matters once VERSIONED subs join in.)
+  (merge-down! [ov] (p/merge-down! ov nil))
+  (merge-down! [_ _]
+    (async+sync (:sync? opts)
+                (async
+                 (let [merged (loop [ss (seq sub-overlays) acc (:systems parent)]
+                                (if ss
+                                  (let [[sid sub-ov] (first ss)]
+                                    (recur (next ss) (assoc acc sid (await (p/merge-down! sub-ov)))))
+                                  acc))]
+                   (assoc parent :systems merged)))))
+
+  (discard! [ov] (p/discard! ov nil))
+  (discard! [_ _]
+    (doseq [[_ sub-ov] sub-overlays] (p/discard! sub-ov))
+    nil))
+
+(defn overlay-subsystem
+  "The writable clone for sub-system `sid` inside a CompositeOverlay — mutate it
+   with that sub's normal ops; `merge-down!` joins all subs back."
+  [composite-overlay sid]
+  (ovl/overlay-system (get (:sub-overlays composite-overlay) sid)))
 
 ;; ============================================================
 ;; CompositeSystem (fiber product / pullback)
@@ -486,7 +535,17 @@
                      (if ss
                        (let [[sid sys] (first ss)]
                          (recur (next ss) (assoc acc sid (await (p/gc-sweep! sys snapshot-ids gopts)))))
-                       acc)))))))
+                       acc))))))
+
+  p/Overlayable
+  ;; overlay every sub-system → a CompositeOverlay (a map of sub-overlays). The
+  ;; composite advertises `:overlayable` only when EVERY sub is (intersection),
+  ;; so this fans out cleanly. Mutate via `overlay-subsystem`; `merge-down!`
+  ;; joins every sub back into the parent composite (store + index preserved).
+  (overlay [this o]
+    (->CompositeOverlay this
+                        (reduce-kv (fn [acc sid sys] (assoc acc sid (p/overlay sys o))) {} systems)
+                        opts)))
 
 ;; ============================================================
 ;; Lifecycle

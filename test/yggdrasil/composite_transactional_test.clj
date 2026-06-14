@@ -57,6 +57,28 @@
           (is (= #{:x :y :w} (g/elements fa)) "the isolated branch evolves independently")
           (is (= #{:x :y :z} (g/elements a)) "the live composite is untouched"))))))
 
+(deftest composite-overlay-isolate-and-merge-down
+  (testing "composite overlay = per-sub overlays; mutate the sub clones in
+            isolation; merge-down! joins every sub back into the PARENT composite
+            (store + index preserved)"
+    (let [sc     (file-cfg)
+          opener (fn [id] (fn [kv o] (g/durable-gset id :kv-store kv
+                                                     :roots-key [:crdt/roots id]
+                                                     :sync? (:sync? o))))
+          comp   (cmp/composite [(opener "a") (opener "b")] :store-config sc)]
+      (g/add (cmp/get-subsystem comp "a") :x)
+      (g/add (cmp/get-subsystem comp "b") :y)
+      (let [ov (p/overlay comp {})
+            ca (cmp/overlay-subsystem ov "a")
+            cb (cmp/overlay-subsystem ov "b")]
+        (g/add ca :x2) (g/add cb :y2)
+        (is (= #{:x :x2} (g/elements ca)) "sub a's overlay evolves in isolation")
+        (is (= #{:x} (g/elements (cmp/get-subsystem comp "a"))) "parent sub a untouched while open")
+        (let [merged (p/merge-down! ov)]
+          (is (= #{:x :x2} (g/elements (cmp/get-subsystem merged "a"))) "merge-down! joined sub a")
+          (is (= #{:y :y2} (g/elements (cmp/get-subsystem merged "b"))) "merge-down! joined sub b")
+          (is (some? (p/snapshot-id merged)) "merged composite still resolves — store/index preserved"))))))
+
 (deftest shared-store-unified-gc
   (testing "a co-located composite sweeps ONCE over the union of all roots —
             reclaims the orphaned superseded trees, keeps live state, and the
