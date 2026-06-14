@@ -216,7 +216,8 @@
      (durable-gset \"kb\" :store-config {:backend :memory :id (random-uuid)})"
   [id & {:keys [store-config comparator branch sync? kv-store roots-key freed-key]
          :or {comparator compare branch :main sync? true}}]
-  (let [opts (cond-> {:sync? sync?}
+  (let [freed-key (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
+        opts (cond-> {:sync? sync?}
                kv-store  (assoc :kv-store kv-store)
                roots-key (assoc :roots-key roots-key)
                freed-key (assoc :freed-key freed-key))]

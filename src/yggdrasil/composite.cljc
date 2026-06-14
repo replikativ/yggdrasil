@@ -58,9 +58,26 @@
 
 ;; The composite's own causal cells (distinct from any sub's :crdt/roots, so
 ;; subs can co-habit the composite's store under [:crdt/roots id]). The ROOT is
-;; written LAST on every persist — the transactional gate.
+;; written LAST on every persist — the transactional gate. The SUBS manifest
+;; lists each co-located sub's roots/freed cells so konserve-sync's composite
+;; walker can ship the whole store with :composite/root keyword-last.
 (def ^:private composite-root-key :composite/root)
 (def ^:private composite-freed-key :composite/freed)
+(def ^:private composite-subs-key :composite/subs)
+
+(defn- colocated-subs-manifest
+  "The {:roots-key :freed-key} of every sub that co-habits the composite's
+   `kv-store` (a durable CRDT opened on it) — for the konserve-sync walker.
+   Non-co-located subs (own backend — datahike/git) sync via their own stores."
+  [kv-store sys-map]
+  (->> (vals sys-map)
+       (keep (fn [s]
+               (when (and kv-store
+                          (identical? kv-store (:kv-store s))
+                          (get-in s [:opts :roots-key]))
+                 {:roots-key (get-in s [:opts :roots-key])
+                  :freed-key (get-in s [:opts :freed-key])})))
+       vec))
 
 ;; ============================================================
 ;; Composite snapshot-id (async+sync — awaits each sub's snapshot-id)
@@ -498,6 +515,10 @@
                        sys (->CompositeSystem sys-map branch composite-name
                                               index-atom kv-store store-config storage opts)
                        snap (await (composite-snapshot-id sys-map opts))]
+                   ;; manifest of co-located subs (for the konserve-sync composite walker)
+                   (when kv-store
+                     (await (kb/k-assoc kv-store composite-subs-key
+                                        (colocated-subs-manifest kv-store sys-map) opts)))
                    (await (register-initial-snapshot! index-atom kv-store storage sys-map snap opts))
                    sys)))))
 
