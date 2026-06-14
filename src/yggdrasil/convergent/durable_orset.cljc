@@ -35,7 +35,12 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->DurableORSet flush!)
+(declare ->DurableORSet flush! apply-delta)
+
+(defn- half-accrue
+  "Accrue δ half-maps {:adds #{[e tag]..} :removals #{[e tag]..}} by union."
+  [a b]
+  (merge-with into a b))
 
 (def ^:private adds-branch :adds)
 (def ^:private removals-branch :removals)
@@ -110,6 +115,9 @@
                                  (atom true) opts))))
   (-conflict-free? [_] true)
 
+  c/PDeltaApply
+  (-apply-delta [this delta] (apply-delta this delta))
+
   p/GarbageCollectable
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
@@ -147,7 +155,7 @@
                       s'   (await (d/set-conj @(:adds-atom o) pair (:comparator o) opts))]
                   (reset! (:adds-atom o) s')
                   (reset! (:dirty-atom o) true)
-                  o)))))
+                  (c/with-delta o half-accrue {:adds #{pair}}))))))
 
 (defn- live-pairs
   "async+sync: the live [elem tag] add-pairs (in adds, not removals)."
@@ -171,7 +179,25 @@
                         (reset! (:removals-atom o) s')
                         (reset! (:dirty-atom o) true)
                         (recur (next ts)))))
-                  o)))))
+                  (c/with-delta o half-accrue {:removals (set tombstones)}))))))
+
+(defn apply-delta
+  "Consume a peer's OR-Set δ ({:adds #{[e tag]..} :removals #{[e tag]..}}) by
+   unioning each half of [elem tag] pairs into the local halves — the OP-path
+   apply (O(δ); cf. -join the STATE-path). Returns o WITHOUT a local δ.
+   (async+sync)"
+  [o delta]
+  (let [opts (:opts o)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [adds (loop [a @(:adds-atom o) ps (seq (:adds delta))]
+                              (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
+                       rems (loop [r @(:removals-atom o) ps (seq (:removals delta))]
+                              (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
+                   (reset! (:adds-atom o) adds)
+                   (reset! (:removals-atom o) rems)
+                   (reset! (:dirty-atom o) true)
+                   o)))))
 
 (defn elements
   "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"

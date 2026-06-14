@@ -113,3 +113,26 @@
           roots (d/load-roots (:kv-store s))]
       (is (contains? roots :adds))
       (is (contains? roots :removals)))))
+
+(deftest twopset-delta-op-perspective
+  (testing "2P-Set δ: add/remove-elem record {:adds}/{:removals} ops (no diffing);
+            apply-delta integrates a peer's δ and converges == -join"
+    (let [s  (-> (t/durable-2pset "a" :store-config {:backend :memory :id (random-uuid)})
+                 (t/add :x) (t/add :y) (t/remove-elem :x))]
+      (is (= {:adds #{:x :y} :removals #{:x}} (c/delta-of s)) "δ = the ops, accrued")
+      (is (= #{:y} (t/elements s)) "live = adds − removals; δ in meta doesn't affect value")
+      (let [peer   (-> (t/durable-2pset "b" :store-config {:backend :memory :id (random-uuid)}) (t/add :z))
+            via-op (c/-apply-delta peer (c/delta-of s))]
+        (is (= #{:y :z} (t/elements via-op)) "ops integrated: :x removed, :y + peer's :z live")
+        (is (= (t/elements via-op) (t/elements (c/-join peer s))) "op-path ≡ state-path")))))
+
+(deftest orset-delta-op-perspective
+  (testing "OR-Set δ: add records {:adds #{[elem tag]}} ops; apply-delta ≡ -join"
+    (let [o  (-> (o/durable-orset "a" :store-config {:backend :memory :id (random-uuid)})
+                 (o/add :x) (o/add :y))
+          dl (c/delta-of o)]
+      (is (= #{:x :y} (set (map first (:adds dl)))) "δ :adds carries the [elem tag] add-pairs")
+      (let [peer   (-> (o/durable-orset "b" :store-config {:backend :memory :id (random-uuid)}) (o/add :z))
+            via-op (c/-apply-delta peer dl)]
+        (is (= #{:x :y :z} (o/elements via-op)) "ops integrated")
+        (is (= (o/elements via-op) (o/elements (c/-join peer o))) "op-path ≡ state-path")))))

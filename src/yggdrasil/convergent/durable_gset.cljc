@@ -24,7 +24,7 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->DurableGSet flush!)
+(declare ->DurableGSet flush! apply-delta)
 
 (defrecord DurableGSet
            [id kv-store store-config storage comparator
@@ -128,6 +128,9 @@
                                                 (keys joined)))
                                     opts))))))
   (-conflict-free? [_] true)
+
+  c/PDeltaApply
+  (-apply-delta [this delta] (apply-delta this delta))
 
   p/GarbageCollectable
   (gc-roots [this]

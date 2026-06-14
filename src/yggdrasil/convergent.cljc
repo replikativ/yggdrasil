@@ -87,3 +87,10 @@
   (let [d (delta-of x)]
     (and (some? d)
          (if (coll? d) (seq d) true))))
+
+(defprotocol PDeltaApply
+  "Consume a peer's δ — the OP-path counterpart to `-join` (the STATE-path)."
+  (-apply-delta [this delta]
+    "Integrate δ (a value produced by `delta-of` on a peer replica) into this
+     replica's state — O(δ), no full -join, no diffing. Returns the new replica
+     WITHOUT a local δ (remote-integrated ops do not re-propagate)."))

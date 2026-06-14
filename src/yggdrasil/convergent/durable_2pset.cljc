@@ -31,10 +31,15 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->Durable2PSet flush!)
+(declare ->Durable2PSet flush! apply-delta)
 
 (def ^:private adds-branch :adds)
 (def ^:private removals-branch :removals)
+
+(defn- half-accrue
+  "Accrue δ half-maps {:adds #{..} :removals #{..}} by unioning each half."
+  [a b]
+  (merge-with into a b))
 
 (defrecord Durable2PSet
            [id kv-store store-config storage comparator
@@ -99,6 +104,9 @@
                                  (atom true) opts))))
   (-conflict-free? [_] true)
 
+  c/PDeltaApply
+  (-apply-delta [this delta] (apply-delta this delta))
+
   p/GarbageCollectable
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
@@ -129,14 +137,17 @@
 ;; ============================================================
 
 (defn- conj-into!
-  "async+sync: conj `elem` onto the PSS set in `atom-kw` of `s`, mark dirty."
+  "async+sync: conj `elem` onto the PSS set in `atom-kw` of `s`, mark dirty, and
+   record the op as a local δ ({:adds #{elem}} or {:removals #{elem}})."
   [s atom-kw elem opts]
   (async+sync (:sync? opts)
               (async
                (let [s' (await (d/set-conj @(atom-kw s) elem (:comparator s) opts))]
                  (reset! (atom-kw s) s')
                  (reset! (:dirty-atom s) true)
-                 s))))
+                 (c/with-delta s half-accrue
+                               (if (= atom-kw :adds-atom)
+                                 {:adds #{elem}} {:removals #{elem}}))))))
 
 (defn add
   "Add `elem`. (async+sync)"
@@ -158,6 +169,23 @@
   "Tombstone `elem` (permanent — 2P-Set semantics). (async+sync)"
   ([s elem] (remove-elem s elem (:opts s)))
   ([s elem opts] (conj-into! s :removals-atom elem opts)))
+
+(defn apply-delta
+  "Consume a peer's 2P-Set δ ({:adds #{..} :removals #{..}}) by unioning each half
+   into the local halves — the OP-path apply (O(δ); cf. -join the STATE-path).
+   Returns s WITHOUT a local δ (remote ops don't re-propagate). (async+sync)"
+  [s delta]
+  (let [opts (:opts s)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [adds (loop [a @(:adds-atom s) es (seq (:adds delta))]
+                              (if es (recur (await (d/set-conj a (first es) (:comparator s) opts)) (next es)) a))
+                       rems (loop [r @(:removals-atom s) es (seq (:removals delta))]
+                              (if es (recur (await (d/set-conj r (first es) (:comparator s) opts)) (next es)) r))]
+                   (reset! (:adds-atom s) adds)
+                   (reset! (:removals-atom s) rems)
+                   (reset! (:dirty-atom s) true)
+                   s)))))
 
 (defn elements
   "Live elements: adds − removals. (async+sync)"
