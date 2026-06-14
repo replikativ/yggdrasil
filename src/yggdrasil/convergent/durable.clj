@@ -26,6 +26,7 @@
             [org.replikativ.persistent-sorted-set :as pss]))
 
 (def ^:private roots-key :crdt/roots)
+(def ^:private freed-key :crdt/freed)
 (def ^:private branching-factor 64)
 
 ;; ============================================================
@@ -34,11 +35,12 @@
 
 (defn open
   "Open the konserve store for a durable CRDT and load its freed-set into a
-   fresh KonserveStorage. Returns {:kv-store :store-config :storage}."
+   fresh content-addressed KonserveStorage. Returns {:kv-store :store-config
+   :storage}."
   [store-config]
   (let [kv-store (store/open-store store-config)
-        storage  (store/create-storage kv-store)
-        freed    (store/load-freed kv-store)]
+        storage  (store/create-storage kv-store {:content-addressed? true})
+        freed    (or (kb/k-get kv-store freed-key {:sync? true}) {})]
     (reset! (:freed-atom storage) freed)
     {:kv-store kv-store :store-config store-config :storage storage}))
 
@@ -78,9 +80,9 @@
   (kb/k-assoc kv-store roots-key roots {:sync? true}))
 
 (defn save-freed!
-  "Persist a KonserveStorage's freed-set."
+  "Persist a KonserveStorage's freed-set under the CRDT freed cell."
   [kv-store storage]
-  (store/save-freed! kv-store @(:freed-atom storage)))
+  (kb/k-assoc kv-store freed-key @(:freed-atom storage) {:sync? true}))
 
 ;; ============================================================
 ;; Reachability walk — the ship-set (delta-first sync primitive)
