@@ -15,7 +15,7 @@
                             :vjoin set/union :bottom #{}))
 
 (defn add "Add `x` to the current branch's set (local op)." [g x]
-  (sys/upd! g conj x))
+  (sys/record-delta (sys/upd! g conj x) #{x}))
 
 (defn elements "Read the current branch's set." [g]
   (sys/cur g))

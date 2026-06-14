@@ -14,7 +14,7 @@
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]))
 
-(declare ->ConflictFreeSystem)
+(declare ->ConflictFreeSystem apply-delta)
 
 (defrecord ConflictFreeSystem [id stype store current vjoin bottom]
   ;; store : (atom {branch -> value}) shared across forks/replicas
@@ -54,11 +54,18 @@
 
   c/PConvergent
   ;; symmetric peer join: per-branch value-join of two replicas' stores (pure).
+  ;; IDEMPOTENCE: a join that changes nothing returns the receiver IDENTICAL, so a
+  ;; signal holding this CRDT doesn't re-fire / re-publish on a no-op (cf. the
+  ;; durable runaway guard).
   (-join [this other]
-    (->ConflictFreeSystem id stype
-                          (atom (merge-with vjoin @store @(:store other)))
-                          current vjoin bottom))
-  (-conflict-free? [_] true))
+    (let [joined (merge-with vjoin @store @(:store other))]
+      (if (= joined @store)
+        this
+        (->ConflictFreeSystem id stype (atom joined) current vjoin bottom))))
+  (-conflict-free? [_] true)
+
+  c/PDeltaApply
+  (-apply-delta [this delta] (apply-delta this delta)))
 
 (defn conflict-free-system
   "Construct a conflict-free system. `vjoin`/`bottom` define the CRDT."
@@ -72,3 +79,18 @@
   (swap! (:store s) assoc (:current s) v) s)
 (defn upd! "Update the current branch's value with f. Returns the system." [s f & args]
   (apply swap! (:store s) update (:current s) (fnil f (:bottom s)) args) s)
+
+;; δ-state (OP perspective) — shared by every in-mem CRDT (G-Set/LWWR/OR-Map).
+(defn record-delta
+  "Record that a local op contributed δ-value `d` — accrued into the system's
+   local δ via its own `vjoin` (the δ is a value of the same shape `vjoin`
+   consumes). Mutators call this after their `put!`/`upd!`. Carries δ in metadata."
+  [s d]
+  (c/with-delta s (:vjoin s) d))
+
+(defn apply-delta
+  "Consume a peer's δ — `vjoin` it into the current value (the OP-path; cf. -join
+   the STATE-path). Returns `s` WITHOUT a local δ (remote-integrated ops don't
+   re-propagate)."
+  [s d]
+  (upd! s (:vjoin s) d))

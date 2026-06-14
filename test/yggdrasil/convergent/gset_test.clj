@@ -63,3 +63,19 @@
              (p/snapshot-id (gs/gset "other" :init #{:seed}))))
       (is (not= (p/snapshot-id (gs/gset "kb" :init #{:seed}))
                 (p/snapshot-id (gs/gset "kb" :init #{:other})))))))
+
+(deftest delta-op-perspective
+  (testing "in-mem catalog δ (via the generic system): ops recorded at the write
+            (no diffing); apply-delta ≡ -join; a no-op -join returns identical
+            (signal-safe, like the durable runaway guard)"
+    (let [g (-> (gs/gset "a") (gs/add :x) (gs/add :y))]
+      (is (= #{:x :y} (c/delta-of g)) "δ = the ops (accrued by vjoin), no diffing")
+      (is (nil? (c/delta-of (c/clear-delta g))) "clear-delta drops it")
+      ;; op-path: a peer applies just the δ; ≡ the state-path (-join)
+      (let [peer (gs/gset "c" :init #{:z})]
+        (is (= #{:x :y :z} (gs/elements (c/-apply-delta peer (c/delta-of g)))) "apply-delta unions ops in")
+        (is (= (gs/elements (c/-apply-delta (gs/gset "c" :init #{:z}) (c/delta-of g)))
+               (gs/elements (c/-join (gs/gset "c" :init #{:z}) g)))
+            "op-path ≡ state-path"))
+      ;; issue-2 idempotence for the in-mem catalog too
+      (is (identical? g (c/-join g (gs/gset "d" :init #{:x}))) "no-op -join returns the receiver identical"))))

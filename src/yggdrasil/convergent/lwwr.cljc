@@ -33,7 +33,8 @@
 (defn set-register
   "Write `v` (stamped now) — the local op."
   [l v]
-  (sys/put! l {:register v :timestamp (t/now-ms)}))
+  (let [reg {:register v :timestamp (t/now-ms)}]
+    (sys/record-delta (sys/put! l reg) reg)))
 
 (defn value
   "Read the current register value (nil if unset)."

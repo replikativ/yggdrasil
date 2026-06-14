@@ -36,16 +36,22 @@
 (defn assoc-key
   "Assoc `v` under `k` with a fresh observed tag (local op)."
   [m k v]
-  (sys/upd! m (fn [val] (assoc-in val [:adds k (random-uuid)] v))))
+  (let [uid (random-uuid)]
+    (sys/record-delta (sys/upd! m assoc-in [:adds k uid] v)
+                      {:adds {k {uid v}}})))
 
 (defn dissoc-key
   "Remove `k` — tombstone its currently-live tags (local op)."
   [m k]
-  (sys/upd! m (fn [val]
-                (reduce (fn [val uid]
-                          (assoc-in val [:removals k uid] (get-in val [:adds k uid])))
-                        val
-                        (live-uids val k)))))
+  (let [val   (sys/cur m)
+        uids  (live-uids val k)
+        delta {:removals {k (into {} (map (fn [uid] [uid (get-in val [:adds k uid])])) uids)}}]
+    (sys/record-delta
+     (sys/upd! m (fn [val]
+                   (reduce (fn [val uid]
+                             (assoc-in val [:removals k uid] (get-in val [:adds k uid])))
+                           val uids)))
+     delta)))
 
 (defn lookup
   "The live value-set for `k` (add-wins), or nil if absent."
