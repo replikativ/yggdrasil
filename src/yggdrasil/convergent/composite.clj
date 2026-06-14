@@ -14,29 +14,44 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.composite :as comp]))
 
+;; The composite is a STATE container (the atomic-workspace value). It syncs via
+;; the STATE path — konserve-sync ships its nodes + the `:composite/root` causal
+;; gate, and `-join` reconciles two whole workspaces. It deliberately has NO
+;; op-δ: a δ is the change a LOCAL mutation made, but a composite isn't mutated
+;; directly — you mutate a SUB, which returns a new (δ-carrying) record the
+;; composite doesn't capture. The OP path is therefore per-LEAF: sync each
+;; sub-system as its own ygg-signal (the dissolution model). Forcing an aggregate
+;; δ onto the composite would be a duplication against the grain.
 (extend-type yggdrasil.composite.CompositeSystem
   c/PConvergent
   (-join [this other]
     (let [others (:systems other)
-          joined (map (fn [[id sys]]
-                        (let [o (get others id)]
-                          (cond
-                            (nil? o) sys                       ; system only on `this`
-                            (c/convergent? sys) (c/-join sys o) ; CRDT: symmetric 2-way join
-                            ;; versioned (datahike/git): 3-way merge — merge `other`'s
-                            ;; branch into `this`'s on the shared store. This IS the
-                            ;; per-system logic merge-to-parent! reimplements; conflicts
-                            ;; are surfaced via the composite's `conflicts` (the
-                            ;; merge-review seam), not auto-resolved here. Requires a
-                            ;; resolvable common ancestor (shared store / forked peer).
-                            (satisfies? p/Mergeable sys)
-                            (-> sys
-                                (p/checkout (p/current-branch sys))
-                                (p/merge! (p/current-branch o)))
-                            :else sys)))
-                      (:systems this))]
-      (comp/composite (vec joined)
-                      :name (:composite-name this)
-                      :branch (:current-branch-name this))))
+          joined (reduce
+                  (fn [m [id sys]]
+                    (let [o (get others id)]
+                      (assoc m id
+                             (cond
+                               (nil? o) sys                       ; system only on `this`
+                               (c/convergent? sys) (c/-join sys o) ; CRDT: symmetric 2-way join
+                               ;; versioned (datahike/git): 3-way merge — merge `other`'s
+                               ;; branch into `this`'s on the shared store. This IS the
+                               ;; per-system logic merge-to-parent! reimplements; conflicts
+                               ;; are surfaced via the composite's `conflicts` (the
+                               ;; merge-review seam), not auto-resolved here. Requires a
+                               ;; resolvable common ancestor (shared store / forked peer).
+                               (satisfies? p/Mergeable sys)
+                               (-> sys
+                                   (p/checkout (p/current-branch sys))
+                                   (p/merge! (p/current-branch o)))
+                               :else sys))))
+                  {} (:systems this))]
+      ;; IDEMPOTENCE: when every sub-join changed nothing (each returns the SAME
+      ;; sub), the composite is unchanged → return `this` identical, so a
+      ;; composite-valued signal doesn't re-fire / re-publish on a no-op.
+      (if (= joined (:systems this))
+        this
+        (comp/composite (vec (vals joined))
+                        :name (:composite-name this)
+                        :branch (:current-branch-name this)))))
   (-conflict-free? [this]
     (every? c/convergent? (vals (:systems this)))))
