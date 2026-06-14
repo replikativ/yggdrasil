@@ -78,6 +78,14 @@
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
+  p/Committable
+  ;; "commit" a durable CRDT = make its current state durable (flush). Identity
+  ;; is content-addressed, so this advances nothing — it's the persist step the
+  ;; composite's transactional commit needs. (async+sync via flush!)
+  (commit! [this] (flush! this))
+  (commit! [this _message] (flush! this))
+  (commit! [this _message _opts] (flush! this))
+
   c/PConvergent
   (-join [_ other]
     (async+sync (:sync? opts)

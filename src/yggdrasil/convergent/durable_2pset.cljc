@@ -74,6 +74,12 @@
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
+  p/Committable
+  ;; "commit" = make current state durable (flush); identity is content-addressed.
+  (commit! [this] (flush! this))
+  (commit! [this _message] (flush! this))
+  (commit! [this _message _opts] (flush! this))
+
   c/PConvergent
   ;; PURE same-store join: union both halves with the peer. (async+sync)
   (-join [_ other]

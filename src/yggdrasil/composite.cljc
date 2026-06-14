@@ -408,12 +408,18 @@
   p/Mergeable
   (merge! [this source] (p/merge! this source {}))
   (merge! [this source opts]
+    ;; TRANSACTIONAL by default: merge every sub-system, then `commit!` — which
+    ;; flushes each sub durable and writes `:composite/root` LAST. So a crash
+    ;; mid-merge leaves the previous committed composite as the latest; a reader
+    ;; (resolving through `:composite/root`) never sees a half-merge.
     (let [new-systems (reduce-kv
                        (fn [acc sid sys]
                          (assoc acc sid (p/merge! sys source opts)))
                        {}
                        systems)]
-      (assoc this :systems new-systems)))
+      (p/commit! (assoc this :systems new-systems)
+                 (or (and (map? opts) (:message opts)) "merge")
+                 opts)))
 
   (conflicts [this a b] (p/conflicts this a b nil))
   (conflicts [_ a b opts]
