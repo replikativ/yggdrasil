@@ -106,13 +106,16 @@
 
   c/PConvergent
   ;; PURE same-store join: union both grow-only halves with the peer. (async+sync)
-  (-join [_ other]
+  (-join [this other]
     (async+sync (:sync? opts)
                 (async
-                 (->DurableORSet id kv-store store-config storage comparator tag-fn
-                                 (atom (await (d/set-union @adds-atom @(:adds-atom other) comparator opts)))
-                                 (atom (await (d/set-union @removals-atom @(:removals-atom other) comparator opts)))
-                                 (atom true) opts))))
+                 (let [adds' (await (d/set-union @adds-atom @(:adds-atom other) comparator opts))
+                       rems' (await (d/set-union @removals-atom @(:removals-atom other) comparator opts))]
+                   ;; IDEMPOTENCE: a no-op join returns the receiver identical.
+                   (if (and (= adds' @adds-atom) (= rems' @removals-atom))
+                     this
+                     (->DurableORSet id kv-store store-config storage comparator tag-fn
+                                     (atom adds') (atom rems') (atom true) opts))))))
   (-conflict-free? [_] true)
 
   c/PDeltaApply

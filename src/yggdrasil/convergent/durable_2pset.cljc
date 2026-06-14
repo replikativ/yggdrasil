@@ -95,13 +95,17 @@
 
   c/PConvergent
   ;; PURE same-store join: union both halves with the peer. (async+sync)
-  (-join [_ other]
+  (-join [this other]
     (async+sync (:sync? opts)
                 (async
-                 (->Durable2PSet id kv-store store-config storage comparator
-                                 (atom (await (d/set-union @adds-atom @(:adds-atom other) comparator opts)))
-                                 (atom (await (d/set-union @removals-atom @(:removals-atom other) comparator opts)))
-                                 (atom true) opts))))
+                 (let [adds' (await (d/set-union @adds-atom @(:adds-atom other) comparator opts))
+                       rems' (await (d/set-union @removals-atom @(:removals-atom other) comparator opts))]
+                   ;; IDEMPOTENCE: a no-op join returns the receiver identical (so a
+                   ;; signal holding it doesn't re-fire/re-publish; cf. the runaway guard).
+                   (if (and (= adds' @adds-atom) (= rems' @removals-atom))
+                     this
+                     (->Durable2PSet id kv-store store-config storage comparator
+                                     (atom adds') (atom rems') (atom true) opts))))))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
