@@ -9,6 +9,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [yggdrasil.adapters.datahike :as dha]
+            [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.protocols :as p]))
 
 (def ^:dynamic *conn* nil)
@@ -221,3 +222,24 @@
               "flags the real clash AND conservatively the one-sided change")
           (is (every? #(= :unavailable (:base %)) confs)
               "entries tagged :base :unavailable (distinguishable from 3-way)"))))))
+
+(deftest overlay-isolate-and-merge-down
+  (testing "datahike overlay = a native branch fork; mutate it in isolation;
+            merge-down! 3-way-merges it back into the parent branch"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id   :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :note/text :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "n1" :note/text "base"}])
+      (let [ov     (p/overlay sys {})
+            forked (ovl/overlay-system ov)
+            fconn  (:conn forked)
+            ids    (fn [conn] (set (map first (d/q '[:find ?id :where [?e :note/id ?id]] @conn))))]
+        (d/transact fconn [{:note/id "n2" :note/text "fork-only"}])
+        (is (= #{"n1"}      (ids (:conn sys))) "parent branch untouched while overlay is open")
+        (is (= #{"n1" "n2"} (ids fconn))       "fork branch has the isolated write")
+        (let [merged (p/merge-down! ov)]
+          (is (= #{"n1" "n2"} (ids (:conn merged)))
+              "merge-down! 3-way-merged the fork's n2 into the parent branch"))
+        (is (true? (:overlayable (p/capabilities sys))) "datahike advertises :overlayable")))))

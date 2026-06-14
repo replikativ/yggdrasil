@@ -259,6 +259,35 @@
 ;; DatahikeSystem record
 ;; ============================================================
 
+;; ============================================================
+;; DatahikeOverlay — branch-based isolated workspace (Overlayable)
+;; ============================================================
+;; datahike is VERSIONED (not convergent), so its overlay is a native BRANCH
+;; fork: `overlay` branches+checks-out a fresh overlay branch (the writable
+;; system); `merge-down!` 3-way-merges it back into the parent branch; `discard!`
+;; deletes the fork branch. (`local-writes` holds the forked system in an atom so
+;; the uniform `overlay-system` accessor works across all overlay kinds.)
+
+(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch]
+  p/Overlayable
+  (base-ref [_] (p/snapshot-id parent))
+  (peek-parent [_] parent)
+  (peek-parent [_ _] parent)
+  (overlay-writes [_] (p/diff parent (p/snapshot-id parent) (p/snapshot-id @local-writes)))
+
+  (advance! [ov] (p/advance! ov nil))
+  (advance! [ov _]                                  ; :following — merge parent INTO the fork
+    (reset! local-writes (p/merge! @local-writes parent-branch))
+    ov)
+
+  ;; 3-way merge the fork branch back into the parent branch → merged parent.
+  (merge-down! [ov] (p/merge-down! ov nil))
+  (merge-down! [_ _]
+    (-> parent (p/checkout parent-branch) (p/merge! fork-branch)))
+
+  (discard! [_] (p/delete-branch! parent fork-branch) nil)
+  (discard! [_ _] (p/delete-branch! parent fork-branch) nil))
+
 (defrecord DatahikeSystem [conn system-name]
   p/SystemIdentity
   (system-id [_]
@@ -266,7 +295,7 @@
         (str "datahike:" (get-in @conn [:config :store :id]))))
   (system-type [_] :datahike)
   (capabilities [_]
-    (t/->Capabilities true true true true false false true false false))
+    (t/->Capabilities true true true true true false true false false))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -487,7 +516,16 @@
             :removed-datoms (count removed)
             :entities-touched (count (into (set (map second added))
                                            (map second removed)))}))
-        (t/->DiffError a b "Could not resolve branch/snapshot")))))
+        (t/->DiffError a b "Could not resolve branch/snapshot"))))
+
+  p/Overlayable
+  ;; native branch fork: branch+checkout a fresh overlay branch as the writable
+  ;; system; `merge-down!` 3-way-merges it back, `discard!` deletes it.
+  (overlay [this _opts]
+    (let [pbranch (p/current-branch this)
+          fbranch (keyword (str "overlay-" (random-uuid)))
+          forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
+      (->DatahikeOverlay this (atom forked) fbranch pbranch))))
 
 ;; ============================================================
 ;; Constructor
