@@ -301,7 +301,14 @@
     (assoc this :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/branch! sys name))) {} systems)))
   (branch! [this name from] (p/branch! this name from nil))
   (branch! [this name from _opts]
-    (assoc this :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/branch! sys name from))) {} systems)))
+    ;; `from` may be a composite SNAPSHOT-ID → branch each sub from ITS recorded
+    ;; sub-snapshot (freeze+isolate the whole composite at a fixed version); or a
+    ;; branch keyword / per-sub ref, passed through unchanged.
+    (let [sub-snaps (resolve-sub-snapshots index-atom from)]
+      (assoc this :systems
+             (reduce-kv (fn [acc sid sys]
+                          (assoc acc sid (p/branch! sys name (if sub-snaps (get sub-snaps sid) from))))
+                        {} systems))))
 
   (delete-branch! [this name] (p/delete-branch! this name nil))
   (delete-branch! [this name _opts]

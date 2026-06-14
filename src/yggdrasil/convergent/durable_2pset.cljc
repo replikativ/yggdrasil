@@ -47,18 +47,25 @@
                      :graphable false :overlayable false})
 
   p/Snapshotable
-  ;; content-addressed identity: the hasch UUID of the live two-set state, so
-  ;; equal content → equal id (what lets another system pin/track this one).
+  ;; addressable snapshot = a content-addressed COMMIT object {:adds :removals}
+  ;; over the two halves' PSS roots (stable across peers — equal content ⇒ equal
+  ;; id — AND re-openable via `as-of`, the freeze handle).
   (snapshot-id [_]
     (async+sync (:sync? opts)
-                (async (str (hasch/uuid {:adds (await (d/set->clj @adds-atom opts))
-                                         :removals (await (d/set->clj @removals-atom opts))})))))
+                (async
+                 (let [adds-root (await (d/store-set! @adds-atom storage opts))
+                       rem-root  (await (d/store-set! @removals-atom storage opts))]
+                   (str (await (d/store-commit! kv-store {:adds adds-root :removals rem-root} opts)))))))
   (parent-ids [_] #{})
-  (as-of [_ _]
+  (as-of [this snap-id] (p/as-of this snap-id nil))
+  (as-of [_ snap-id _opts]
+    ;; restore the FIXED value (adds − removals) at that commit, not the live set.
     (async+sync (:sync? opts)
-                (async (set/difference (await (d/set->clj @adds-atom opts))
-                                       (await (d/set->clj @removals-atom opts))))))
-  (as-of [this t _] (p/as-of this t))
+                (async
+                 (let [commit (await (d/read-commit kv-store (parse-uuid (str snap-id)) opts))]
+                   (set/difference
+                    (await (d/set->clj (d/restore-set comparator (:adds commit) storage opts) opts))
+                    (await (d/set->clj (d/restore-set comparator (:removals commit) storage opts) opts)))))))
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
   p/Branchable

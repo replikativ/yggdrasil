@@ -27,6 +27,7 @@
   (:require [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
             [konserve.gc :as kgc]
+            [hasch.core :as hasch]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]])
@@ -187,6 +188,33 @@
   ([kv-store storage opts]
    (async+sync (:sync? opts)
                (async (await (kb/k-assoc kv-store (fk opts) @(:freed-atom storage) opts))))))
+
+;; ============================================================
+;; Commit objects — addressable snapshots of a MULTI-root CRDT
+;; ============================================================
+;; A single-root CRDT (G-Set) uses its PSS root address directly as the snapshot
+;; handle. A multi-root CRDT (2P-Set/OR-Set = two halves) instead stores a tiny
+;; content-addressed "commit" map {:adds <root> :removals <root>} and uses ITS
+;; address as the snapshot-id — so `as-of`/`open-at` can re-open both halves at a
+;; fixed version. Content-addressed → equal halves ⇒ equal snapshot-id.
+
+(defn store-commit!
+  "Store a small content-addressed commit map (e.g. {:adds r :removals r}) and
+   return its address — the addressable snapshot handle. (async+sync)"
+  ([kv-store commit] (store-commit! kv-store commit {:sync? true}))
+  ([kv-store commit opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [addr (hasch/uuid commit)]
+                  (await (kb/k-assoc kv-store addr commit opts))
+                  addr)))))
+
+(defn read-commit
+  "Read a commit map by its address. (async+sync)"
+  ([kv-store addr] (read-commit kv-store addr {:sync? true}))
+  ([kv-store addr opts]
+   (async+sync (:sync? opts)
+               (async (await (kb/k-get kv-store addr opts))))))
 
 ;; ============================================================
 ;; Reachability walk — the ship-set (delta-first sync primitive)

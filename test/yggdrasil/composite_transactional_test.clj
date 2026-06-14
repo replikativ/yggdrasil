@@ -37,6 +37,26 @@
           (is (= #{"a" "b"} (set (keys (:sub-snapshots meta))))
               "the committed bundle references every sub-system"))))))
 
+(deftest branch-from-composite-snapshot-freezes-and-isolates
+  (testing "branch! from a composite snapshot-id forks every sub at ITS recorded
+            sub-snapshot — the whole composite frozen at a version + isolated"
+    (let [sc     (file-cfg)
+          opener (fn [id] (fn [kv o] (g/durable-gset id :kv-store kv
+                                                     :roots-key [:crdt/roots id]
+                                                     :sync? (:sync? o))))
+          comp   (cmp/composite [(opener "a")] :store-config sc)
+          a      (cmp/get-subsystem comp "a")]
+      (g/add a :x) (g/add a :y)
+      (let [comp (p/commit! comp "v1")
+            sid  (p/snapshot-id comp)]              ; FREEZE the composite at a:{:x :y}
+        (g/add a :z) (p/commit! comp "v2")          ; evolve the live composite → a:{:x :y :z}
+        (let [frozen (-> comp (p/branch! :iso sid) (p/checkout :iso))
+              fa     (cmp/get-subsystem frozen "a")]
+          (is (= #{:x :y} (g/elements fa)) "sub a is frozen at the composite snapshot")
+          (g/add fa :w)
+          (is (= #{:x :y :w} (g/elements fa)) "the isolated branch evolves independently")
+          (is (= #{:x :y :z} (g/elements a)) "the live composite is untouched"))))))
+
 (deftest shared-store-unified-gc
   (testing "a co-located composite sweeps ONCE over the union of all roots —
             reclaims the orphaned superseded trees, keeps live state, and the

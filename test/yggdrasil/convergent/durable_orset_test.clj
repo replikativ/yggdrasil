@@ -6,7 +6,8 @@
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.durable-orset :as o])
+            [yggdrasil.convergent.durable-orset :as o]
+            [yggdrasil.convergent.durable-2pset :as t])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -63,6 +64,24 @@
       ;; only ONE [:x :x] pair exists (tag = element) ⇒ idempotent
       (is (= 1 (count (filter (fn [[e _]] (= e :x)) (seq @(:adds-atom s)))))
           "idempotent add: a single content-tagged pair"))))
+
+(deftest orset-addressable-snapshot-freeze
+  (testing "OR-Set snapshot-id (commit object) + as-of restores the frozen value"
+    (let [s   (-> (o/durable-orset "reg" :store-config (mem)) (o/add :a) (o/add :b))
+          sid (p/snapshot-id s)]                         ; FREEZE {:a :b}
+      (o/remove-elem s :a) (o/add s :c)                  ; evolve → {:b :c}
+      (is (= #{:b :c} (o/elements s)))
+      (is (= #{:a :b} (p/as-of s sid)) "as-of restores the frozen live elements"))))
+
+(deftest twopset-addressable-snapshot-freeze
+  (testing "2P-Set snapshot-id (commit object) + as-of restores the frozen value"
+    (let [s   (-> (t/durable-2pset "x" :store-config (mem)) (t/add :a) (t/add :b))
+          sid (p/snapshot-id s)]                         ; FREEZE {:a :b}
+      (t/remove-elem s :a)                               ; evolve → {:b}
+      (is (= #{:b} (t/elements s)))
+      (is (= #{:a :b} (p/as-of s sid)) "as-of restores the frozen value")
+      (is (= sid (p/snapshot-id (-> (t/durable-2pset "y" :store-config (mem)) (t/add :b) (t/add :a))))
+          "content-addressed commit: equal halves (any order/store) → equal snapshot-id"))))
 
 (deftest orset-store-layout-is-crdt-walkable
   (testing "both halves live under :crdt/roots — the shape konserve-sync's crdt
