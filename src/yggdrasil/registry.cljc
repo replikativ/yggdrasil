@@ -1,18 +1,30 @@
 (ns yggdrasil.registry
-  "Cross-system snapshot registry with a single PSS index.
+  "Cross-system snapshot registry — a content-addressed 2P-Set of RegistryEntry.
 
-   Maintains one persistent-sorted-set index over RegistryEntry records,
-   sorted by [hlc system-id branch-name snapshot-id] for efficient
-   temporal queries (as-of-T).
+   The registry is a conflict-free yggdrasil system (see
+   `yggdrasil.convergent`): it grows monotonically and reconciles by union, so
+   it IS a CRDT. But it also needs REMOVE (deregister a head, GC an old
+   snapshot), which a grow-only G-Set can't do convergently. So the registry is
+   a **2P-Set**: two grow-only, content-addressed PSS sets —
 
-   Other access patterns (per-system history, GC ref-counting) use
-   full scans of the same index — fast enough for the expected scale
-   (thousands of entries, not millions). Additional indices can be
-   added later if profiling shows they're needed.
+     adds      every registered entry        (root under :registry/roots :adds)
+     removals  tombstones for deregistered entries     (… :registry/roots :removals)
 
-   Each index node is a PSS B-tree node backed by KonserveStorage
-   for durable, lazy-loading from disk."
-  (:require [yggdrasil.types :as t]
+   with live(entry) ⇔ entry ∈ adds ∧ entry ∉ removals. Entries are
+   content-addressed (`:content-addressed? true`), so re-registering the same
+   entry is idempotent and a deregistered (content-)entry stays gone — exactly
+   what a registry wants (a GC'd snapshot's content is gone; new work is a new
+   snapshot-id, never a re-add of a dead one). When richer re-add-after-remove
+   semantics are needed, use the full OR-Set (`yggdrasil.convergent.durable-orset`).
+
+   Both halves are tsbs-sorted (`[hlc system-id branch-name snapshot-id]`) PSS
+   B-trees over KonserveStorage. Queries full-scan the live set — fast enough at
+   the expected scale (thousands of entries). Sync rides konserve-sync's
+   reachability walk over `:registry/roots` (which walks BOTH roots); a
+   subscriber projects live = adds − removals."
+  (:require [clojure.set :as set]
+            [yggdrasil.types :as t]
+            [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
             [org.replikativ.persistent-sorted-set :as pss]))
 
@@ -20,26 +32,20 @@
 ;; Comparator
 ;; ============================================================
 
-(defn- safe-compare
-  "Compare two values, treating nil as less than any value."
-  [a b]
-  (cond
-    (and (nil? a) (nil? b)) 0
-    (nil? a) -1
-    (nil? b) 1
-    :else (compare a b)))
+(defn- safe-compare [a b]
+  (cond (and (nil? a) (nil? b)) 0
+        (nil? a) -1
+        (nil? b) 1
+        :else (compare a b)))
 
-(defn- hlc-cmp
-  "Compare two HLC values, nil-safe."
-  [a b]
-  (cond
-    (and (nil? a) (nil? b)) 0
-    (nil? a) -1
-    (nil? b) 1
-    :else (t/hlc-compare a b)))
+(defn- hlc-cmp [a b]
+  (cond (and (nil? a) (nil? b)) 0
+        (nil? a) -1
+        (nil? b) 1
+        :else (t/hlc-compare a b)))
 
 (def ^:private tsbs-comparator
-  "Sort by [hlc system-id branch-name snapshot-id]"
+  "Sort by [hlc system-id branch-name snapshot-id]."
   (fn [a b]
     (let [c (hlc-cmp (:hlc a) (:hlc b))]
       (if-not (zero? c) c
@@ -49,237 +55,197 @@
                           (if-not (zero? c) c
                                   (safe-compare (:snapshot-id a) (:snapshot-id b))))))))))
 
-;; ============================================================
-;; Probe entries for range queries
-;; ============================================================
-
-(def ^:private min-hlc (t/->HLC 0 0))
-(def ^:private max-hlc (t/->HLC #?(:clj Long/MAX_VALUE :cljs (.-MAX_SAFE_INTEGER js/Number))
-                                #?(:clj Integer/MAX_VALUE :cljs (.-MAX_SAFE_INTEGER js/Number))))
-(def ^:private max-str "\uffff")
-
-(defn- probe
-  "Create a probe entry for range queries.
-   Unspecified fields default to minimum values."
-  [& {:keys [snapshot-id system-id branch-name hlc]
-      :or {snapshot-id "" system-id "" branch-name "" hlc min-hlc}}]
-  (t/->RegistryEntry snapshot-id system-id branch-name hlc nil nil nil))
+(def ^:private roots-key :registry/roots)
+(def ^:private freed-key :registry/freed)
+(def ^:private branching-factor 64)
 
 ;; ============================================================
-;; Index construction
+;; PSS helpers
 ;; ============================================================
 
-(defn- build-index
-  "Build a PSS index from entries with the given comparator.
-   When storage is provided, the index is backed by konserve."
-  ([comparator entries]
-   (into (pss/sorted-set-by comparator) entries))
-  ([comparator entries storage]
-   (into (pss/sorted-set* {:comparator comparator
-                           :storage storage
-                           :branching-factor 64})
-         entries)))
+(defn- empty-set [storage]
+  (pss/sorted-set* {:comparator tsbs-comparator :storage storage
+                    :branching-factor branching-factor}))
+
+(defn- restore-set [root storage]
+  (pss/restore-by tsbs-comparator root storage {:branching-factor branching-factor}))
 
 ;; ============================================================
 ;; Registry record
 ;; ============================================================
 
 (defrecord Registry
-           [index-atom       ; atom of PSS sorted by [hlc sys branch snap]
-            kv-store         ; konserve store (or nil for in-memory only)
-            store-config     ; konserve store config map (or nil for in-memory only)
-            storage          ; KonserveStorage (or nil for in-memory only)
-            dirty-atom])     ; atom of boolean — true if unsaved changes
+           [adds-atom        ; atom of PSS — registered entries
+            removals-atom    ; atom of PSS — tombstones
+            kv-store         ; konserve store (nil = in-memory only, never here:
+                             ; ephemeral uses a :memory konserve store)
+            store-config
+            storage          ; KonserveStorage (content-addressed, entry codec)
+            dirty-atom])
+
+(defn- live-entries
+  "The currently-live entry set: adds minus removals."
+  [^Registry registry]
+  (set/difference (set (seq @(:adds-atom registry)))
+                  (set (seq @(:removals-atom registry)))))
 
 ;; ============================================================
-;; CRUD operations
+;; CRUD
 ;; ============================================================
 
 (defn register!
-  "Add a RegistryEntry to the index.
-   Marks registry as dirty for deferred persistence."
+  "Add a RegistryEntry (idempotent — content-addressed). Marks dirty."
   [^Registry registry entry]
-  (swap! (:index-atom registry) conj entry)
+  (swap! (:adds-atom registry) conj entry)
   (reset! (:dirty-atom registry) true)
   registry)
-
-(defn deregister!
-  "Remove a RegistryEntry from the index."
-  [^Registry registry entry]
-  (swap! (:index-atom registry) disj entry)
-  (reset! (:dirty-atom registry) true)
-  registry)
-
-(defn flush!
-  "Persist current index state to konserve.
-   Stores the PSS tree and saves the root address."
-  [^Registry registry]
-  (when-let [storage (:storage registry)]
-    (when @(:dirty-atom registry)
-      (let [root (pss/store @(:index-atom registry) storage)]
-        (store/save-roots! (:kv-store registry) {:tsbs root})
-        ;; Persist freed addresses
-        (store/save-freed! (:kv-store registry)
-                           @(:freed-atom storage))
-        (reset! (:dirty-atom registry) false))))
-  registry)
-
-;; ============================================================
-;; Query operations — temporal (as-of-T)
-;; ============================================================
-
-(defn as-of
-  "Find the world state at time T.
-   Returns the latest entry per [system-id branch-name] with HLC <= T.
-   Result: {[system-id branch-name] -> RegistryEntry}"
-  [^Registry registry hlc]
-  (let [upper (probe :hlc hlc :system-id max-str
-                     :branch-name max-str :snapshot-id max-str)
-        entries (pss/slice @(:index-atom registry)
-                           (probe)
-                           upper)]
-    (->> entries
-         (group-by (juxt :system-id :branch-name))
-         (map (fn [[k vs]] [k (last vs)]))
-         (into {}))))
-
-(defn entries-in-range
-  "Find all entries with HLC between from-hlc and to-hlc (inclusive)."
-  [^Registry registry from-hlc to-hlc]
-  (let [lower (probe :hlc from-hlc)
-        upper (probe :hlc to-hlc :system-id max-str
-                     :branch-name max-str :snapshot-id max-str)]
-    (seq (pss/slice @(:index-atom registry) lower upper))))
-
-;; ============================================================
-;; Query operations — per-system history (full scan)
-;; ============================================================
-
-(defn system-history
-  "Get history for a specific system and branch, newest first.
-   opts: {:limit n, :since snapshot-id}"
-  ([^Registry registry system-id branch-name]
-   (system-history registry system-id branch-name {}))
-  ([^Registry registry system-id branch-name opts]
-   (let [all (seq @(:index-atom registry))]
-     (cond->> (filter #(and (= (:system-id %) system-id)
-                            (= (:branch-name %) branch-name))
-                      all)
-       true reverse
-       (:limit opts) (take (:limit opts))
-       (:since opts) (take-while #(not= (:snapshot-id %) (:since opts)))))))
-
-(defn system-branches
-  "List all branches known in the registry for a given system-id."
-  [^Registry registry system-id]
-  (into #{} (comp (filter #(= (:system-id %) system-id))
-                  (map :branch-name))
-        (seq @(:index-atom registry))))
-
-;; ============================================================
-;; Query operations — snapshot refs (full scan)
-;; ============================================================
-
-(defn snapshot-refs
-  "Find all references to a given snapshot-id across all systems.
-   Returns seq of RegistryEntry or nil if none."
-  [^Registry registry snapshot-id]
-  (seq (filter #(= (:snapshot-id %) snapshot-id)
-               (seq @(:index-atom registry)))))
-
-(defn snapshot-systems
-  "Find which systems reference a given snapshot-id.
-   Returns set of system-id strings."
-  [^Registry registry snapshot-id]
-  (into #{} (map :system-id) (or (snapshot-refs registry snapshot-id) [])))
-
-;; ============================================================
-;; Bulk operations
-;; ============================================================
-
-(defn all-entries
-  "Return all entries in the registry."
-  [^Registry registry]
-  (set (seq @(:index-atom registry))))
-
-(defn entry-count
-  "Return the number of entries in the registry."
-  [^Registry registry]
-  (count @(:index-atom registry)))
 
 (defn register-batch!
   "Register multiple entries at once."
   [^Registry registry entries]
-  (swap! (:index-atom registry) into entries)
+  (swap! (:adds-atom registry) into entries)
   (reset! (:dirty-atom registry) true)
   registry)
 
+(defn deregister!
+  "Observed-remove a RegistryEntry: tombstone it in the removals set. Convergent
+   (unlike a G-Set disj). Permanent per content (a re-registered identical entry
+   stays removed — the registry semantics)."
+  [^Registry registry entry]
+  (swap! (:removals-atom registry) conj entry)
+  (reset! (:dirty-atom registry) true)
+  registry)
+
+(defn flush!
+  "Persist both halves to konserve + the {:adds :removals} roots cell + freed."
+  [^Registry registry]
+  (when (and (:storage registry) @(:dirty-atom registry))
+    (let [storage (:storage registry)
+          adds-root     (pss/store @(:adds-atom registry) storage)
+          removals-root (pss/store @(:removals-atom registry) storage)]
+      (kb/k-assoc (:kv-store registry) roots-key
+                  {:adds adds-root :removals removals-root} {:sync? true})
+      (kb/k-assoc (:kv-store registry) freed-key @(:freed-atom storage) {:sync? true})
+      (reset! (:dirty-atom registry) false)))
+  registry)
+
 ;; ============================================================
-;; Max HLC query
+;; Query — temporal (as-of-T)
 ;; ============================================================
 
-(defn max-hlc
-  "Return the maximum HLC in the registry, or nil if empty.
-   O(1) since the PSS index is sorted by HLC first — the last
-   entry has the highest HLC."
+(defn as-of
+  "World state at time T: the latest live entry per [system-id branch-name] with
+   HLC <= T. Result: {[system-id branch-name] -> RegistryEntry}."
+  [^Registry registry hlc]
+  (->> (live-entries registry)
+       (filter #(<= (hlc-cmp (:hlc %) hlc) 0))
+       (sort tsbs-comparator)
+       (group-by (juxt :system-id :branch-name))
+       (reduce-kv (fn [m k vs] (assoc m k (last vs))) {})))
+
+(defn entries-in-range
+  "All live entries with HLC between from-hlc and to-hlc (inclusive)."
+  [^Registry registry from-hlc to-hlc]
+  (seq (->> (live-entries registry)
+            (filter #(and (<= (hlc-cmp from-hlc (:hlc %)) 0)
+                          (<= (hlc-cmp (:hlc %) to-hlc) 0)))
+            (sort tsbs-comparator))))
+
+;; ============================================================
+;; Query — per-system history
+;; ============================================================
+
+(defn system-history
+  "History for a system+branch, newest first. opts: {:limit n :since snapshot-id}."
+  ([^Registry registry system-id branch-name]
+   (system-history registry system-id branch-name {}))
+  ([^Registry registry system-id branch-name opts]
+   (cond->> (->> (live-entries registry)
+                 (filter #(and (= (:system-id %) system-id)
+                               (= (:branch-name %) branch-name)))
+                 (sort tsbs-comparator)
+                 reverse)
+     (:limit opts) (take (:limit opts))
+     (:since opts) (take-while #(not= (:snapshot-id %) (:since opts))))))
+
+(defn system-branches
+  "All branches known for a given system-id."
+  [^Registry registry system-id]
+  (into #{} (comp (filter #(= (:system-id %) system-id)) (map :branch-name))
+        (live-entries registry)))
+
+;; ============================================================
+;; Query — snapshot refs
+;; ============================================================
+
+(defn snapshot-refs
+  "All live references to a given snapshot-id, or nil if none."
+  [^Registry registry snapshot-id]
+  (seq (filter #(= (:snapshot-id %) snapshot-id) (live-entries registry))))
+
+(defn snapshot-systems
+  "Which systems reference a given snapshot-id (set of system-id)."
+  [^Registry registry snapshot-id]
+  (into #{} (map :system-id) (or (snapshot-refs registry snapshot-id) [])))
+
+;; ============================================================
+;; Bulk
+;; ============================================================
+
+(defn all-entries
+  "All live entries."
   [^Registry registry]
-  (let [idx @(:index-atom registry)]
-    (when (pos? (count idx))
-      (:hlc (last (seq idx))))))
+  (live-entries registry))
+
+(defn entry-count
+  "Number of live entries."
+  [^Registry registry]
+  (count (live-entries registry)))
+
+(defn max-hlc
+  "Maximum HLC among live entries, or nil if empty."
+  [^Registry registry]
+  (let [live (live-entries registry)]
+    (when (seq live)
+      (:hlc (last (sort-by :hlc hlc-cmp live))))))
 
 ;; ============================================================
 ;; Factory
 ;; ============================================================
 
+(defn- ephemeral-store-config []
+  {:backend :memory :id (random-uuid)})
+
 (defn create-registry
-  "Create a new registry.
+  "Create a registry.
 
-   Requires an explicit persistence choice:
-     {:store-config {:backend :file :id #uuid \"...\" :path \"/tmp/reg\"}}
-     {:store-config {:backend :memory :id #uuid \"...\"}}
-     {:ephemeral true}
+     {:store-config {:backend :file   :id (random-uuid) :path \"/tmp/reg\"}}
+     {:store-config {:backend :memory :id (random-uuid)}}
+     {:ephemeral true}   ; a fresh in-memory konserve store
 
-   For backward compatibility, a no-arg call creates an ephemeral registry.
-   However, callers should prefer the explicit {:ephemeral true} form."
+   A no-arg call is ephemeral."
   ([] (create-registry {:ephemeral true}))
   ([opts]
-   (cond
-     ;; Persistent registry with konserve store config
-     (:store-config opts)
-     (let [store-config (:store-config opts)
-           kv-store (store/open-store store-config)
-           storage (store/create-storage kv-store {:key-encode store/entry->map
-                                                   :key-decode store/map->entry})
-           roots (store/load-roots kv-store)
-           freed (store/load-freed kv-store)
-           _ (reset! (:freed-atom storage) freed)]
-       (if roots
-         ;; Restore from existing root
-         (let [idx (pss/restore-by tsbs-comparator (:tsbs roots) storage
-                                   {:branching-factor 64})]
-           (->Registry (atom idx) kv-store store-config storage (atom false)))
-         ;; Fresh registry with storage
-         (let [idx (build-index tsbs-comparator [] storage)]
-           (->Registry (atom idx) kv-store store-config storage (atom false)))))
-
-     ;; Explicit ephemeral
-     (:ephemeral opts)
-     (let [idx (build-index tsbs-comparator [])]
-       (->Registry (atom idx) nil nil nil (atom false)))
-
-     ;; Legacy: :store-path sugar — convert to file store config
-     (:store-path opts)
-     (create-registry {:store-config {:backend :file
-                                      :id (random-uuid)
-                                      :path (:store-path opts)}})
-
-     :else
-     (throw (ex-info
-             (str "Registry requires explicit persistence choice.\n"
-                  "  {:store-config {:backend :file :id (random-uuid) :path \"/tmp/reg\"}}\n"
-                  "  {:store-config {:backend :memory :id (random-uuid)}}\n"
-                  "  {:ephemeral true}")
-             {:opts opts})))))
+   (let [store-config (cond
+                        (:store-config opts) (:store-config opts)
+                        (:store-path opts) {:backend :file :id (random-uuid)
+                                            :path (:store-path opts)}
+                        (:ephemeral opts) (ephemeral-store-config)
+                        :else (throw (ex-info
+                                      (str "Registry requires an explicit persistence choice: "
+                                           "{:store-config …} | {:ephemeral true}")
+                                      {:opts opts})))
+         kv-store (store/open-store store-config)
+         storage  (store/create-storage kv-store {:key-encode store/entry->map
+                                                  :key-decode store/map->entry
+                                                  :content-addressed? true})
+         roots (kb/k-get kv-store roots-key {:sync? true})
+         freed (or (kb/k-get kv-store freed-key {:sync? true}) {})
+         _ (reset! (:freed-atom storage) freed)
+         restore (fn [root] (if root (restore-set root storage) (empty-set storage)))]
+     (->Registry (atom (restore (:adds roots)))
+                 (atom (restore (:removals roots)))
+                 kv-store store-config storage (atom false)))))
 
 (defn close!
   "Flush and close the registry."
