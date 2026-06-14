@@ -131,13 +131,17 @@
                                (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts)))))
 
   p/Overlayable
-  ;; the UNIFORM isolate: a fresh-atoms clone at the current value (same content-
-  ;; addressed store → immutable nodes → isolated by construction). Mutate it via
-  ;; `ovl/overlay-system`; `merge-down!` joins it back, `discard!` drops it.
-  (overlay [this _opts]
-    (ovl/convergent-overlay this :frozen nil
-                            (fn [g] (assoc g :roots-atom (atom @(:roots-atom g))
-                                           :dirty-atom (atom #{}))))))
+  ;; :frozen → a fresh-atoms CLONE at the current value (isolated snapshot).
+  ;; :following → an EMPTY delta; `ovl/overlay-value` joins it with the LIVE
+  ;; parent on read, so the overlay tracks the parent's concurrent growth.
+  ;; Mutate via `ovl/overlay-system`; `merge-down!` joins it back.
+  (overlay [this opts]
+    (let [mode (or (:mode opts) :frozen)
+          lw   (if (= :following mode)
+                 (assoc this :roots-atom (atom {current (d/empty-set storage comparator)})
+                        :dirty-atom (atom #{}))
+                 (assoc this :roots-atom (atom @roots-atom) :dirty-atom (atom #{})))]
+      (ovl/convergent-overlay this mode lw))))
 
 ;; ============================================================
 ;; Value ops — cross-platform (dispatch on the record's mode)

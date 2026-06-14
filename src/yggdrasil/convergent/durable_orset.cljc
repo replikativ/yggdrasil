@@ -122,13 +122,16 @@
                                (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts)))))
 
   p/Overlayable
-  ;; uniform isolate (the residue fix): a fresh-atoms clone of BOTH halves at the
-  ;; current value. `merge-down!` joins both halves back (add-wins convergent).
-  (overlay [this _opts]
-    (ovl/convergent-overlay this :frozen nil
-                            (fn [s] (assoc s :adds-atom (atom @(:adds-atom s))
-                                           :removals-atom (atom @(:removals-atom s))
-                                           :dirty-atom (atom false))))))
+  ;; :frozen → clone BOTH halves. :following → empty delta halves; `overlay-value`
+  ;; joins with the LIVE parent on read (add-wins convergent).
+  (overlay [this opts]
+    (let [mode (or (:mode opts) :frozen)
+          lw   (if (= :following mode)
+                 (assoc this :adds-atom (atom (d/empty-set storage comparator))
+                        :removals-atom (atom (d/empty-set storage comparator)) :dirty-atom (atom false))
+                 (assoc this :adds-atom (atom @adds-atom)
+                        :removals-atom (atom @removals-atom) :dirty-atom (atom false)))]
+      (ovl/convergent-overlay this mode lw))))
 
 ;; ============================================================
 ;; Value ops

@@ -135,13 +135,33 @@
 ;; ============================================================
 
 (defprotocol Overlayable
-  "Live fork that can observe parent's evolution.
-   Three modes: :frozen, :following, :gated."
+  "An ISOLATED WORKSPACE over a parent system — fork → mutate → merge-down/discard.
+   Distinct from Branchable: a branch is a durable named ref; an overlay is a
+   transient, abandonable workspace with an observation MODE relative to the
+   parent (this is the spindel-fork / OverlayBackend relationship):
+
+     :frozen    pinned at the parent's state AT FORK TIME — the parent's later
+                evolution is INVISIBLE. (A snapshot clone / branch.) Available on
+                EVERY system.
+     :following the workspace sees the parent's LIVE state for everything it
+                hasn't overwritten, with its own writes isolated — it TRACKS the
+                parent's concurrent evolution. Clean only for CONVERGENT systems
+                (read = join(parent-live, own-delta), can't conflict); a VERSIONED
+                system (datahike/git) can't do this cheaply and DEGRADES to :frozen
+                + manual `advance!`.
+     :gated     :following with an ATOMIC observation point (sequence-lock) for
+                consistent reads of a moving parent. (Deferred.)
+
+   MODE NEGOTIATION: you REQUEST a mode; each system grants it or degrades, and
+   the resulting overlay reports the GRANTED mode in its `:mode`. So a composite
+   overlay is honestly mixed-mode (CRDT subs :following, datahike/git subs :frozen)."
 
   (overlay [this opts]
-    "Create overlay on top of system.
-     opts: {:mode :frozen|:following|:gated, :sync? true}
-     Returns Overlay.")
+    "Create an isolated overlay workspace over this system.
+     opts: {:mode :frozen|:following|:gated (default :frozen), :sync? true}
+     Returns an overlay whose `:mode` is the GRANTED mode. Read the effective
+     value with `yggdrasil.convergent.overlay/overlay-value`, write via
+     `overlay-system`, and `merge-down!`/`discard!` to finish.")
 
   (advance! [overlay] [overlay opts]
     "Sync overlay to parent's current state (gated mode).

@@ -27,19 +27,40 @@
                             [is.simm.partial-cps.async :refer [async]])))
 
 (defn overlay-system
-  "The Overlay's isolated, writable clone — mutate it with the parent system's
-   normal functional ops (add/remove/…); `merge-down!` joins it back."
+  "The Overlay's isolated, WRITABLE system — mutate it with the parent's normal
+   ops. For `:frozen` it's a clone (snapshot + own writes); for `:following` it's
+   an empty DELTA holding only the overlay's own writes (read the effective value
+   with `overlay-value`, which joins it with the live parent)."
   [overlay]
   @(:local-writes overlay))
 
 (defn convergent-overlay
-  "Build an Overlay over a convergent `parent` system: a fresh-atoms clone of
-   `parent` at its current value, isolated. `clone-fn` returns the isolated copy
-   (per-record: fresh mutable atoms, same content). `base` is the parent's
-   snapshot-id at creation (the observation point)."
-  [parent mode base clone-fn]
-  (t/->Overlay (str (random-uuid)) parent (or mode :frozen) base
-               (atom (clone-fn parent)) (t/now-ms)))
+  "Build an Overlay over a convergent `parent`. `local-writes-system` is the
+   isolated writable system the caller built for the mode:
+     :frozen    a CLONE of the parent (snapshot-at-fork + own writes) — does NOT
+                see the parent's later evolution.
+     :following an EMPTY delta (own writes only); `overlay-value` joins it with
+                the LIVE parent on read, so the overlay TRACKS the parent's
+                concurrent evolution (the spindel OverlayBackend semantics)."
+  [parent mode local-writes-system]
+  (t/->Overlay (str (random-uuid)) parent (or mode :frozen) nil
+               (atom local-writes-system) (t/now-ms)))
+
+(defn overlay-value
+  "The overlay's current EFFECTIVE system (read its value with the parent's
+   normal ops, e.g. `elements`):
+     :frozen    → the isolated clone (snapshot at fork + own writes).
+     :following → the parent's LIVE state JOINED with the overlay's delta — so it
+                  reflects the parent's concurrent evolution AND the overlay's own
+                  writes (convergent, so the join can't conflict).
+   (async+sync — the `:following` join is async on cljs.)"
+  [ov]
+  (let [parent (:parent ov)]
+    (async+sync (:sync? (:opts parent))
+                (async
+                 (if (= :following (:mode ov))
+                   (await (c/-join parent @(:local-writes ov)))
+                   @(:local-writes ov))))))
 
 ;; The overlay-SIDE methods are generic — they only use the parent's convergent
 ;; `-join` and the cloned system held in `:local-writes`.

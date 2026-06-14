@@ -133,7 +133,9 @@
 ;; worktree. (Same separate-record pattern as datahike; `local-writes` holds the
 ;; forked system so the uniform `overlay-system` accessor works.)
 
-(defrecord GitOverlay [parent local-writes fork-branch parent-branch]
+;; `mode` is always :frozen — git can't do live fall-through across worktrees; a
+;; `:following` request degrades to :frozen + manual `advance!` (git merge main).
+(defrecord GitOverlay [parent local-writes fork-branch parent-branch mode]
   p/Overlayable
   (base-ref [_] (p/snapshot-id parent))
   (peek-parent [_] parent)
@@ -360,7 +362,8 @@
     (let [pbranch (p/current-branch this)
           fbranch (keyword (str "overlay-" (random-uuid)))
           forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
-      (->GitOverlay this (atom forked) fbranch pbranch)))
+      ;; :following degrades to :frozen for git (honest fallback).
+      (->GitOverlay this (atom forked) fbranch pbranch :frozen)))
 
   p/GarbageCollectable
   (gc-roots [_]

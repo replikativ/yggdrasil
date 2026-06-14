@@ -247,7 +247,10 @@
 ;; (the convergent composite `-join` rebuilds an ephemeral composite, which would
 ;; drop them, so we don't use it here).
 
-(defrecord CompositeOverlay [parent sub-overlays opts]
+;; `mode` is the REQUESTED mode; each sub negotiates its own (a CRDT sub grants
+;; :following, a datahike/git sub degrades to :frozen) — see each sub-overlay's
+;; `:mode`. So a composite overlay is honestly mixed-mode.
+(defrecord CompositeOverlay [parent sub-overlays opts mode]
   p/Overlayable
   (base-ref [_] nil)
   (peek-parent [ov] (:parent ov)) (peek-parent [ov _] (:parent ov))
@@ -545,7 +548,7 @@
   (overlay [this o]
     (->CompositeOverlay this
                         (reduce-kv (fn [acc sid sys] (assoc acc sid (p/overlay sys o))) {} systems)
-                        opts)))
+                        opts (or (:mode o) :frozen))))
 
 ;; ============================================================
 ;; Lifecycle

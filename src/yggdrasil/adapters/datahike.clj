@@ -268,7 +268,9 @@
 ;; deletes the fork branch. (`local-writes` holds the forked system in an atom so
 ;; the uniform `overlay-system` accessor works across all overlay kinds.)
 
-(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch]
+;; `mode` is always :frozen — a versioned store can't cheaply do `:following`
+;; (live join); a `:following` request degrades to :frozen + manual `advance!`.
+(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch mode]
   p/Overlayable
   (base-ref [_] (p/snapshot-id parent))
   (peek-parent [_] parent)
@@ -525,7 +527,8 @@
     (let [pbranch (p/current-branch this)
           fbranch (keyword (str "overlay-" (random-uuid)))
           forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
-      (->DatahikeOverlay this (atom forked) fbranch pbranch))))
+      ;; :following degrades to :frozen for a versioned store (honest fallback).
+      (->DatahikeOverlay this (atom forked) fbranch pbranch :frozen))))
 
 ;; ============================================================
 ;; Constructor

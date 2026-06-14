@@ -50,6 +50,25 @@
       (let [merged (p/merge-down! ov)]
         (is (= #{:x :y :w} (g/elements merged)) "merge-down! joins the overlay into the parent")))))
 
+(deftest overlay-following-tracks-parent-evolution
+  (testing ":following overlay = the parent's LIVE state joined with the overlay's
+            delta — it sees the parent's concurrent growth AND isolates its own
+            writes; :frozen does NOT see the parent evolve"
+    (let [g  (-> (g/durable-gset "kb" :store-config (mem)) (g/add :x))
+          ov (p/overlay g {:mode :following})]
+      (is (= :following (:mode ov)) "granted :following (a convergent system can)")
+      (g/add (ovl/overlay-system ov) :w)                 ; the overlay's own write (isolated)
+      (g/add g :y)                                       ; the parent EVOLVES concurrently
+      (is (= #{:x :y :w} (g/elements (ovl/overlay-value ov)))
+          ":following sees the parent's :y AND the overlay's :w")
+      (is (= #{:x :y} (g/elements g)) "parent has only its own writes — :w stays isolated"))
+    (testing ":frozen is pinned at fork time"
+      (let [g  (-> (g/durable-gset "kb" :store-config (mem)) (g/add :x))
+            fz (p/overlay g {:mode :frozen})]
+        (g/add g :z)                                     ; parent evolves AFTER the frozen overlay
+        (is (= #{:x} (g/elements (ovl/overlay-value fz)))
+            ":frozen is pinned at fork — does NOT see the parent's later :z")))))
+
 (deftest overlay-discard-leaves-parent-untouched
   (testing "discard! drops the overlay; the parent is unaffected"
     (let [g     (-> (g/durable-gset "kb" :store-config (mem)) (g/add :a))
