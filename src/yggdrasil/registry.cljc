@@ -1,47 +1,40 @@
 (ns yggdrasil.registry
-  "Cross-system snapshot registry — a content-addressed 2P-Set of RegistryEntry.
+  "Cross-system snapshot registry — a query lens over a durable 2P-Set of
+   RegistryEntry (`yggdrasil.convergent.durable-2pset`).
 
-   The registry is a conflict-free yggdrasil system (see
-   `yggdrasil.convergent`): it grows monotonically and reconciles by union, so
-   it IS a CRDT. But it also needs REMOVE (deregister a head, GC an old
-   snapshot), which a grow-only G-Set can't do convergently. So the registry is
-   a **2P-Set**: two grow-only, content-addressed PSS sets —
+   The registry is a conflict-free yggdrasil system: it grows and reconciles by
+   union, but also needs convergent REMOVE (deregister a head, GC an old
+   snapshot), which is exactly a **2P-Set** — two grow-only, content-addressed
+   PSS sets (adds + removals), live = adds − removals. Content-addressing makes
+   register! idempotent and a deregistered entry stay gone (a GC'd snapshot's
+   content is gone; new work is a new snapshot-id, never a dead re-add).
 
-     adds      every registered entry        (root under :registry/roots :adds)
-     removals  tombstones for deregistered entries     (… :registry/roots :removals)
+   This namespace is the registry-flavored projection: RegistryEntry elements,
+   the tsbs order (`[hlc system-id branch-name snapshot-id]`), and the temporal /
+   per-system queries. The CRDT mechanics (durability, -join, sync via
+   konserve-sync, system-hood) all come from the 2P-Set underneath — which is a
+   first-class yggdrasil system (`registry-system`), so another yggdrasil can
+   itself track/fork/merge a registry.
 
-   with live(entry) ⇔ entry ∈ adds ∧ entry ∉ removals. Entries are
-   content-addressed (`:content-addressed? true`), so re-registering the same
-   entry is idempotent and a deregistered (content-)entry stays gone — exactly
-   what a registry wants (a GC'd snapshot's content is gone; new work is a new
-   snapshot-id, never a re-add of a dead one). When richer re-add-after-remove
-   semantics are needed, use the full OR-Set (`yggdrasil.convergent.durable-orset`).
-
-   Both halves are tsbs-sorted (`[hlc system-id branch-name snapshot-id]`) PSS
-   B-trees over KonserveStorage. Queries full-scan the live set — fast enough at
-   the expected scale (thousands of entries). Sync rides konserve-sync's
-   reachability walk over `:registry/roots` (which walks BOTH roots); a
-   subscriber projects live = adds − removals."
-  (:require [clojure.set :as set]
-            [yggdrasil.types :as t]
-            [yggdrasil.kbridge :as kb]
+   Entries serialize via the 2P-Set's element codec (`entry->map`/`map->entry`):
+   bare-element keys, so the codec applies cleanly (no `[elem tag]` pairs).
+   Queries full-scan the live set — fast enough at the expected scale."
+  (:require [yggdrasil.types :as t]
             [yggdrasil.storage :as store]
-            [org.replikativ.persistent-sorted-set :as pss]))
+            [yggdrasil.convergent.durable-2pset :as d2p]))
 
 ;; ============================================================
-;; Comparator
+;; tsbs comparator
 ;; ============================================================
 
 (defn- safe-compare [a b]
   (cond (and (nil? a) (nil? b)) 0
-        (nil? a) -1
-        (nil? b) 1
+        (nil? a) -1 (nil? b) 1
         :else (compare a b)))
 
 (defn- hlc-cmp [a b]
   (cond (and (nil? a) (nil? b)) 0
-        (nil? a) -1
-        (nil? b) 1
+        (nil? a) -1 (nil? b) 1
         :else (t/hlc-compare a b)))
 
 (def ^:private tsbs-comparator
@@ -55,89 +48,57 @@
                           (if-not (zero? c) c
                                   (safe-compare (:snapshot-id a) (:snapshot-id b))))))))))
 
-;; The registry is just a durable conflict-free system (a 2P-Set), so it uses
-;; the unified CRDT store convention — one roots cell {:adds :removals} that
-;; konserve-sync's generic crdt walker syncs like any other durable CRDT.
-(def ^:private roots-key :crdt/roots)
-(def ^:private freed-key :crdt/freed)
-(def ^:private branching-factor 64)
-
 ;; ============================================================
-;; PSS helpers
+;; Registry — a lens over a durable 2P-Set
 ;; ============================================================
 
-(defn- empty-set [storage]
-  (pss/sorted-set* {:comparator tsbs-comparator :storage storage
-                    :branching-factor branching-factor}))
+(defrecord Registry [tpset kv-store store-config])
 
-(defn- restore-set [root storage]
-  (pss/restore-by tsbs-comparator root storage {:branching-factor branching-factor}))
-
-;; ============================================================
-;; Registry record
-;; ============================================================
-
-(defrecord Registry
-           [adds-atom        ; atom of PSS — registered entries
-            removals-atom    ; atom of PSS — tombstones
-            kv-store         ; konserve store (nil = in-memory only, never here:
-                             ; ephemeral uses a :memory konserve store)
-            store-config
-            storage          ; KonserveStorage (content-addressed, entry codec)
-            dirty-atom])
-
-(defn- live-entries
-  "The currently-live entry set: adds minus removals."
+(defn registry-system
+  "The underlying durable 2P-Set — a first-class conflict-free yggdrasil system
+   (SystemIdentity/Snapshotable/Branchable/Mergeable/PConvergent). This is what
+   another yggdrasil (a composite or meta-registry) tracks, forks, or merges:
+   the registry, being content-addressed, has a stable snapshot identity."
   [^Registry registry]
-  (set/difference (set (seq @(:adds-atom registry)))
-                  (set (seq @(:removals-atom registry)))))
+  (:tpset registry))
+
+(defn- live-entries [^Registry registry]
+  (d2p/elements (:tpset registry)))
 
 ;; ============================================================
 ;; CRUD
 ;; ============================================================
 
 (defn register!
-  "Add a RegistryEntry (idempotent — content-addressed). Marks dirty."
+  "Add a RegistryEntry (idempotent — content-addressed)."
   [^Registry registry entry]
-  (swap! (:adds-atom registry) conj entry)
-  (reset! (:dirty-atom registry) true)
+  (d2p/add (:tpset registry) entry)
   registry)
 
 (defn register-batch!
   "Register multiple entries at once."
   [^Registry registry entries]
-  (swap! (:adds-atom registry) into entries)
-  (reset! (:dirty-atom registry) true)
+  (d2p/add-all (:tpset registry) entries)
   registry)
 
 (defn deregister!
-  "Observed-remove a RegistryEntry: tombstone it in the removals set. Convergent
-   (unlike a G-Set disj). Permanent per content (a re-registered identical entry
-   stays removed — the registry semantics)."
+  "Convergent observed-remove: tombstone the entry (permanent per content)."
   [^Registry registry entry]
-  (swap! (:removals-atom registry) conj entry)
-  (reset! (:dirty-atom registry) true)
+  (d2p/remove-elem (:tpset registry) entry)
   registry)
 
 (defn flush!
-  "Persist both halves to konserve + the {:adds :removals} roots cell + freed."
+  "Persist the 2P-Set (both halves + the :crdt/roots cell + freed)."
   [^Registry registry]
-  (when (and (:storage registry) @(:dirty-atom registry))
-    (let [storage (:storage registry)
-          adds-root     (pss/store @(:adds-atom registry) storage)
-          removals-root (pss/store @(:removals-atom registry) storage)]
-      (kb/k-assoc (:kv-store registry) roots-key
-                  {:adds adds-root :removals removals-root} {:sync? true})
-      (kb/k-assoc (:kv-store registry) freed-key @(:freed-atom storage) {:sync? true})
-      (reset! (:dirty-atom registry) false)))
+  (d2p/flush! (:tpset registry))
   registry)
 
 ;; ============================================================
-;; Query — temporal (as-of-T)
+;; Query — temporal
 ;; ============================================================
 
 (defn as-of
-  "World state at time T: the latest live entry per [system-id branch-name] with
+  "World state at time T: latest live entry per [system-id branch-name] with
    HLC <= T. Result: {[system-id branch-name] -> RegistryEntry}."
   [^Registry registry hlc]
   (->> (live-entries registry)
@@ -195,15 +156,9 @@
 ;; Bulk
 ;; ============================================================
 
-(defn all-entries
-  "All live entries."
-  [^Registry registry]
-  (live-entries registry))
+(defn all-entries [^Registry registry] (live-entries registry))
 
-(defn entry-count
-  "Number of live entries."
-  [^Registry registry]
-  (count (live-entries registry)))
+(defn entry-count [^Registry registry] (count (live-entries registry)))
 
 (defn max-hlc
   "Maximum HLC among live entries, or nil if empty."
@@ -215,9 +170,6 @@
 ;; ============================================================
 ;; Factory
 ;; ============================================================
-
-(defn- ephemeral-store-config []
-  {:backend :memory :id (random-uuid)})
 
 (defn create-registry
   "Create a registry.
@@ -233,22 +185,17 @@
                         (:store-config opts) (:store-config opts)
                         (:store-path opts) {:backend :file :id (random-uuid)
                                             :path (:store-path opts)}
-                        (:ephemeral opts) (ephemeral-store-config)
+                        (:ephemeral opts) {:backend :memory :id (random-uuid)}
                         :else (throw (ex-info
                                       (str "Registry requires an explicit persistence choice: "
                                            "{:store-config …} | {:ephemeral true}")
                                       {:opts opts})))
-         kv-store (store/open-store store-config)
-         storage  (store/create-storage kv-store {:key-encode store/entry->map
-                                                  :key-decode store/map->entry
-                                                  :content-addressed? true})
-         roots (kb/k-get kv-store roots-key {:sync? true})
-         freed (or (kb/k-get kv-store freed-key {:sync? true}) {})
-         _ (reset! (:freed-atom storage) freed)
-         restore (fn [root] (if root (restore-set root storage) (empty-set storage)))]
-     (->Registry (atom (restore (:adds roots)))
-                 (atom (restore (:removals roots)))
-                 kv-store store-config storage (atom false)))))
+         tpset (d2p/durable-2pset "registry"
+                                  :store-config store-config
+                                  :comparator tsbs-comparator
+                                  :key-encode store/entry->map
+                                  :key-decode store/map->entry)]
+     (->Registry tpset (:kv-store tpset) store-config))))
 
 (defn close!
   "Flush and close the registry."

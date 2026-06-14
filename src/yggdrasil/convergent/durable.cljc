@@ -36,13 +36,20 @@
 (defn open
   "Open the konserve store for a durable CRDT and load its freed-set into a
    fresh content-addressed KonserveStorage. Returns {:kv-store :store-config
-   :storage}."
-  [store-config]
-  (let [kv-store (store/open-store store-config)
-        storage  (store/create-storage kv-store {:content-addressed? true})
-        freed    (or (kb/k-get kv-store freed-key {:sync? true}) {})]
-    (reset! (:freed-atom storage) freed)
-    {:kv-store kv-store :store-config store-config :storage storage}))
+   :storage}.
+
+   opts may carry `:key-encode`/`:key-decode` — a node-key element codec (default
+   identity). Bare-element CRDTs (G-Set/2P-Set of records) pass the entry codec
+   here so records round-trip; element-pair CRDTs leave it identity."
+  ([store-config] (open store-config {}))
+  ([store-config {:keys [key-encode key-decode]}]
+   (let [kv-store (store/open-store store-config)
+         storage  (store/create-storage kv-store {:content-addressed? true
+                                                  :key-encode key-encode
+                                                  :key-decode key-decode})
+         freed    (or (kb/k-get kv-store freed-key {:sync? true}) {})]
+     (reset! (:freed-atom storage) freed)
+     {:kv-store kv-store :store-config store-config :storage storage})))
 
 ;; ============================================================
 ;; PSS set helpers

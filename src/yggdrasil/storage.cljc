@@ -163,11 +163,13 @@
      :settings  PSS settings (default = platform default)."
   ([kv-store] (create-storage kv-store {}))
   ([kv-store {:keys [settings key-encode key-decode content-addressed?]
-              :or {key-encode identity key-decode identity content-addressed? true}}]
+              :or {content-addressed? true}}]
+   ;; coerce in the body (not via :or) so an explicit nil — e.g. from
+   ;; durable/open threading {:key-encode nil} — still defaults to identity.
    (->KonserveStorage kv-store
                       (or settings #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
                       (atom {}) (atom {})
-                      key-encode key-decode content-addressed?)))
+                      (or key-encode identity) (or key-decode identity) content-addressed?)))
 
 ;; ============================================================
 ;; Index root + freed persistence — async+sync (sync on JVM, async on cljs)
