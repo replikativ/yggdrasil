@@ -124,6 +124,18 @@
                    #?(:clj  (contains? s x)
                       :cljs (await (pss/contains? s x opts)))))))
 
+(defn set-union
+  "Union PSS set `b` into `a` (conj every element of `b`, ordered by `cmp`).
+   The cross-platform core of -join / merge / merge-peer!. (async+sync)"
+  [a b cmp opts]
+  (async+sync (:sync? opts)
+              (async
+               #?(:clj  (into a (seq b))
+                  :cljs (loop [items (await (pss/seq b opts)) acc a]
+                          (if-some [x (await (aseq/first items))]
+                            (recur (await (aseq/rest items)) (await (pss/conj acc x cmp opts)))
+                            acc))))))
+
 ;; ============================================================
 ;; Root cell + freed persistence
 ;; ============================================================

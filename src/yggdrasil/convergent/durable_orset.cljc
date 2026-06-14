@@ -20,10 +20,10 @@
    `tag-fn` for an idempotent add (re-adding the same element is a no-op) — the
    shape the snapshot registry wants.
 
-   Implements `PConvergent` (-join) + `Branchable`. **Cross-platform via
-   `async+sync`**: browser-reachable ops (factory/add/remove-elem/elements/
-   contains-elem?/flush!) run sync on JVM and async on cljs; server-only ops
-   (-join/merge-peer!/gc!/protocols) stay synchronous."
+   Implements `PConvergent` (-join) + `Branchable`. **Fully cross-platform**: the
+   record carries its sync-mode (`opts`), so EVERY content-touching op — the
+   functional API AND the protocol methods (-join/snapshot-id/as-of/gc-sweep!) —
+   dispatches through `async+sync` (sync on JVM, async/CPS on cljs)."
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
@@ -39,13 +39,12 @@
 (def ^:private adds-branch :adds)
 (def ^:private removals-branch :removals)
 
-(defn- ->pss-union [a b] (into a (seq b)))
-
 (defrecord DurableORSet
            [id kv-store store-config storage comparator tag-fn
             adds-atom      ; atom of PSS set of [element tag]
             removals-atom  ; atom of PSS set of [element tag]
-            dirty-atom]    ; atom boolean
+            dirty-atom     ; atom boolean
+            opts]          ; the record's sync-mode
 
   p/SystemIdentity
   (system-id [_] id)
@@ -55,10 +54,16 @@
                      :graphable false :overlayable false})
 
   p/Snapshotable
-  (snapshot-id [_] (str (hash [(set (seq @adds-atom)) (set (seq @removals-atom))])))
+  (snapshot-id [_]
+    (async+sync (:sync? opts)
+                (async (str (hash [(await (d/set->clj @adds-atom opts))
+                                   (await (d/set->clj @removals-atom opts))])))))
   (parent-ids [_] #{})
-  (as-of [_ _] (let [a (set (seq @adds-atom)) r (set (seq @removals-atom))]
-                 (into #{} (map first) (set/difference a r))))
+  (as-of [_ _]
+    (async+sync (:sync? opts)
+                (async (into #{} (map first)
+                             (set/difference (await (d/set->clj @adds-atom opts))
+                                             (await (d/set->clj @removals-atom opts)))))))
   (as-of [this t _] (p/as-of this t))
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
@@ -79,21 +84,26 @@
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
   c/PConvergent
-  ;; PURE same-store join: union both grow-only halves with the peer.
+  ;; PURE same-store join: union both grow-only halves with the peer. (async+sync)
   (-join [_ other]
-    (->DurableORSet id kv-store store-config storage comparator tag-fn
-                    (atom (->pss-union @adds-atom @(:adds-atom other)))
-                    (atom (->pss-union @removals-atom @(:removals-atom other)))
-                    (atom true)))
+    (async+sync (:sync? opts)
+                (async
+                 (->DurableORSet id kv-store store-config storage comparator tag-fn
+                                 (atom (await (d/set-union @adds-atom @(:adds-atom other) comparator opts)))
+                                 (atom (await (d/set-union @removals-atom @(:removals-atom other) comparator opts)))
+                                 (atom true) opts))))
   (-conflict-free? [_] true)
 
   p/GarbageCollectable
-  (gc-roots [this] #{(p/snapshot-id this)})
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids {}))
+  (gc-roots [this]
+    (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
   (gc-sweep! [this _snapshot-ids before]
-    (flush! this)
-    (d/gc! kv-store (vals (d/load-roots kv-store))
-           (or before (java.util.Date.)))))
+    (async+sync (:sync? opts)
+                (async
+                 (await (flush! this))
+                 (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
+                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts))))))
 
 ;; ============================================================
 ;; Value ops
@@ -101,7 +111,7 @@
 
 (defn add
   "Add `elem` with a fresh tag (from `tag-fn`). Marks dirty. (async+sync) Returns o."
-  ([o elem] (add o elem {:sync? true}))
+  ([o elem] (add o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
@@ -122,7 +132,7 @@
 (defn remove-elem
   "Observed-remove `elem`: tombstone exactly the add-tags currently observed for
    it. A concurrent (unobserved) add survives — add-wins. (async+sync) Returns o."
-  ([o elem] (remove-elem o elem {:sync? true}))
+  ([o elem] (remove-elem o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
@@ -137,14 +147,14 @@
 
 (defn elements
   "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"
-  ([o] (elements o {:sync? true}))
+  ([o] (elements o (:opts o)))
   ([o opts]
    (async+sync (:sync? opts)
                (async (into #{} (map first) (await (live-pairs o opts)))))))
 
 (defn contains-elem?
   "Whether `elem` is live. (async+sync)"
-  ([o elem] (contains-elem? o elem {:sync? true}))
+  ([o elem] (contains-elem? o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async (contains? (await (elements o opts)) elem)))))
@@ -156,7 +166,7 @@
 (defn flush!
   "Persist both halves, update the :crdt/roots cell ({:adds :removals}) + freed.
    (async+sync)"
-  ([o] (flush! o {:sync? true}))
+  ([o] (flush! o (:opts o)))
   ([o opts]
    (async+sync (:sync? opts)
                (async
@@ -172,17 +182,22 @@
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's adds+removals nodes into this store and
-   union both halves. Returns o."
+   union both halves. (async+sync) Returns o."
   [o other]
-  (let [ostorage (:storage other)
-        a-root (d/store-set! @(:adds-atom other) ostorage)
-        r-root (d/store-set! @(:removals-atom other) ostorage)]
-    (d/ship! (:kv-store other) (:kv-store o) a-root)
-    (d/ship! (:kv-store other) (:kv-store o) r-root)
-    (swap! (:adds-atom o) ->pss-union (d/restore-set (:comparator o) a-root (:storage o)))
-    (swap! (:removals-atom o) ->pss-union (d/restore-set (:comparator o) r-root (:storage o)))
-    (reset! (:dirty-atom o) true)
-    o))
+  (let [opts (:opts o) cmp (:comparator o)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [ostorage (:storage other)
+                       a-root (await (d/store-set! @(:adds-atom other) ostorage opts))
+                       r-root (await (d/store-set! @(:removals-atom other) ostorage opts))]
+                   (await (d/ship! (:kv-store other) (:kv-store o) a-root opts))
+                   (await (d/ship! (:kv-store other) (:kv-store o) r-root opts))
+                   (reset! (:adds-atom o)
+                           (await (d/set-union @(:adds-atom o) (d/restore-set cmp a-root (:storage o) opts) cmp opts)))
+                   (reset! (:removals-atom o)
+                           (await (d/set-union @(:removals-atom o) (d/restore-set cmp r-root (:storage o) opts) cmp opts)))
+                   (reset! (:dirty-atom o) true)
+                   o)))))
 
 (defn gc!
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
@@ -215,4 +230,4 @@
                    (->DurableORSet id kv-store store-config storage comparator tag-fn
                                    (atom (restore adds-branch))
                                    (atom (restore removals-branch))
-                                   (atom false)))))))
+                                   (atom false) opts))))))
