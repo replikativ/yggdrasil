@@ -14,8 +14,10 @@
    (`branches`/`checkout`/`branch!`/…), are plain sync on both."
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
+            [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
+            [yggdrasil.convergent.overlay :as ovl]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -32,8 +34,8 @@
   (system-id [_] id)
   (system-type [_] :gset)
   (capabilities [_] {:snapshotable true :branchable true :mergeable true
-                     :garbage-collectable true
-                     :graphable false :overlayable false})
+                     :garbage-collectable true :overlayable true
+                     :graphable false})
 
   p/Snapshotable
   ;; snapshot-id = the content-addressed PSS ROOT of the current branch (an
@@ -126,7 +128,16 @@
                 (async
                  (await (flush! this))
                  (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts))))))
+                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts)))))
+
+  p/Overlayable
+  ;; the UNIFORM isolate: a fresh-atoms clone at the current value (same content-
+  ;; addressed store → immutable nodes → isolated by construction). Mutate it via
+  ;; `ovl/overlay-system`; `merge-down!` joins it back, `discard!` drops it.
+  (overlay [this _opts]
+    (ovl/convergent-overlay this :frozen nil
+                            (fn [g] (assoc g :roots-atom (atom @(:roots-atom g))
+                                           :dirty-atom (atom #{}))))))
 
 ;; ============================================================
 ;; Value ops — cross-platform (dispatch on the record's mode)

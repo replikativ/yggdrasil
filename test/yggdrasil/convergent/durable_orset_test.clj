@@ -7,7 +7,8 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.durable-orset :as o]
-            [yggdrasil.convergent.durable-2pset :as t])
+            [yggdrasil.convergent.durable-2pset :as t]
+            [yggdrasil.convergent.overlay :as ovl])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -82,6 +83,27 @@
       (is (= #{:a :b} (p/as-of s sid)) "as-of restores the frozen value")
       (is (= sid (p/snapshot-id (-> (t/durable-2pset "y" :store-config (mem)) (t/add :b) (t/add :a))))
           "content-addressed commit: equal halves (any order/store) → equal snapshot-id"))))
+
+(deftest orset-overlay-isolate-merge-down
+  (testing "OR-Set overlay isolates (the residue fix); merge-down! joins (add-wins)"
+    (let [s     (-> (o/durable-orset "reg" :store-config (mem)) (o/add :a) (o/add :b))
+          ov    (p/overlay s {})
+          clone (ovl/overlay-system ov)]
+      (o/add clone :c)
+      (is (= #{:a :b :c} (o/elements clone)) "overlay evolves in isolation")
+      (is (= #{:a :b}    (o/elements s))     "parent untouched while overlay is open")
+      (is (= #{:a :b :c} (o/elements (p/merge-down! ov))) "merge-down! joins the overlay"))))
+
+(deftest twopset-overlay-isolate-merge-down
+  (testing "2P-Set overlay isolates; merge-down! joins BOTH halves (remove propagates)"
+    (let [s     (-> (t/durable-2pset "x" :store-config (mem)) (t/add :a) (t/add :b))
+          ov    (p/overlay s {})
+          clone (ovl/overlay-system ov)]
+      (t/add clone :c) (t/remove-elem clone :a)
+      (is (= #{:b :c} (t/elements clone)) "overlay evolves in isolation")
+      (is (= #{:a :b} (t/elements s))     "parent untouched while overlay is open")
+      (is (= #{:b :c} (t/elements (p/merge-down! ov)))
+          "merge-down! unions adds+removals — the overlay's remove of :a propagates"))))
 
 (deftest orset-store-layout-is-crdt-walkable
   (testing "both halves live under :crdt/roots — the shape konserve-sync's crdt

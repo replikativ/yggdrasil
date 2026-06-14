@@ -24,6 +24,7 @@
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
+            [yggdrasil.convergent.overlay :as ovl]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -43,8 +44,8 @@
   (system-id [_] id)
   (system-type [_] :2p-set)
   (capabilities [_] {:snapshotable true :branchable true :mergeable true
-                     :garbage-collectable true
-                     :graphable false :overlayable false})
+                     :garbage-collectable true :overlayable true
+                     :graphable false})
 
   p/Snapshotable
   ;; addressable snapshot = a content-addressed COMMIT object {:adds :removals}
@@ -109,7 +110,17 @@
                 (async
                  (await (flush! this))
                  (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts))))))
+                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts)))))
+
+  p/Overlayable
+  ;; uniform isolate (the residue fix): a fresh-atoms clone of BOTH halves at the
+  ;; current value. Mutate via `ovl/overlay-system`; `merge-down!` joins both
+  ;; halves back (convergent), `discard!` drops it.
+  (overlay [this _opts]
+    (ovl/convergent-overlay this :frozen nil
+                            (fn [s] (assoc s :adds-atom (atom @(:adds-atom s))
+                                           :removals-atom (atom @(:removals-atom s))
+                                           :dirty-atom (atom false))))))
 
 ;; ============================================================
 ;; Value ops

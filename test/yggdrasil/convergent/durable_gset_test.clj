@@ -8,7 +8,8 @@
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.durable-gset :as g])
+            [yggdrasil.convergent.durable-gset :as g]
+            [yggdrasil.convergent.overlay :as ovl])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -36,6 +37,27 @@
       (let [a (p/snapshot-id (-> (g/durable-gset "a" :store-config (mem)) (g/add :x) (g/add :y)))
             b (p/snapshot-id (-> (g/durable-gset "b" :store-config (mem)) (g/add :y) (g/add :x)))]
         (is (= a b) "snapshot-id is a stable content handle, store-independent")))))
+
+(deftest overlay-frozen-isolate-and-merge-down
+  (testing "overlay = an isolated clone at the current value; merge-down! joins
+            it back into the parent (the uniform isolate / residue fix)"
+    (let [g     (-> (g/durable-gset "kb" :store-config (mem)) (g/add :x) (g/add :y))
+          ov    (p/overlay g {:mode :frozen})
+          clone (ovl/overlay-system ov)]
+      (g/add clone :w)                                   ; mutate the overlay in isolation
+      (is (= #{:x :y :w} (g/elements clone)) "overlay clone evolves independently")
+      (is (= #{:x :y}    (g/elements g))     "parent untouched while the overlay is open")
+      (let [merged (p/merge-down! ov)]
+        (is (= #{:x :y :w} (g/elements merged)) "merge-down! joins the overlay into the parent")))))
+
+(deftest overlay-discard-leaves-parent-untouched
+  (testing "discard! drops the overlay; the parent is unaffected"
+    (let [g     (-> (g/durable-gset "kb" :store-config (mem)) (g/add :a))
+          ov    (p/overlay g {})
+          clone (ovl/overlay-system ov)]
+      (g/add clone :b)
+      (is (nil? (p/discard! ov)))
+      (is (= #{:a} (g/elements g)) "parent unaffected by a discarded overlay"))))
 
 (deftest shared-store-distinct-cells
   (testing "two CRDTs co-habit ONE store under distinct roots/freed cells — the
