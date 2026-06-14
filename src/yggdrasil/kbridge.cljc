@@ -23,6 +23,26 @@
                   (reject v)
                   (resolve v))))))
 
+(defn await-chan
+  "Bridge a RAW konserve/core.async channel (e.g. `konserve.gc/sweep!`, which is
+   not :sync?-aware) into `async+sync`: on JVM-sync, block and return the value
+   (throw on error); on async, a partial-cps CPS fn over the channel."
+  [ch opts]
+  (if (:sync? opts)
+    #?(:clj  (let [v (clojure.core.async/<!! ch)]
+               (if (instance? Throwable v) (throw v) v))
+       :cljs ch)
+    (chan->cps ch)))
+
+(defn sync-or-cps
+  "Bridge a :sync?-aware konserve result into `async+sync`. `result` is what a
+   konserve fn returned: a VALUE on `{:sync? true}` (pass through) or a core.async
+   CHANNEL on `{:sync? false}` (wrap as a CPS fn). Use for store-lifecycle calls
+   (`konserve.store/connect-store` etc.):
+     (await (kb/sync-or-cps (kstore/connect-store cfg opts) opts))"
+  [result opts]
+  (if (:sync? opts) result (chan->cps result)))
+
 (defn k-get [store key opts]
   (if (:sync? opts)
     (k/get store key nil opts)

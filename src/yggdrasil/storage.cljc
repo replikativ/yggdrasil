@@ -39,13 +39,17 @@
 ;; ============================================================
 
 (defn open-store
-  "Open or create a konserve store from a store-config map. Sync on JVM; on cljs
-   pass {:sync? false} (returns a channel)."
+  "Open or create a konserve store from a store-config map. async+sync: sync on
+   JVM ({:sync? true}); on cljs pass {:sync? false} → a partial-cps async value
+   (`await` it). The `store-exists?` check is itself async on cljs, so it must be
+   awaited before branching (a bare `if` over the channel is always truthy)."
   ([store-config] (open-store store-config {:sync? true}))
   ([store-config opts]
-   (if (kstore/store-exists? store-config opts)
-     (kstore/connect-store store-config opts)
-     (kstore/create-store store-config opts))))
+   (async+sync (:sync? opts)
+               (async
+                (if (await (kb/sync-or-cps (kstore/store-exists? store-config opts) opts))
+                  (await (kb/sync-or-cps (kstore/connect-store store-config opts) opts))
+                  (await (kb/sync-or-cps (kstore/create-store store-config opts) opts)))))))
 
 ;; ============================================================
 ;; Record <-> map conversion for safe serialization (JVM records only)

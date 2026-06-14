@@ -12,20 +12,27 @@
    Storage layout in a (per-system) konserve store:
      <uuid>        -> a PSS B-tree node {:level :keys :addresses}  (KonserveStorage)
      :crdt/roots   -> {branch -> root-address}  (the live heads — one cell)
-     :registry/freed -> {address -> ts}         (markFreed bookkeeping; reused)
+     :crdt/freed   -> {address -> ts}           (GC bookkeeping)
+
+   **Cross-platform via `async+sync`** (mirrors persistent-sorted-set): every
+   storage-touching fn takes `opts` (default `{:sync? true}`) and is written once
+   with partial-cps `async`/`await`; the macro emits a SYNC body (JVM, values)
+   and an ASYNC body (cljs, CPS over konserve channels). JVM callers are
+   behaviour-identical to before; a browser passes `{:sync? false}` and `await`s.
 
    delta-first: `reachable-addresses` is the ship-set — the SAME value that is
    (a) konserve-sync's incremental transport set and (b) the basis of the
    element-level join-delta. `ship!` is the store-to-store sync primitive; it
-   copies only the nodes the destination is missing (incremental).
-
-   JVM-only for now (synchronous konserve {:sync? true}); the cljs durable path
-   would thread storage.cljc's async+sync — deferred. See doc gaps."
+   copies only the nodes the destination is missing (incremental)."
   (:require [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
             [konserve.gc :as kgc]
-            #?(:clj [clojure.core.async :as async])
-            [org.replikativ.persistent-sorted-set :as pss]))
+            #?(:clj  [is.simm.partial-cps.async :refer [async await]]
+               :cljs [is.simm.partial-cps.async :refer [await]])
+            #?(:clj [yggdrasil.macros :refer [async+sync]])
+            [org.replikativ.persistent-sorted-set :as pss])
+  #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
+                            [is.simm.partial-cps.async :refer [async]])))
 
 (def ^:private roots-key :crdt/roots)
 (def ^:private freed-key :crdt/freed)
@@ -37,51 +44,62 @@
 
 (defn open
   "Open the konserve store for a durable CRDT and load its freed-set into a
-   fresh content-addressed KonserveStorage. Returns {:kv-store :store-config
-   :storage}.
+   fresh content-addressed KonserveStorage. Returns (async+sync)
+   {:kv-store :store-config :storage}.
 
    opts may carry `:key-encode`/`:key-decode` — a node-key element codec (default
    identity). Bare-element CRDTs (G-Set/2P-Set of records) pass the entry codec
    here so records round-trip; element-pair CRDTs leave it identity."
-  ([store-config] (open store-config {}))
-  ([store-config {:keys [key-encode key-decode]}]
-   (let [kv-store (store/open-store store-config)
-         storage  (store/create-storage kv-store {:content-addressed? true
-                                                  :key-encode key-encode
-                                                  :key-decode key-decode})
-         freed    (or (kb/k-get kv-store freed-key {:sync? true}) {})]
-     (reset! (:freed-atom storage) freed)
-     {:kv-store kv-store :store-config store-config :storage storage})))
+  ([store-config] (open store-config {:sync? true}))
+  ([store-config opts]
+   (let [opts (merge {:sync? true} opts)     ; codec-only callers default to sync
+         {:keys [key-encode key-decode]} opts]
+     (async+sync (:sync? opts)
+                 (async
+                  (let [kv-store (await (store/open-store store-config opts))
+                        storage  (store/create-storage kv-store {:content-addressed? true
+                                                                 :key-encode key-encode
+                                                                 :key-decode key-decode})
+                        freed    (or (await (kb/k-get kv-store freed-key opts)) {})]
+                    (reset! (:freed-atom storage) freed)
+                    {:kv-store kv-store :store-config store-config :storage storage}))))))
 
 ;; ============================================================
 ;; PSS set helpers
 ;; ============================================================
 
 (defn empty-set
-  "An empty PSS sorted-set backed by `storage`."
+  "An empty PSS sorted-set backed by `storage` (pure — no storage IO)."
   [storage comparator]
   (pss/sorted-set* {:comparator comparator
                     :storage storage
                     :branching-factor branching-factor}))
 
 (defn store-set!
-  "Persist `s` to its storage and return the root address."
-  [s storage]
-  (pss/store s storage))
+  "Persist `s` to its storage and return its root address (async+sync — PSS
+   writes nodes to konserve)."
+  ([s storage] (store-set! s storage {:sync? true}))
+  ([s storage opts]
+   #?(:clj  (pss/store s storage)            ; JVM IStorage is synchronous
+      :cljs (pss/store s storage opts))))
 
 (defn restore-set
-  "Lazily restore a PSS set from `root` under `comparator`+`storage`."
-  [comparator root storage]
-  (pss/restore-by comparator root storage {:branching-factor branching-factor}))
+  "Build a LAZY PSS set rooted at `root` (sync — traversal loads nodes lazily,
+   each op then threads its own `opts`)."
+  ([comparator root storage] (restore-set comparator root storage {:sync? true}))
+  ([comparator root storage opts]
+   (pss/restore-by comparator root storage (assoc opts :branching-factor branching-factor))))
 
 ;; ============================================================
 ;; Root cell + freed persistence
 ;; ============================================================
 
 (defn load-roots
-  "Read the {branch -> root-address} cell, or nil when none yet."
-  [kv-store]
-  (kb/k-get kv-store roots-key {:sync? true}))
+  "Read the {branch -> root-address} cell, or nil when none yet (async+sync)."
+  ([kv-store] (load-roots kv-store {:sync? true}))
+  ([kv-store opts]
+   (async+sync (:sync? opts)
+               (async (await (kb/k-get kv-store roots-key opts))))))
 
 (defn save-roots!
   "MERGE `roots` into the {branch -> root-address} cell — a convergent (grow-map)
@@ -89,15 +107,20 @@
    doesn't (e.g. ones a synced peer added to the store). For a shared branch the
    incoming root wins; that's safe because mutually-merged peers compute the SAME
    content-addressed root per branch, so the cell converges rather than losing a
-   branch under blind LWW."
-  [kv-store roots]
-  (let [existing (or (kb/k-get kv-store roots-key {:sync? true}) {})]
-    (kb/k-assoc kv-store roots-key (merge existing roots) {:sync? true})))
+   branch under blind LWW. (async+sync)"
+  ([kv-store roots] (save-roots! kv-store roots {:sync? true}))
+  ([kv-store roots opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [existing (or (await (kb/k-get kv-store roots-key opts)) {})]
+                  (await (kb/k-assoc kv-store roots-key (merge existing roots) opts)))))))
 
 (defn save-freed!
-  "Persist a KonserveStorage's freed-set under the CRDT freed cell."
-  [kv-store storage]
-  (kb/k-assoc kv-store freed-key @(:freed-atom storage) {:sync? true}))
+  "Persist a KonserveStorage's freed-set under the CRDT freed cell (async+sync)."
+  ([kv-store storage] (save-freed! kv-store storage {:sync? true}))
+  ([kv-store storage opts]
+   (async+sync (:sync? opts)
+               (async (await (kb/k-assoc kv-store freed-key @(:freed-atom storage) opts))))))
 
 ;; ============================================================
 ;; Reachability walk — the ship-set (delta-first sync primitive)
@@ -105,34 +128,40 @@
 
 (defn reachable-addresses
   "Every node address reachable from `root` in `kv-store` (root + transitive
-   `:addresses`). This IS the ship-set: the nodes a peer must hold to restore
-   the set rooted at `root`. konserve-sync computes the same set structurally;
-   here it's a direct walk so the durable layer is sync-provable on its own."
-  [kv-store root]
-  (loop [to-visit [root] seen #{}]
-    (if-let [addr (first to-visit)]
-      (if (contains? seen addr)
-        (recur (rest to-visit) seen)
-        (let [node (kb/k-get kv-store addr {:sync? true})]
-          (recur (into (vec (rest to-visit)) (:addresses node))
-                 (conj seen addr))))
-      seen)))
+   `:addresses`). This IS the ship-set: the nodes a peer must hold to restore the
+   set rooted at `root`. (async+sync — the recursive walk awaits each `k-get`,
+   exactly like PSS's `walk-addresses`.)"
+  ([kv-store root] (reachable-addresses kv-store root {:sync? true}))
+  ([kv-store root opts]
+   (async+sync (:sync? opts)
+               (async
+                (loop [to-visit [root] seen #{}]
+                  (if-let [addr (first to-visit)]
+                    (if (contains? seen addr)
+                      (recur (rest to-visit) seen)
+                      (let [node (await (kb/k-get kv-store addr opts))]
+                        (recur (into (vec (rest to-visit)) (:addresses node))
+                               (conj seen addr))))
+                    seen))))))
 
 (defn ship!
   "Copy every node reachable from `root` in `src-store` that `dst-store` is
-   MISSING. Returns the count copied — incremental: 0 when already in sync.
-   The durable G-Set's sync primitive (the store-to-store form of -join's
-   transport). Idempotent: re-shipping copies nothing."
-  [src-store dst-store root]
-  (reduce (fn [n addr]
-            (if (some? (kb/k-get dst-store addr {:sync? true}))
-              n
-              (do (kb/k-assoc dst-store addr
-                              (kb/k-get src-store addr {:sync? true})
-                              {:sync? true})
-                  (inc n))))
-          0
-          (reachable-addresses src-store root)))
+   MISSING. Returns the count copied — incremental: 0 when already in sync. The
+   store-to-store form of -join's transport; idempotent. (async+sync)"
+  ([src-store dst-store root] (ship! src-store dst-store root {:sync? true}))
+  ([src-store dst-store root opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [addrs (await (reachable-addresses src-store root opts))]
+                  (loop [as (seq addrs) n 0]
+                    (if as
+                      (let [addr (first as)]
+                        (if (some? (await (kb/k-get dst-store addr opts)))
+                          (recur (next as) n)
+                          (let [v (await (kb/k-get src-store addr opts))]
+                            (await (kb/k-assoc dst-store addr v opts))
+                            (recur (next as) (inc n)))))
+                      n)))))))
 
 ;; ============================================================
 ;; Mark-and-sweep GC (datahike-style: whitelist reachable, sweep the rest)
@@ -150,11 +179,16 @@
 
    After `-join`/union, the superseded (content-addressed) root trees become
    unreferenced and accumulate forever without this. `before` defaults to now.
-   Returns the set of deleted keys. JVM (the konserve.gc channel is dereffed)."
-  ([kv-store roots] (gc! kv-store roots #?(:clj (java.util.Date.) :cljs (js/Date.))))
-  ([kv-store roots before]
-   (let [reachable (into #{roots-key freed-key}
-                         (mapcat #(reachable-addresses kv-store %) roots))]
-     #?(:clj  (let [r (async/<!! (kgc/sweep! kv-store reachable before))]
-                (if (instance? Throwable r) (throw r) r))
-        :cljs (kgc/sweep! kv-store reachable before)))))
+   Returns the set of deleted keys. (async+sync)"
+  ([kv-store roots] (gc! kv-store roots nil {:sync? true}))
+  ([kv-store roots before] (gc! kv-store roots before {:sync? true}))
+  ([kv-store roots before opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [before (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
+                      reachable (loop [rs (seq roots) acc #{roots-key freed-key}]
+                                  (if rs
+                                    (recur (next rs)
+                                           (into acc (await (reachable-addresses kv-store (first rs) opts))))
+                                    acc))]
+                  (await (kb/await-chan (kgc/sweep! kv-store reachable before) opts)))))))
