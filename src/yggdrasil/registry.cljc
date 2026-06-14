@@ -55,8 +55,11 @@
                           (if-not (zero? c) c
                                   (safe-compare (:snapshot-id a) (:snapshot-id b))))))))))
 
-(def ^:private roots-key :registry/roots)
-(def ^:private freed-key :registry/freed)
+;; The registry is just a durable conflict-free system (a 2P-Set), so it uses
+;; the unified CRDT store convention — one roots cell {:adds :removals} that
+;; konserve-sync's generic crdt walker syncs like any other durable CRDT.
+(def ^:private roots-key :crdt/roots)
+(def ^:private freed-key :crdt/freed)
 (def ^:private branching-factor 64)
 
 ;; ============================================================
