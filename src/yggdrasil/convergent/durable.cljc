@@ -84,9 +84,15 @@
   (kb/k-get kv-store roots-key {:sync? true}))
 
 (defn save-roots!
-  "Write the {branch -> root-address} cell."
+  "MERGE `roots` into the {branch -> root-address} cell — a convergent (grow-map)
+   write: a writer that knows only some branches never clobbers branches it
+   doesn't (e.g. ones a synced peer added to the store). For a shared branch the
+   incoming root wins; that's safe because mutually-merged peers compute the SAME
+   content-addressed root per branch, so the cell converges rather than losing a
+   branch under blind LWW."
   [kv-store roots]
-  (kb/k-assoc kv-store roots-key roots {:sync? true}))
+  (let [existing (or (kb/k-get kv-store roots-key {:sync? true}) {})]
+    (kb/k-assoc kv-store roots-key (merge existing roots) {:sync? true})))
 
 (defn save-freed!
   "Persist a KonserveStorage's freed-set under the CRDT freed cell."

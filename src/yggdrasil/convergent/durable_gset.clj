@@ -137,18 +137,21 @@
   g)
 
 (defn merge-peer!
-  "Reconcile with a peer G-Set living in a DIFFERENT store: ship the peer's
-   current-branch nodes into this store, restore, and union into the current
-   branch. The durable, cross-store form of -join. Returns g."
+  "Reconcile with a peer G-Set living in a DIFFERENT store: for EVERY branch the
+   peer has, ship that branch's nodes into this store, restore, and union into
+   this G-Set's same-named branch (creating it if absent). So branches a peer
+   added converge here too, not just the current one. The durable, cross-store
+   form of -join. Returns g."
   [g other]
-  (let [oroot (d/store-set! (get @(:roots-atom other) (:current other)) (:storage other))]
-    (d/ship! (:kv-store other) (:kv-store g) oroot)
-    (let [orestored (d/restore-set (:comparator g) oroot (:storage g))]
-      (swap! (:roots-atom g) update (:current g)
-             (fn [s] (->pss-union (or s (d/empty-set (:storage g) (:comparator g)))
-                                  orestored)))
-      (swap! (:dirty-atom g) conj (:current g))
-      g)))
+  (doseq [[branch oset] @(:roots-atom other)]
+    (let [oroot (d/store-set! oset (:storage other))]
+      (d/ship! (:kv-store other) (:kv-store g) oroot)
+      (let [orestored (d/restore-set (:comparator g) oroot (:storage g))]
+        (swap! (:roots-atom g) update branch
+               (fn [s] (->pss-union (or s (d/empty-set (:storage g) (:comparator g)))
+                                    orestored)))
+        (swap! (:dirty-atom g) conj branch))))
+  g)
 
 (defn gc!
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
