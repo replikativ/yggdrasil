@@ -39,7 +39,10 @@
             ;; transactional commit: flush both subs durable, write :composite/root LAST
             [tcommit committed] (<! (realize (p/commit! comp "snap-1")))
             [tsid sid]   (<! (realize (p/snapshot-id committed)))
-            meta         (p/snapshot-meta committed sid)]       ; SYNC (in-memory map) on cljs too
+            meta         (p/snapshot-meta committed sid)        ; SYNC (in-memory map) on cljs too
+            ;; as-of resolves each sub through the bundle + restores it on cljs
+            ;; (via PSS `restore`) — freeze+isolate works cross-platform now.
+            [taf as-of]  (<! (realize (p/as-of committed sid)))]
         (is (= :ok tc) "composite constructed async")
         (is (= :ok ta) "co-located sub add is async")
         (is (= :ok tcommit) "transactional commit is async")
@@ -47,10 +50,7 @@
         (is (some? sid) "committed composite has a snapshot id")
         (is (= #{"a" "b"} (set (keys (:sub-snapshots meta))))
             "the committed bundle references every sub-system (sync map read)")
-        ;; NOTE: `as-of`/`branch!`-from-snapshot (freeze+isolate) is JVM-only for
-        ;; durable CRDTs right now — it restores via PSS `restore-by`, which exists
-        ;; only in PSS's JVM impl; the cljs PSS exposes `restore` (needs :shift/
-        ;; :count or an info-map). Bridging `d/restore-set` to the cljs `restore`
-        ;; API is the follow-up for the simmis browser path. (JVM coverage:
-        ;; durable-gset-test/snapshot-id-as-of-and-branch-from-snapshot.)
+        (is (= :ok taf) "as-of restores each sub on cljs")
+        (is (= #{:a1 :a2} (get as-of "a")) "as-of resolves sub a through the bundle")
+        (is (= #{:b1} (get as-of "b")) "as-of resolves sub b through the bundle")
         (done)))))

@@ -97,10 +97,18 @@
 
 (defn restore-set
   "Build a LAZY PSS set rooted at `root` (sync — traversal loads nodes lazily,
-   each op then threads its own `opts`)."
+   each op then threads its own `opts`).
+
+   JVM uses `restore-by` (custom comparator + bare address). cljs uses the public
+   `restore` with a `{:root-address :comparator}` info-map — PSS's `restore-by`
+   is JVM-only, and cljs `restore` builds the BTSet with count -1 (lazily filled),
+   which is fine for our drain/`contains?` reads (we never read the cached count;
+   datahike stores it only for accurate `(count db)`)."
   ([comparator root storage] (restore-set comparator root storage {:sync? true}))
   ([comparator root storage opts]
-   (pss/restore-by comparator root storage (assoc opts :branching-factor branching-factor))))
+   #?(:clj  (pss/restore-by comparator root storage (assoc opts :branching-factor branching-factor))
+      :cljs (pss/restore {:root-address root :comparator comparator :branching-factor branching-factor}
+                         storage opts))))
 
 ;; ---- cross-platform PSS element ops (shared by the catalog) ----------------
 

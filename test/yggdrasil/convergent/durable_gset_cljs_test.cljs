@@ -8,6 +8,7 @@
             [org.replikativ.persistent-sorted-set :as pss]
             [is.simm.partial-cps.sequence :as aseq]
             [is.simm.partial-cps.async :refer-macros [async] :refer [await]]
+            [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.durable-gset :as g]))
@@ -44,4 +45,25 @@
         (is (= #{:x :y} els) "async add + read round-trips")
         (is (= #{:x :y} jels) "protocol -join is cross-platform (idempotent here)")
         (is (= #{:x :y} els2) "freshly-restored LAZY set reads the same elements")
+        (done)))))
+
+(deftest gset-freeze-and-isolate-on-cljs
+  ;; freeze+isolate cross-platform: snapshot-id pins a content root; as-of +
+  ;; branch!-from-snapshot re-open it over async konserve (PSS cljs `restore`).
+  (async done
+    (go
+      (let [sc          {:backend :memory :id (random-uuid)}
+            [t1 gs]     (<! (realize (g/durable-gset "kb" :store-config sc :sync? false)))
+            [_ gs]      (<! (realize (g/add gs :x)))
+            [_ gs]      (<! (realize (g/add gs :y)))
+            [t2 sid]    (<! (realize (p/snapshot-id gs)))         ; FREEZE {:x :y}
+            [_ gs]      (<! (realize (g/add gs :z)))               ; evolve → {:x :y :z}
+            [t3 frozen] (<! (realize (p/as-of gs sid)))            ; as-of the frozen id
+            iso         (-> gs (p/branch! :iso sid) (p/checkout :iso))  ; isolate (structural, sync)
+            [t4 isoels] (<! (realize (g/elements iso)))
+            [t5 curels] (<! (realize (g/elements gs)))]
+        (is (every? #(= :ok %) [t1 t2 t3 t4 t5]) "every async op completed")
+        (is (= #{:x :y} frozen) "as-of restores the frozen value on cljs")
+        (is (= #{:x :y} isoels) "branch-from-snapshot is the frozen value, isolated")
+        (is (= #{:x :y :z} curels) "the live system kept evolving independently")
         (done)))))
