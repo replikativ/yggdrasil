@@ -197,6 +197,14 @@
                                   :key-decode store/map->entry)]
      (->Registry tpset (:kv-store tpset) store-config))))
 
+(defn gc!
+  "Reclaim PSS B-tree nodes superseded by prior flushes (mark-and-sweep over the
+   underlying 2P-Set). Tombstoned (deregistered) entries remain — they're live
+   2P-Set members; this reclaims the old index-tree versions. Returns the set of
+   deleted node keys."
+  ([^Registry registry] (d2p/gc! (:tpset registry)))
+  ([^Registry registry before] (d2p/gc! (:tpset registry) before)))
+
 (defn close!
   "Flush and close the registry."
   [^Registry registry]

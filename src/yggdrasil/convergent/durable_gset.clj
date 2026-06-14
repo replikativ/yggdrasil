@@ -23,7 +23,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]))
 
-(declare ->DurableGSet)
+(declare ->DurableGSet flush!)
 
 (defn- ->pss-union
   "Union of two PSS sets: conj all of `b` into `a` (new nodes land in a's
@@ -88,7 +88,15 @@
     (->DurableGSet id kv-store store-config storage comparator
                    (atom (merge-with ->pss-union @roots-atom @(:roots-atom other)))
                    current (atom (into #{} (keys @roots-atom)))))
-  (-conflict-free? [_] true))
+  (-conflict-free? [_] true)
+
+  p/GarbageCollectable
+  (gc-roots [this] #{(p/snapshot-id this)})
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids {}))
+  (gc-sweep! [this _snapshot-ids before]
+    (flush! this)
+    (d/gc! kv-store (vals (d/load-roots kv-store))
+           (or before (java.util.Date.)))))
 
 ;; ============================================================
 ;; Value ops
@@ -141,6 +149,12 @@
                                   orestored)))
       (swap! (:dirty-atom g) conj (:current g))
       g)))
+
+(defn gc!
+  "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
+   set of deleted node keys."
+  ([g] (p/gc-sweep! g nil nil))
+  ([g before] (p/gc-sweep! g nil before)))
 
 ;; ============================================================
 ;; Factory

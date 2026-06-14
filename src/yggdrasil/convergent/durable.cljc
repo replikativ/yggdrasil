@@ -23,6 +23,8 @@
    would thread storage.cljc's async+sync — deferred. See doc gaps."
   (:require [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
+            [konserve.gc :as kgc]
+            #?(:clj [clojure.core.async :as async])
             [org.replikativ.persistent-sorted-set :as pss]))
 
 (def ^:private roots-key :crdt/roots)
@@ -125,3 +127,28 @@
                   (inc n))))
           0
           (reachable-addresses src-store root)))
+
+;; ============================================================
+;; Mark-and-sweep GC (datahike-style: whitelist reachable, sweep the rest)
+;; ============================================================
+
+(defn gc!
+  "Reclaim unreferenced PSS nodes by mark-and-sweep, mirroring datahike's
+   `gc-storage!`:
+     MARK   reachable = every node reachable from each root in `roots` ∪ the
+            mutable pointer keys (:crdt/roots, :crdt/freed) — `reachable-addresses`
+            is the PSS tree walk (datahike's `-mark`).
+     SWEEP  `konserve.gc/sweep!` deletes every store key NOT in the reachable set
+            whose last-write is before `before` (so keys written during the GC,
+            and all reachable nodes, are spared).
+
+   After `-join`/union, the superseded (content-addressed) root trees become
+   unreferenced and accumulate forever without this. `before` defaults to now.
+   Returns the set of deleted keys. JVM (the konserve.gc channel is dereffed)."
+  ([kv-store roots] (gc! kv-store roots #?(:clj (java.util.Date.) :cljs (js/Date.))))
+  ([kv-store roots before]
+   (let [reachable (into #{roots-key freed-key}
+                         (mapcat #(reachable-addresses kv-store %) roots))]
+     #?(:clj  (let [r (async/<!! (kgc/sweep! kv-store reachable before))]
+                (if (instance? Throwable r) (throw r) r))
+        :cljs (kgc/sweep! kv-store reachable before)))))

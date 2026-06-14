@@ -25,7 +25,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]))
 
-(declare ->Durable2PSet)
+(declare ->Durable2PSet flush!)
 
 (def ^:private adds-branch :adds)
 (def ^:private removals-branch :removals)
@@ -73,7 +73,17 @@
                     (atom (->pss-union @adds-atom @(:adds-atom other)))
                     (atom (->pss-union @removals-atom @(:removals-atom other)))
                     (atom true)))
-  (-conflict-free? [_] true))
+  (-conflict-free? [_] true)
+
+  p/GarbageCollectable
+  (gc-roots [this] #{(p/snapshot-id this)})
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids {}))
+  ;; node reclamation, not snapshot deletion: flush, then mark-and-sweep the
+  ;; PSS nodes unreachable from the live adds/removals roots.
+  (gc-sweep! [this _snapshot-ids before]
+    (flush! this)
+    (d/gc! kv-store (vals (d/load-roots kv-store))
+           (or before #?(:clj (java.util.Date.) :cljs (js/Date.))))))
 
 ;; ============================================================
 ;; Value ops
@@ -131,6 +141,12 @@
     (swap! (:removals-atom s) ->pss-union (d/restore-set (:comparator s) r-root (:storage s)))
     (reset! (:dirty-atom s) true)
     s))
+
+(defn gc!
+  "Reclaim PSS nodes unreachable from the live adds/removals roots (mark-and-sweep).
+   Returns the set of deleted node keys."
+  ([s] (p/gc-sweep! s nil nil))
+  ([s before] (p/gc-sweep! s nil before)))
 
 ;; ============================================================
 ;; Factory

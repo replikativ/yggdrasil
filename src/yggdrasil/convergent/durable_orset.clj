@@ -26,7 +26,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]))
 
-(declare ->DurableORSet)
+(declare ->DurableORSet flush!)
 
 (def ^:private adds-branch :adds)
 (def ^:private removals-branch :removals)
@@ -77,7 +77,15 @@
                     (atom (->pss-union @adds-atom @(:adds-atom other)))
                     (atom (->pss-union @removals-atom @(:removals-atom other)))
                     (atom true)))
-  (-conflict-free? [_] true))
+  (-conflict-free? [_] true)
+
+  p/GarbageCollectable
+  (gc-roots [this] #{(p/snapshot-id this)})
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids {}))
+  (gc-sweep! [this _snapshot-ids before]
+    (flush! this)
+    (d/gc! kv-store (vals (d/load-roots kv-store))
+           (or before (java.util.Date.)))))
 
 ;; ============================================================
 ;; Value ops
@@ -145,6 +153,12 @@
     (swap! (:removals-atom o) ->pss-union (d/restore-set (:comparator o) r-root (:storage o)))
     (reset! (:dirty-atom o) true)
     o))
+
+(defn gc!
+  "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
+   set of deleted node keys."
+  ([o] (p/gc-sweep! o nil nil))
+  ([o before] (p/gc-sweep! o nil before)))
 
 ;; ============================================================
 ;; Factory
