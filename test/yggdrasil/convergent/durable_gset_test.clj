@@ -182,3 +182,25 @@
       ;; reopen a fresh handle on the same store
       (let [reopened (g/durable-gset "kb" :store-config sc)]
         (is (= #{:p :q :r} (g/elements reopened)) "restored from disk")))))
+
+(deftest delta-state-op-perspective
+  (testing "the OP perspective: a mutation records its op as a local δ (captured
+            at the write, no diffing); apply-delta consumes a peer's δ; the op-path
+            converges to the SAME value as the state-path (-join)"
+    (let [g (-> (g/durable-gset "a" :store-config {:backend :memory :id (random-uuid)})
+                (g/add :x) (g/add :y))]
+      (is (= #{:x :y} (c/delta-of g)) "δ = exactly the ops applied (accrued), no diffing")
+      (is (nil? (c/delta-of (c/clear-delta g))) "clear-delta drops the δ")
+      (is (= #{:x :y} (g/elements g)) "δ rides in metadata — value/equality unaffected")
+      ;; op-path: a peer applies just the δ (cheap, O(δ))
+      (let [peer   (-> (g/durable-gset "b" :store-config {:backend :memory :id (random-uuid)}) (g/add :z))
+            via-op (g/apply-delta peer (c/delta-of g))]
+        (is (= #{:x :y :z} (g/elements via-op)) "apply-delta unions the peer's ops in")
+        (is (= #{:z} (c/delta-of via-op))
+            "remote-integrated ops are NOT added to the local δ — only the peer's own
+             un-propagated :z remains, so remote ops never echo back to the sender"))
+      ;; op-path ≡ state-path: same converged value as a full -join
+      (let [peer2 (-> (g/durable-gset "c" :store-config {:backend :memory :id (random-uuid)}) (g/add :z))]
+        (is (= (g/elements (g/apply-delta peer2 (c/delta-of g)))
+               (g/elements (c/-join peer2 g)))
+            "op-path (apply δ) ≡ state-path (-join)")))))

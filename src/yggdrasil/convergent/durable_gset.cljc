@@ -158,7 +158,9 @@
 ;; ============================================================
 
 (defn add
-  "Add `x` to the current branch's set; mark dirty. (async+sync) Returns g."
+  "Add `x` to the current branch's set; mark dirty, and RECORD the op as a local δ
+   (`{x}`) so a synced signal can ship just the op. (async+sync) Returns the
+   (δ-carrying) g."
   [g x]
   (let [opts (:opts g)]
     (async+sync (:sync? opts)
@@ -167,6 +169,26 @@
                        base (or (get @(:roots-atom g) cur)
                                 (d/empty-set (:storage g) (:comparator g)))
                        s'   (await (d/set-conj base x (:comparator g) opts))]
+                   (swap! (:roots-atom g) assoc cur s')
+                   (swap! (:dirty-atom g) conj cur)
+                   (c/with-delta g set/union #{x}))))))
+
+(defn apply-delta
+  "Consume a peer's G-Set δ — a set of added elements — by unioning it into the
+   current branch. The OP-path apply (cheap: O(δ), no full -join, no diffing); the
+   counterpart to -join (the STATE-path). Returns g WITHOUT a local δ (remote-
+   integrated ops do not re-propagate). (async+sync)"
+  [g delta]
+  (let [opts (:opts g)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [cur  (:current g)
+                       base (or (get @(:roots-atom g) cur)
+                                (d/empty-set (:storage g) (:comparator g)))
+                       s'   (loop [s base es (seq delta)]
+                              (if es
+                                (recur (await (d/set-conj s (first es) (:comparator g) opts)) (next es))
+                                s))]
                    (swap! (:roots-atom g) assoc cur s')
                    (swap! (:dirty-atom g) conj cur)
                    g)))))
