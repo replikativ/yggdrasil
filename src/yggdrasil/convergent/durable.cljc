@@ -244,12 +244,12 @@
    (async+sync (:sync? opts)
                (async
                 (let [before (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
-                      ;; NOTE: in a SHARED store (single-causal-root composite) this
-                      ;; sub's `roots` don't reach sibling subs' nodes, so a per-sub
-                      ;; gc! would delete them — the composite must instead sweep ONCE
-                      ;; over the UNION of every sub's roots. Standalone (own-store)
-                      ;; CRDTs are unaffected.
-                      reachable (loop [rs (seq roots) acc #{(rk opts) (fk opts)}]
+                      ;; A SHARED-store composite sweeps ONCE over the UNION of every
+                      ;; sub's roots (a per-sub gc! would delete siblings, unreachable
+                      ;; from one sub's roots) and passes `:spare-keys` = all the extra
+                      ;; pointer cells to keep (each sub's [:crdt/roots id]/[:crdt/freed
+                      ;; id] + the composite manifest). Standalone CRDTs leave it nil.
+                      reachable (loop [rs (seq roots) acc (into #{(rk opts) (fk opts)} (:spare-keys opts))]
                                   (if rs
                                     (recur (next rs)
                                            (into acc (await (reachable-addresses kv-store (first rs) opts))))

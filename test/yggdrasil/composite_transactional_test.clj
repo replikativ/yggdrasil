@@ -37,6 +37,31 @@
           (is (= #{"a" "b"} (set (keys (:sub-snapshots meta))))
               "the committed bundle references every sub-system"))))))
 
+(deftest shared-store-unified-gc
+  (testing "a co-located composite sweeps ONCE over the union of all roots —
+            reclaims the orphaned superseded trees, keeps live state, and the
+            composite still resolves afterwards"
+    (let [sc     (file-cfg)
+          opener (fn [id] (fn [kv o] (g/durable-gset id :kv-store kv
+                                                     :roots-key [:crdt/roots id]
+                                                     :sync? (:sync? o))))
+          comp   (cmp/composite [(opener "a")] :store-config sc)
+          a      (cmp/get-subsystem comp "a")]
+      (g/add a :x) (g/add a :y)
+      (p/commit! comp "c1")
+      (g/add a :z)
+      (let [comp   (p/commit! comp "c2")          ; supersedes c1's index + sub trees
+            before (count (k/keys (:kv-store comp) {:sync? true}))
+            report (p/gc-sweep! comp nil)
+            after  (count (k/keys (:kv-store comp) {:sync? true}))]
+        (is (seq (:deleted report)) "reclaimed nodes from the superseded trees")
+        (is (< after before) "the shared store shrank")
+        ;; live state survives + the composite still resolves through :composite/root
+        (is (= #{:x :y :z} (g/elements (cmp/get-subsystem comp "a"))) "live sub state intact")
+        (let [sid (p/snapshot-id comp)]
+          (is (some? (p/snapshot-meta comp sid)) "history still resolves")
+          (is (= #{:x :y :z} (get (p/as-of comp sid) "a")) "as-of resolves the live sub"))))))
+
 (deftest merge-commits-transactionally
   (testing "composite merge! delegates to the transactional commit"
     (let [a (-> (g/durable-gset "a" :store-config (file-cfg)) (g/add :x))

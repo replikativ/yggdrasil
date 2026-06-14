@@ -197,6 +197,46 @@
                            :sub-snapshots sub-snaps})
                    (await (persist-index! kv-store storage index-atom opts)))))))
 
+(defn- colocated?
+  "Whether `sys` co-habits `kv-store` as a durable CRDT (its own roots cell)."
+  [kv-store sys]
+  (boolean (and kv-store (identical? kv-store (:kv-store sys)) (get-in sys [:opts :roots-key]))))
+
+(defn- unified-gc!
+  "Shared-store composite GC: flush the index + every co-located sub, then ONE
+   mark-and-sweep over the UNION of the composite index root and every sub root,
+   sparing all pointer cells (per-sub [:crdt/roots id]/[:crdt/freed id] + the
+   manifest). A per-sub gc! would delete siblings (unreachable from one sub's
+   roots), so the composite must sweep as a whole. (async+sync) Returns the
+   reclamation report {:deleted <set-of-keys>}."
+  [kv-store storage index-atom systems opts before]
+  (async+sync (:sync? opts)
+              (async
+               ;; persist the latest state we mean to keep
+               (loop [ss (seq systems)]
+                 (when ss
+                   (when (satisfies? p/Committable (val (first ss)))
+                     (await (p/commit! (val (first ss)))))
+                   (recur (next ss))))
+               (await (persist-index! kv-store storage index-atom opts))
+               (let [manifest  (colocated-subs-manifest kv-store systems)
+                     comp-root (await (kb/k-get kv-store composite-root-key opts))
+                     sub-roots (loop [ss (seq systems) acc []]
+                                 (if ss
+                                   (let [s (val (first ss))]
+                                     (recur (next ss)
+                                            (into acc (vals (await (d/load-roots (:kv-store s) (:opts s)))))))
+                                   acc))
+                     roots (filterv some? (cons comp-root sub-roots))
+                     spare (into #{composite-subs-key}
+                                 (mapcat (fn [m] [(:roots-key m) (:freed-key m)]))
+                                 manifest)
+                     deleted (await (d/gc! kv-store roots before
+                                           (assoc opts :roots-key composite-root-key
+                                                  :freed-key composite-freed-key
+                                                  :spare-keys spare)))]
+                 {:deleted deleted}))))
+
 ;; ============================================================
 ;; CompositeSystem (fiber product / pullback)
 ;; ============================================================
@@ -428,15 +468,13 @@
   (gc-sweep! [_ snapshot-ids gopts]
     (async+sync (:sync? opts)
                 (async
-                 (if (and kv-store
-                          (seq systems)
-                          (every? (fn [[_ sys]] (identical? kv-store (:kv-store sys))) systems))
-                   ;; SHARED store: a per-sub sweep would delete sibling + index nodes
-                   ;; (unreachable from one sub's roots). A correct unified sweep over
-                   ;; the union of all roots is a follow-up — skip rather than corrupt.
-                   {:skipped :shared-store-gc-todo
-                    :reason "subs co-habit the composite store; unified sweep not yet implemented"}
-                   ;; SEPARATE stores: each sub owns its store — safe to fan out.
+                 (if (and kv-store (seq systems)
+                          (every? (fn [[_ sys]] (colocated? kv-store sys)) systems))
+                   ;; SHARED store → ONE unified mark-and-sweep over the union of roots
+                   ;; (a per-sub sweep would delete siblings/index nodes).
+                   (await (unified-gc! kv-store storage index-atom systems opts
+                                       (:remove-before gopts)))
+                   ;; SEPARATE stores → each sub owns its store, safe to fan out.
                    (loop [ss (seq systems) acc {}]
                      (if ss
                        (let [[sid sys] (first ss)]
