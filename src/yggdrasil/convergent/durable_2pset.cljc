@@ -23,7 +23,12 @@
             [hasch.core :as hasch]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
-            [yggdrasil.convergent.durable :as d]))
+            [yggdrasil.convergent.durable :as d]
+            #?(:clj  [is.simm.partial-cps.async :refer [async await]]
+               :cljs [is.simm.partial-cps.async :refer [await]])
+            #?(:clj [yggdrasil.macros :refer [async+sync]]))
+  #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
+                            [is.simm.partial-cps.async :refer [async]])))
 
 (declare ->Durable2PSet flush!)
 
@@ -89,45 +94,72 @@
 ;; Value ops
 ;; ============================================================
 
-(defn add [s elem]
-  (swap! (:adds-atom s) conj elem)
-  (reset! (:dirty-atom s) true)
-  s)
+(defn- conj-into!
+  "async+sync: conj `elem` onto the PSS set in `atom-kw` of `s`, mark dirty."
+  [s atom-kw elem opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [s' (await (d/set-conj @(atom-kw s) elem (:comparator s) opts))]
+                 (reset! (atom-kw s) s')
+                 (reset! (:dirty-atom s) true)
+                 s))))
 
-(defn add-all [s elems]
-  (swap! (:adds-atom s) into elems)
-  (reset! (:dirty-atom s) true)
-  s)
+(defn add
+  "Add `elem`. (async+sync)"
+  ([s elem] (add s elem {:sync? true}))
+  ([s elem opts] (conj-into! s :adds-atom elem opts)))
+
+(defn add-all
+  "Add many elements. (async+sync)"
+  ([s elems] (add-all s elems {:sync? true}))
+  ([s elems opts]
+   (async+sync (:sync? opts)
+               (async
+                (loop [es (seq elems)]
+                  (if es
+                    (do (await (conj-into! s :adds-atom (first es) opts)) (recur (next es)))
+                    s))))))
 
 (defn remove-elem
-  "Tombstone `elem` (permanent — 2P-Set semantics)."
-  [s elem]
-  (swap! (:removals-atom s) conj elem)
-  (reset! (:dirty-atom s) true)
-  s)
+  "Tombstone `elem` (permanent — 2P-Set semantics). (async+sync)"
+  ([s elem] (remove-elem s elem {:sync? true}))
+  ([s elem opts] (conj-into! s :removals-atom elem opts)))
 
 (defn elements
-  "Live elements: adds − removals."
-  [s]
-  (set/difference (set (seq @(:adds-atom s))) (set (seq @(:removals-atom s)))))
+  "Live elements: adds − removals. (async+sync)"
+  ([s] (elements s {:sync? true}))
+  ([s opts]
+   (async+sync (:sync? opts)
+               (async (set/difference (await (d/set->clj @(:adds-atom s) opts))
+                                      (await (d/set->clj @(:removals-atom s) opts)))))))
 
-(defn contains-elem? [s elem] (contains? (elements s) elem))
+(defn contains-elem?
+  "Whether `elem` is live. (async+sync)"
+  ([s elem] (contains-elem? s elem {:sync? true}))
+  ([s elem opts]
+   (async+sync (:sync? opts)
+               (async (contains? (await (elements s opts)) elem)))))
 
 ;; ============================================================
 ;; Persistence + cross-store sync
 ;; ============================================================
 
 (defn flush!
-  "Persist both halves + the :crdt/roots cell ({:adds :removals}) + freed."
-  [s]
-  (when @(:dirty-atom s)
-    (let [storage (:storage s)
-          adds-root     (d/store-set! @(:adds-atom s) storage)
-          removals-root (d/store-set! @(:removals-atom s) storage)]
-      (d/save-roots! (:kv-store s) {adds-branch adds-root removals-branch removals-root})
-      (d/save-freed! (:kv-store s) storage)
-      (reset! (:dirty-atom s) false)))
-  s)
+  "Persist both halves + the :crdt/roots cell ({:adds :removals}) + freed.
+   (async+sync)"
+  ([s] (flush! s {:sync? true}))
+  ([s opts]
+   (async+sync (:sync? opts)
+               (async
+                (when @(:dirty-atom s)
+                  (let [storage       (:storage s)
+                        adds-root     (await (d/store-set! @(:adds-atom s) storage opts))
+                        removals-root (await (d/store-set! @(:removals-atom s) storage opts))]
+                    (await (d/save-roots! (:kv-store s)
+                                          {adds-branch adds-root removals-branch removals-root} opts))
+                    (await (d/save-freed! (:kv-store s) storage opts))
+                    (reset! (:dirty-atom s) false)))
+                s))))
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's adds+removals nodes here and union both."
@@ -159,15 +191,18 @@
    :key-encode/:key-decode  node-key element codec (default identity; the
                             registry passes its entry<->map codec)
    Restores both halves from the store's :crdt/roots cell when present."
-  [id & {:keys [store-config comparator key-encode key-decode]
-         :or {comparator compare}}]
-  (let [{:keys [kv-store storage]} (d/open store-config {:key-encode key-encode
-                                                         :key-decode key-decode})
-        roots (d/load-roots kv-store)
-        restore (fn [branch] (if-let [root (get roots branch)]
-                               (d/restore-set comparator root storage)
-                               (d/empty-set storage comparator)))]
-    (->Durable2PSet id kv-store store-config storage comparator
-                    (atom (restore adds-branch))
-                    (atom (restore removals-branch))
-                    (atom false))))
+  [id & {:keys [store-config comparator key-encode key-decode sync?]
+         :or {comparator compare sync? true}}]
+  (let [opts {:sync? sync?}]
+    (async+sync sync?
+                (async
+                 (let [{:keys [kv-store storage]} (await (d/open store-config (assoc opts :key-encode key-encode
+                                                                                    :key-decode key-decode)))
+                       roots (await (d/load-roots kv-store opts))
+                       restore (fn [branch] (if-let [root (get roots branch)]
+                                              (d/restore-set comparator root storage opts)
+                                              (d/empty-set storage comparator)))]
+                   (->Durable2PSet id kv-store store-config storage comparator
+                                   (atom (restore adds-branch))
+                                   (atom (restore removals-branch))
+                                   (atom false)))))))

@@ -30,7 +30,8 @@
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]])
-            [org.replikativ.persistent-sorted-set :as pss])
+            [org.replikativ.persistent-sorted-set :as pss]
+            #?(:cljs [is.simm.partial-cps.sequence :as aseq]))
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
@@ -89,6 +90,39 @@
   ([comparator root storage] (restore-set comparator root storage {:sync? true}))
   ([comparator root storage opts]
    (pss/restore-by comparator root storage (assoc opts :branching-factor branching-factor))))
+
+;; ---- cross-platform PSS element ops (shared by the catalog) ----------------
+
+(defn set->clj
+  "Materialize a (possibly lazy) PSS set into a Clojure set. (async+sync). On
+   cljs a storage-backed set is drained one node at a time via its AsyncSeq (the
+   partial-cps sequence protocol PSS itself uses)."
+  [s opts]
+  (async+sync (:sync? opts)
+              (async
+               (if (nil? s) #{}
+                   #?(:clj  (into #{} s)
+                      :cljs (loop [items (await (pss/seq s opts)) acc (transient #{})]
+                              (if-some [x (await (aseq/first items))]
+                                (recur (await (aseq/rest items)) (conj! acc x))
+                                (persistent! acc))))))))
+
+(defn set-conj
+  "conj `x` onto PSS set `s` under comparator `cmp`. (async+sync)"
+  [s x cmp opts]
+  (async+sync (:sync? opts)
+              (async
+               #?(:clj  (conj s x)
+                  :cljs (await (pss/conj s x cmp opts))))))
+
+(defn set-contains?
+  "Whether PSS set `s` contains `x`. (async+sync)"
+  [s x opts]
+  (async+sync (:sync? opts)
+              (async
+               (if (nil? s) false
+                   #?(:clj  (contains? s x)
+                      :cljs (await (pss/contains? s x opts)))))))
 
 ;; ============================================================
 ;; Root cell + freed persistence

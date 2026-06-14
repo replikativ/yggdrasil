@@ -23,9 +23,7 @@
             [yggdrasil.convergent.durable :as d]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
-            #?(:clj [yggdrasil.macros :refer [async+sync]])
-            #?@(:cljs [[org.replikativ.persistent-sorted-set :as pss]
-                       [is.simm.partial-cps.sequence :as aseq]]))
+            #?(:clj [yggdrasil.macros :refer [async+sync]]))
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
@@ -36,30 +34,6 @@
    the protocol `-join` and `merge-peer!` (server-side)."
   [a b]
   (into a (seq b)))
-
-;; ---- async+sync set primitives (browser-reachable) -------------------------
-
-(defn- set->clj
-  "Materialize a (possibly lazy) PSS set into a Clojure set. (async+sync). On
-   cljs the set may be storage-backed/lazy, so drain its AsyncSeq (the partial-cps
-   sequence protocol PSS itself uses) one node at a time."
-  [s opts]
-  (async+sync (:sync? opts)
-              (async
-               (if (nil? s) #{}
-                   #?(:clj  (into #{} s)
-                      :cljs (loop [items (await (pss/seq s opts)) acc (transient #{})]
-                              (if-some [x (await (aseq/first items))]
-                                (recur (await (aseq/rest items)) (conj! acc x))
-                                (persistent! acc))))))))
-
-(defn- pss-conj
-  "conj `x` onto PSS set `s` under comparator `cmp`. (async+sync)"
-  [s x cmp opts]
-  (async+sync (:sync? opts)
-              (async
-               #?(:clj  (conj s x)
-                  :cljs (await (pss/conj s x cmp opts))))))
 
 ;; ============================================================
 ;; Record
@@ -141,7 +115,7 @@
                 (let [cur  (:current g)
                       base (or (get @(:roots-atom g) cur)
                                (d/empty-set (:storage g) (:comparator g)))
-                      s'   (await (pss-conj base x (:comparator g) opts))]
+                      s'   (await (d/set-conj base x (:comparator g) opts))]
                   (swap! (:roots-atom g) assoc cur s')
                   (swap! (:dirty-atom g) conj cur)
                   g)))))
@@ -151,7 +125,7 @@
   ([g] (elements g {:sync? true}))
   ([g opts]
    (async+sync (:sync? opts)
-               (async (await (set->clj (get @(:roots-atom g) (:current g)) opts))))))
+               (async (await (d/set->clj (get @(:roots-atom g) (:current g)) opts))))))
 
 (defn contains-elem?
   "Whether `x` is in the current branch's set. (async+sync)"
@@ -160,9 +134,7 @@
    (async+sync (:sync? opts)
                (async
                 (let [s (get @(:roots-atom g) (:current g))]
-                  (if (nil? s) false
-                      #?(:clj  (contains? s x)
-                         :cljs (await (pss/contains? s x opts)))))))))
+                  (await (d/set-contains? s x opts)))))))
 
 (defn added
   "Element-level join-delta: elements in `g` not in peer `other`. (async+sync)"

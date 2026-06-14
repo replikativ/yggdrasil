@@ -20,11 +20,19 @@
    `tag-fn` for an idempotent add (re-adding the same element is a no-op) — the
    shape the snapshot registry wants.
 
-   Implements `PConvergent` (-join) + `Branchable`. JVM-only for now."
+   Implements `PConvergent` (-join) + `Branchable`. **Cross-platform via
+   `async+sync`**: browser-reachable ops (factory/add/remove-elem/elements/
+   contains-elem?/flush!) run sync on JVM and async on cljs; server-only ops
+   (-join/merge-peer!/gc!/protocols) stay synchronous."
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
-            [yggdrasil.convergent.durable :as d]))
+            [yggdrasil.convergent.durable :as d]
+            #?(:clj  [is.simm.partial-cps.async :refer [async await]]
+               :cljs [is.simm.partial-cps.async :refer [await]])
+            #?(:clj [yggdrasil.macros :refer [async+sync]]))
+  #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
+                            [is.simm.partial-cps.async :refer [async]])))
 
 (declare ->DurableORSet flush!)
 
@@ -92,53 +100,75 @@
 ;; ============================================================
 
 (defn add
-  "Add `elem` with a fresh tag (from `tag-fn`). Marks dirty. Returns o."
-  [o elem]
-  (swap! (:adds-atom o) conj [elem ((:tag-fn o) elem)])
-  (reset! (:dirty-atom o) true)
-  o)
+  "Add `elem` with a fresh tag (from `tag-fn`). Marks dirty. (async+sync) Returns o."
+  ([o elem] (add o elem {:sync? true}))
+  ([o elem opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [pair [elem ((:tag-fn o) elem)]
+                      s'   (await (d/set-conj @(:adds-atom o) pair (:comparator o) opts))]
+                  (reset! (:adds-atom o) s')
+                  (reset! (:dirty-atom o) true)
+                  o)))))
 
-(defn- observed-tags
-  "The [elem tag] add-pairs for `elem` currently live (in adds, not removals)."
-  [o elem]
-  (let [rem (set (seq @(:removals-atom o)))]
-    (->> (seq @(:adds-atom o))
-         (filter (fn [[e _ :as pair]] (and (= e elem) (not (contains? rem pair))))))))
+(defn- live-pairs
+  "async+sync: the live [elem tag] add-pairs (in adds, not removals)."
+  [o opts]
+  (async+sync (:sync? opts)
+              (async
+               (set/difference (await (d/set->clj @(:adds-atom o) opts))
+                               (await (d/set->clj @(:removals-atom o) opts))))))
 
 (defn remove-elem
   "Observed-remove `elem`: tombstone exactly the add-tags currently observed for
-   it. A concurrent (unobserved) add survives the merge — add-wins. Returns o."
-  [o elem]
-  (let [tombstones (observed-tags o elem)]
-    (when (seq tombstones)
-      (swap! (:removals-atom o) (fn [s] (reduce conj s tombstones)))
-      (reset! (:dirty-atom o) true)))
-  o)
+   it. A concurrent (unobserved) add survives — add-wins. (async+sync) Returns o."
+  ([o elem] (remove-elem o elem {:sync? true}))
+  ([o elem opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [tombstones (filter (fn [[e _]] (= e elem)) (await (live-pairs o opts)))]
+                  (loop [ts (seq tombstones)]
+                    (when ts
+                      (let [s' (await (d/set-conj @(:removals-atom o) (first ts) (:comparator o) opts))]
+                        (reset! (:removals-atom o) s')
+                        (reset! (:dirty-atom o) true)
+                        (recur (next ts)))))
+                  o)))))
 
 (defn elements
-  "Live elements: those with ≥1 add-tag not tombstoned."
-  [o]
-  (let [adds (set (seq @(:adds-atom o)))
-        rem  (set (seq @(:removals-atom o)))]
-    (into #{} (map first) (set/difference adds rem))))
+  "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"
+  ([o] (elements o {:sync? true}))
+  ([o opts]
+   (async+sync (:sync? opts)
+               (async (into #{} (map first) (await (live-pairs o opts)))))))
 
-(defn contains-elem? [o elem] (contains? (elements o) elem))
+(defn contains-elem?
+  "Whether `elem` is live. (async+sync)"
+  ([o elem] (contains-elem? o elem {:sync? true}))
+  ([o elem opts]
+   (async+sync (:sync? opts)
+               (async (contains? (await (elements o opts)) elem)))))
 
 ;; ============================================================
 ;; Persistence + cross-store sync
 ;; ============================================================
 
 (defn flush!
-  "Persist both halves, update the :crdt/roots cell ({:adds :removals}) + freed."
-  [o]
-  (when @(:dirty-atom o)
-    (let [storage (:storage o)
-          adds-root     (d/store-set! @(:adds-atom o) storage)
-          removals-root (d/store-set! @(:removals-atom o) storage)]
-      (d/save-roots! (:kv-store o) {adds-branch adds-root removals-branch removals-root})
-      (d/save-freed! (:kv-store o) storage)
-      (reset! (:dirty-atom o) false)))
-  o)
+  "Persist both halves, update the :crdt/roots cell ({:adds :removals}) + freed.
+   (async+sync)"
+  ([o] (flush! o {:sync? true}))
+  ([o opts]
+   (async+sync (:sync? opts)
+               (async
+                (when @(:dirty-atom o)
+                  (let [storage       (:storage o)
+                        adds-root     (await (d/store-set! @(:adds-atom o) storage opts))
+                        removals-root (await (d/store-set! @(:removals-atom o) storage opts))]
+                    (await (d/save-roots! (:kv-store o)
+                                          {adds-branch adds-root removals-branch removals-root} opts))
+                    (await (d/save-freed! (:kv-store o) storage opts))
+                    (reset! (:dirty-atom o) false)))
+                o))))
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's adds+removals nodes into this store and
@@ -172,14 +202,17 @@
    :tag-fn  element -> tag (default: ignore element, fresh random-uuid → true
             OR-Set). Pass a content-hash fn for idempotent add (registry shape).
    Restores both halves from the store's :crdt/roots cell when present."
-  [id & {:keys [store-config comparator tag-fn]
-         :or {comparator compare tag-fn (fn [_] (random-uuid))}}]
-  (let [{:keys [kv-store storage]} (d/open store-config)
-        roots (d/load-roots kv-store)
-        restore (fn [branch] (if-let [root (get roots branch)]
-                               (d/restore-set comparator root storage)
-                               (d/empty-set storage comparator)))]
-    (->DurableORSet id kv-store store-config storage comparator tag-fn
-                    (atom (restore adds-branch))
-                    (atom (restore removals-branch))
-                    (atom false))))
+  [id & {:keys [store-config comparator tag-fn sync?]
+         :or {comparator compare tag-fn (fn [_] (random-uuid)) sync? true}}]
+  (let [opts {:sync? sync?}]
+    (async+sync sync?
+                (async
+                 (let [{:keys [kv-store storage]} (await (d/open store-config opts))
+                       roots (await (d/load-roots kv-store opts))
+                       restore (fn [branch] (if-let [root (get roots branch)]
+                                              (d/restore-set comparator root storage opts)
+                                              (d/empty-set storage comparator)))]
+                   (->DurableORSet id kv-store store-config storage comparator tag-fn
+                                   (atom (restore adds-branch))
+                                   (atom (restore removals-branch))
+                                   (atom false)))))))
