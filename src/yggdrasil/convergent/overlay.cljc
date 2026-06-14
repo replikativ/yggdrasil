@@ -26,11 +26,25 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
+(defn overlay?
+  "True if `x` is an Overlay (convergent `t/Overlay`, `DatahikeOverlay`, or
+   `GitOverlay`) rather than a plain system. All three overlay records carry
+   `:parent` + `:local-writes` + `:mode`; no system does — so this distinguishes a
+   forked overlay value from a root system value (the spindel ygg-signal deref
+   seam relies on it to unwrap)."
+  [x]
+  (and (record? x)
+       (contains? x :local-writes)
+       (contains? x :parent)
+       (contains? x :mode)))
+
 (defn overlay-system
   "The Overlay's isolated, WRITABLE system — mutate it with the parent's normal
    ops. For `:frozen` it's a clone (snapshot + own writes); for `:following` it's
    an empty DELTA holding only the overlay's own writes (read the effective value
-   with `overlay-value`, which joins it with the live parent)."
+   with `overlay-value`, which joins it with the live parent). Uniform across all
+   overlay kinds (convergent / datahike / git) — each holds its writable system in
+   the `:local-writes` atom."
   [overlay]
   @(:local-writes overlay))
 
