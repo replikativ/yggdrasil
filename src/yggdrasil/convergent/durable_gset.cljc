@@ -103,7 +103,7 @@
   (commit! [this _message _opts] (flush! this))
 
   c/PConvergent
-  (-join [_ other]
+  (-join [this other]
     (async+sync (:sync? opts)
                 (async
                  (let [branches (set (concat (keys @roots-atom) (keys @(:roots-atom other))))
@@ -115,8 +115,18 @@
                                           u     (if b-set (await (d/set-union a-set b-set comparator opts)) a-set)]
                                       (recur (next bs) (assoc acc b u)))
                                     acc))]
-                   (->DurableGSet id kv-store store-config storage comparator
-                                  (atom joined) current (atom (into #{} (keys @roots-atom))) opts)))))
+                   ;; IDEMPOTENCE: a join that adds nothing must be an OBSERVABLE
+                   ;; no-op — return the receiver UNCHANGED (identical). Otherwise a
+                   ;; signal holding this CRDT sees a new (≠) record on every join
+                   ;; and mutually-synced peers re-publish forever (runaway). Only
+                   ;; mark genuinely-changed branches dirty.
+                   (if (= joined @roots-atom)
+                     this
+                     (->DurableGSet id kv-store store-config storage comparator
+                                    (atom joined) current
+                                    (atom (into #{} (remove #(= (get joined %) (get @roots-atom %)))
+                                                (keys joined)))
+                                    opts))))))
   (-conflict-free? [_] true)
 
   p/GarbageCollectable
