@@ -3,14 +3,10 @@
    cross-store convergence, durability, and the idempotent content-tag variant
    (the registry shape)."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.core.async :refer [<!!]]
-            [konserve.core :as k]
-            [konserve.memory :refer [new-mem-store]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.durable-orset :as o]
-            [konserve-sync.walkers.crdt :as kcrdt])
+            [yggdrasil.convergent.durable-orset :as o])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -68,14 +64,11 @@
       (is (= 1 (count (filter (fn [[e _]] (= e :x)) (seq @(:adds-atom s)))))
           "idempotent add: a single content-tagged pair"))))
 
-(deftest orset-store-syncs-via-konserve-sync-walker
-  (testing "both halves live under :crdt/roots, so the crdt walker reaches all"
+(deftest orset-store-layout-is-crdt-walkable
+  (testing "both halves live under :crdt/roots — the shape konserve-sync's crdt
+            walker syncs (the walk itself is covered in konserve-sync)"
     (let [s (-> (o/durable-orset "reg" :store-config (mem))
                 (o/add :a) (o/add :b) (o/remove-elem :a) o/flush!)
-          kv (:kv-store s)
-          roots (d/load-roots kv)
-          walk-set (<!! (kcrdt/crdt-walk-fn kv {}))]
+          roots (d/load-roots (:kv-store s))]
       (is (contains? roots :adds))
-      (is (contains? roots :removals))
-      (is (contains? walk-set (:adds roots)) "adds root in ship-set")
-      (is (contains? walk-set (:removals roots)) "removals root in ship-set"))))
+      (is (contains? roots :removals)))))
