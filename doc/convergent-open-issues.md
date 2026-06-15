@@ -185,3 +185,21 @@ must land together.
 
 Phase 1 done. Phase 2 is the coupled durable+holders unit above — a focused effort, not
 piecemeal (an isolated orset attempt was reverted because the shared overlay breaks).
+
+### Phase 2 DONE (2026-06-15, ygg `9c53c3b`)
+Durable tier (gset/2pset/orset) value-semantic (atoms → plain fields; mutators/flush!/
+-join return new values). Holders became conns: overlay `overlay-swap!`, registry
+`tpset-atom` (external API unchanged → workspace/gc untouched), composite
+`update-subsystem`/`overlay-subsystem-swap!`. Tests threaded. Green: ygg JVM 77/295,
+ygg cljs shadow 7/20, **spindel 843/2863**.
+
+**New semantic (a deliberate casualty):** `:following` overlays no longer auto-track a
+still-evolving parent — the overlay captures the parent BY VALUE, so live-tracking is
+now the FRP **signal** layer's job (re-derive the overlay when the parent signal fires),
+not the overlay layer. `:following` = parent-at-fork joined with the overlay's own
+writes. (`:following` was deferred/thin/non-production, so this is acceptable; revisit
+if a true live-tracking overlay is needed — it'd take the parent's signal-ref.)
+
+**The catalog is now fully value-semantic.** Mutable state lives ONLY at the necessary
+boundaries: the spindel signal-atom (FRP), the konserve store + PSS freed-set (I/O), and
+the registry/overlay conn-atoms (service holders). The CRDT values carry none.
