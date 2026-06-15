@@ -13,8 +13,8 @@
   (testing "set-register / value"
     (let [l (-> (lwwr/lwwr "x") (lwwr/set-register :hello))]
       (is (= :hello (lwwr/value l)))
-      (lwwr/set-register l :world)
-      (is (= :world (lwwr/value l)))))) ; last write wins locally (shared store)
+      (let [l (lwwr/set-register l :world)]          ; value-semantic: rebind the new handle
+        (is (= :world (lwwr/value l)))))))            ; last write wins
 
 (deftest test-lwwr-join
   (testing "later timestamp wins; symmetric; idempotent"

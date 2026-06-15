@@ -10,12 +10,12 @@
     (let [m (-> (om/ormap "kb") (om/assoc-key :a 1) (om/assoc-key :b 2))]
       (is (= #{1} (om/lookup m :a)))
       (is (= #{:a :b} (om/ormap-keys m)))
-      (om/dissoc-key m :a)
-      (is (nil? (om/lookup m :a)))
-      (is (= #{:b} (om/ormap-keys m)))
-      (testing "re-assoc after remove brings the key back (fresh tag)"
-        (om/assoc-key m :a 9)
-        (is (= #{9} (om/lookup m :a)))))))
+      (let [m (om/dissoc-key m :a)]                  ; value-semantic: rebind
+        (is (nil? (om/lookup m :a)))
+        (is (= #{:b} (om/ormap-keys m)))
+        (testing "re-assoc after remove brings the key back (fresh tag)"
+          (let [m (om/assoc-key m :a 9)]
+            (is (= #{9} (om/lookup m :a)))))))))
 
 (deftest test-peer-join
   (testing "two peer replicas converge — keys union, symmetric"
@@ -34,7 +34,7 @@
   (testing "a concurrent add survives a remove that didn't observe it (add-wins)"
     (let [a (-> (om/ormap "kb") (om/assoc-key :k 1)) ; a: :k=1 (tag-a)
           b (-> (om/ormap "kb") (om/assoc-key :k 2)) ; b (separate replica): :k=2 (tag-b)
-          _ (om/dissoc-key a :k)]                    ; a removes ONLY its own tag-a
+          a (om/dissoc-key a :k)]                    ; a removes ONLY its own tag-a (rebind)
       (let [m (c/-join a b)]
         (is (= #{:k} (om/ormap-keys m)) "b's concurrent add keeps :k alive")
         (is (= #{2} (om/lookup m :k)) "only b's value survives; a's was tombstoned")))))

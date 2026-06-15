@@ -49,7 +49,7 @@
       (is (satisfies? p/Mergeable g))
       (is (= :gset (p/system-type g)))
       (is (= :main (p/current-branch g)))
-      (testing "branch! shares the backing store; fork writes are isolated"
+      (testing "branch! copies the branch value; fork writes are isolated (value-semantic)"
         (let [forked (-> g (p/branch! :fork) (p/checkout :fork) (gs/add :only-fork))]
           (is (= #{:seed :only-fork} (gs/elements forked)))
           ;; the original value on :main does NOT see the fork's write
