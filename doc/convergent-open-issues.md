@@ -46,12 +46,18 @@ build rc=0 (all changes + composite.cljc compile on cljs).
 
 ## Open decisions (semantic — need a human call)
 
-- **D1 — LWWR wall-clock → HLC.** Tie-break determinism is now fixed (F6), but LWWR
-  still stamps with `types/now-ms` (wall-clock, no node id) → a stale write wins under
-  clock skew, and same-ms concurrent writes resolve by value-hash not by a per-replica
-  id. The codebase HAS an HLC (`types/->HLC`, used by the registry). Recommend stamping
-  LWWR with an HLC `[physical logical node-id]` — but it changes register semantics, so
-  it's a deliberate choice. (Pass A + B.)
+- **D1 — LWWR wall-clock → HLC. DONE (2026-06-15, ygg `e3a576e`).** LWWR's
+  `:timestamp ms` → `:hlc [physical logical]` (a Hybrid Logical Clock as a plain
+  vector, ordered by `compare`). `set-register` ticks from the register's current hlc
+  → **monotonic** (no lost write on an NTP backward step, even single-writer) +
+  **causal** (a write that observed a peer wins under skew). Concurrent writes resolve
+  by wall-clock then hasch. **No node-id** (hash tiebreak suffices). Clock injectable
+  via `types/*now-fn*` (fixes O5 replay-determinism; backward-compatible nil default).
+  `physical` stays the wall-clock ms (`lwwr/timestamp`). Decision recorded with the
+  user: HLC over faithful-wall-clock because monotonicity helps our single-writer
+  reality; no node-id; injectable. Tests: monotonic-under-regression + causal-across-
+  peers. (The reference, replikativ.crdt.lwwr, is plain wall-clock + pr-str tiebreak;
+  we generalized it.)
 - **D2 — δ on a no-op `-join`.** The no-op branch returns `this` *with* its local δ
   while the changed branch returns a fresh δ-free handle (inconsistent post-condition).
   Verified **sound as used** (the signal layer clears δ at the export boundary, so a
