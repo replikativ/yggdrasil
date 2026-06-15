@@ -128,3 +128,48 @@ and is fine to keep as a plain value field (it's carried, not mutated). If threa
 proves noisy, the alternative is to drop it and always-flush (idempotent + content-
 addressed → a clean flush only rewrites the small roots cell). The atoms are NOT needed
 for performance (PSS nodes are immutable + shared), so removing them is pure cleanup.
+
+### Phase 1 DONE (2026-06-15, ygg `11f9844` / spindel `ee6639c`)
+In-mem tier value-semantic: `system.cljc`'s `store` atom → plain map; mutators return
+new systems; `-join` pure over the map. The in-mem catalog is test-only — call-site
+adoption was the conn-style "discard-return, re-read" pattern in gset/lwwr/ormap tests
++ spindel `composite_join_test` (now seeds via build-then-register). Full convergent
+suite 51/178 green.
+
+### Phase 2 REFINED SCOPE (the cascade — discovered while scoping)
+The original plan under-scoped this. The durable CRDTs **cannot be converted in
+isolation**: their *holders* are conn-style and discard the durable return values,
+relying on in-place atom mutation:
+- **registry** (`registry.cljc`) holds a `durable-2pset` in a plain field and does
+  `(d2p/add (:tpset r) e)` / `(d2p/flush! (:tpset r))` discarding returns (`:75/:87/:93`).
+- **composite** (`composite.cljc`) holds subs in a plain `{id→system}` map and mutates
+  them in place via their atoms (sub `commit!`/`add`); `composite_cljs_test` mutates a
+  `get-subsystem` handle in place.
+- **workspace/gc** call `(reg/flush! registry)` (5+ sites) discarding the return.
+- Many tests (durable_gset/2pset/orset, gc, roots, transactional, sync, the cljs ones,
+  spindel `ygg_signal_test`) use the in-place add/flush pattern.
+
+**Keystone model (the optimal resolution):** a CRDT is a pure immutable VALUE; its
+HOLDERS are conns with ONE atom each that `swap!` the value:
+- durable `gset`/`2pset`/`orset`: drop internal atoms → plain fields; mutators/`flush!`/
+  `-join`/`apply-delta`/`merge-peer!` return new values; overlay carries values.
+- **registry → a conn**: `[tpset-atom kv-store store-config]`; `register!`/`deregister!`/
+  `add-all` `swap!` the atom with the value-semantic `d2p` result; `flush!`/`gc!` persist
+  then swap. Its EXTERNAL API stays "mutate via the handle" → **workspace/gc callers
+  unchanged**. Net: 3 atoms-in-value → 1 atom-in-service (fewer atoms, value CRDT).
+- **composite → hold subs behind the same discipline** (sub mutations must be adopted
+  back into `systems`; either a systems-atom conn or get-subsystem returns + re-seats).
+- **spindel signal** already a conn (`ygg-swap!` adopts) — no change.
+
+**Sequence (each a verified, committed increment):**
+- 2a. `durable-orset` first — it's the MOST INDEPENDENT (only its own test uses it;
+  not the registry, not composite). Proves the durable value-semantic pattern end-to-end
+  on the safe CRDT.
+- 2b. `durable-2pset` + **registry-as-conn** together (coupled; registry depends on it)
+  + workspace/gc verify (callers unchanged) + registry tests.
+- 2c. `durable-gset` + **composite** sub-adoption + spindel `ygg_signal_test`.
+- 2d. overlay/`merge-down!` carries values (small).
+- 2e. full verify: ygg convergent+registry+workspace+composite suites + shadow cljs +
+  **spindel 843-test suite** (the FRP consumers).
+
+NOT yet started (Phase 1 done). 2a is the clean next increment.
