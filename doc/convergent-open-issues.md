@@ -159,17 +159,29 @@ HOLDERS are conns with ONE atom each that `swap!` the value:
   unchanged**. Net: 3 atoms-in-value → 1 atom-in-service (fewer atoms, value CRDT).
 - **composite → hold subs behind the same discipline** (sub mutations must be adopted
   back into `systems`; either a systems-atom conn or get-subsystem returns + re-seats).
+- **overlay** (`yggdrasil.convergent.overlay`, the SHARED `ovl/convergent-overlay`/
+  `overlay-system`/`merge-down!` machinery) is a FOURTH holder: it parks a system clone
+  in `local-writes` (an atom) and `overlay-system` hands it out for in-place mutation;
+  value-semantic CRDTs need `overlay-system` to return + re-seat, or an `overlay-swap!`.
 - **spindel signal** already a conn (`ygg-swap!` adopts) — no change.
 
-**Sequence (each a verified, committed increment):**
-- 2a. `durable-orset` first — it's the MOST INDEPENDENT (only its own test uses it;
-  not the registry, not composite). Proves the durable value-semantic pattern end-to-end
-  on the safe CRDT.
-- 2b. `durable-2pset` + **registry-as-conn** together (coupled; registry depends on it)
-  + workspace/gc verify (callers unchanged) + registry tests.
-- 2c. `durable-gset` + **composite** sub-adoption + spindel `ygg_signal_test`.
-- 2d. overlay/`merge-down!` carries values (small).
-- 2e. full verify: ygg convergent+registry+workspace+composite suites + shadow cljs +
+**No truly-independent per-CRDT increment exists** (an early hope): the durable CRDTs
+SHARE the overlay machinery, and converting one CRDT's value semantics breaks its
+overlay test (`orset-overlay-isolate-merge-down` mutates the clone in place) until the
+overlay holder adopts. So Phase 2 is a COUPLED UNIT — durable values + the four holders
+must land together.
+
+**Sequence (one coupled change, staged for review but landed/verified together):**
+- 2a. Convert the overlay holder (`overlay.cljc`) to adopt value-semantic clones
+  (`overlay-system` re-seats / `merge-down!` joins the adopted value).
+- 2b. Convert `durable-gset`/`durable-2pset`/`durable-orset` values (atoms → fields;
+  mutators/`flush!`/`-join`/`apply-delta`/`merge-peer!` return new values).
+- 2c. **registry → conn** (swaps the value-semantic `d2p`; external API stable →
+  workspace/gc unchanged) + **composite** sub-adoption.
+- 2d. Fix all in-place test call-sites (durable_gset/2pset/orset, gc, roots,
+  transactional, sync, cljs, spindel `ygg_signal_test`) to thread/adopt.
+- 2e. Full verify: ygg convergent+registry+workspace+composite + shadow cljs +
   **spindel 843-test suite** (the FRP consumers).
 
-NOT yet started (Phase 1 done). 2a is the clean next increment.
+Phase 1 done. Phase 2 is the coupled durable+holders unit above — a focused effort, not
+piecemeal (an isolated orset attempt was reverted because the shared overlay breaks).
