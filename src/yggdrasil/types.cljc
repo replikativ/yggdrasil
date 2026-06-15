@@ -54,6 +54,23 @@
   []
   (->HLC (now-ms) 0))
 
+(defn gc-cutoff
+  "Resolve a GC sweep cutoff (a Date) from `opts` — the ONE convention shared by
+   the whole GC machinery (protocol `gc-sweep!`, `durable/gc!`, composite, registry,
+   coordinator):
+     `:remove-before` (a Date)     ⇒ that exact cutoff (wins);
+     `:grace-period-ms` (a window) ⇒ now − ms;
+     neither                       ⇒ EPOCH ⇒ reclaim NOTHING.
+   The epoch default is SAFE: a GC with no window never sweeps a node an in-flight
+   lazy read might still hold. Pass a window in production (≥ your longest lazy-read
+   drain; ~60 s tight, hours/a day looser) — otherwise superseded trees accumulate
+   without bound."
+  [opts]
+  (or (:remove-before opts)
+      (when-let [g (:grace-period-ms opts)]
+        (#?(:clj java.util.Date. :cljs js/Date.) (- (now-ms) (long g))))
+      (#?(:clj java.util.Date. :cljs js/Date.) 0)))
+
 (defn hlc-tick
   "Advance HLC for local event."
   [hlc]

@@ -144,7 +144,7 @@
          (reg/flush! registry)
          ;; Reclaim superseded PSS B-tree nodes from the registry's own storage
          ;; (the registry is a durable 2P-Set — mark-and-sweep, datahike-style).
-         (let [freed-count (try (count (reg/gc! registry))
+         (let [freed-count (try (count (reg/gc! registry opts))
                                 (catch Exception _ 0))]
            {:swept @swept
             :errors @errors

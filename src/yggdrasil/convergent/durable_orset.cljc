@@ -133,13 +133,14 @@
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids before]
+  (gc-sweep! [this snapshot-ids gc-opts]
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
                  ;; retain held snapshots: an OR-Set snapshot-id is a COMMIT addr
                  ;; ({:adds r :removals r}); keep the commit object + both halves'
-                 ;; nodes so as-of/frozen on that id survives GC.
+                 ;; nodes so as-of/frozen on that id survives GC. The cutoff
+                 ;; (`:remove-before`/`:grace-period-ms`) rides in `gc-opts`.
                  (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
                        retain-roots (loop [cs (seq commit-addrs) acc []]
                                       (if cs
@@ -147,9 +148,8 @@
                                           (recur (next cs) (conj acc (:adds c) (:removals c))))
                                         acc))]
                    (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                                 (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
-                                 (assoc opts :retain-roots retain-roots
-                                        :retain-keys commit-addrs)))))))
+                                 (merge gc-opts opts {:retain-roots retain-roots
+                                                      :retain-keys commit-addrs})))))))
 
   p/Overlayable
   ;; :frozen → carry BOTH halves (immutable PSS values; isolated by value).
@@ -271,7 +271,7 @@
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
    set of deleted node keys."
   ([o] (p/gc-sweep! o nil nil))
-  ([o before] (p/gc-sweep! o nil before)))
+  ([o opts] (p/gc-sweep! o nil opts)))
 
 ;; ============================================================
 ;; Factory

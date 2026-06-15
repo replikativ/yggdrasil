@@ -93,7 +93,10 @@
           comp   (cmp/update-subsystem comp "a" #(g/add % :z))]
       (let [comp   (p/commit! comp "c2")          ; supersedes c1's index + sub trees
             before (count (k/keys (:kv-store comp) {:sync? true}))
-            report (p/gc-sweep! comp nil)
+            ;; cutoff 1s ahead = "reclaim every orphan up to now" (reachable nodes
+            ;; are spared by the whitelist, not the timestamp); a bare `now` can
+            ;; collide with the just-written orphans' millisecond and spare them.
+            report (p/gc-sweep! comp nil {:remove-before (java.util.Date. (+ (System/currentTimeMillis) 1000))})
             after  (count (k/keys (:kv-store comp) {:sync? true}))]
         (is (seq (:deleted report)) "reclaimed nodes from the superseded trees")
         (is (< after before) "the shared store shrank")

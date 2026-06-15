@@ -135,15 +135,16 @@
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids before]
+  (gc-sweep! [this snapshot-ids gc-opts]
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
                  ;; retain held snapshots: a G-Set snapshot-id IS a PSS root address,
                  ;; so keep its reachable nodes (else as-of/frozen on it breaks post-GC).
+                 ;; The cutoff (`:remove-before`/`:grace-period-ms`) rides in `gc-opts`
+                 ;; → d/gc!'s `t/gc-cutoff` (default epoch ⇒ reclaim nothing).
                  (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
-                               (assoc opts :retain-roots (seq snapshot-ids)))))))
+                               (merge gc-opts opts {:retain-roots (seq snapshot-ids)}))))))
 
   p/Overlayable
   ;; :frozen → carry the current roots (immutable PSS values; isolated by value).
@@ -262,9 +263,11 @@
                      (assoc g :roots roots :dirty dirty)))))))
 
 (defn gc!
-  "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). (async+sync)"
+  "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). SAFE BY DEFAULT
+   (reclaims nothing); pass a window in `opts` (`:remove-before`/`:grace-period-ms`).
+   (async+sync)"
   ([g] (p/gc-sweep! g nil nil))
-  ([g before] (p/gc-sweep! g nil before)))
+  ([g opts] (p/gc-sweep! g nil opts)))
 
 ;; ============================================================
 ;; Factory — cross-platform

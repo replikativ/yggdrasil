@@ -26,6 +26,7 @@
    copies only the nodes the destination is missing (incremental)."
   (:require [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
+            [yggdrasil.types :as t]
             [konserve.gc :as kgc]
             [hasch.core :as hasch]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
@@ -269,6 +270,20 @@
 ;; ============================================================
 ;; Mark-and-sweep GC (datahike-style: whitelist reachable, sweep the rest)
 ;; ============================================================
+;; CONCURRENCY MODEL (the lazy-read-vs-GC question). A durable CRDT is a VALUE
+;; held in ONE mutable cell — a spindel signal-atom or an overlay's `:local-writes`
+;; — so:
+;;   - single-writer-per-cell is STRUCTURAL: mutations go through that cell's
+;;     atomic `swap!`, so there is no mutation/mutation or mutation/flush race
+;;     (co-located sub-stores are safe too: the roots cell is updated atomically
+;;     via `save-roots!`, and nodes are content-addressed → idempotent + shared);
+;;   - readers read the CURRENT value (FRP re-derivation) — a deref'd value is an
+;;     immutable snapshot at a LIVE root, which `gc!` never reclaims.
+;; The only residual hazard is a reader RETAINING a now-superseded value and
+;; lazily draining it (each node = a `k-get`) WHILE a concurrent `gc!` sweeps the
+;; orphaned nodes. The GC cutoff (`t/gc-cutoff` — `:remove-before`/`:grace-period-ms`)
+;; below bounds that: a node written after the cutoff is kept, so a deref'd value
+;; is drainable for ≥ the window (epoch default ⇒ keep everything ⇒ safe).
 
 (defn gc!
   "Reclaim unreferenced PSS nodes by mark-and-sweep, mirroring datahike's
@@ -278,21 +293,23 @@
             `as-of`/frozen-overlay snapshots, so GC never reclaims a held
             snapshot's nodes) ∪ the mutable pointer keys (:crdt/roots,
             :crdt/freed) ∪ `(:spare-keys opts)` ∪ `(:retain-keys opts)` (bare
-            addresses to spare, e.g. retained commit objects). `reachable-
-            addresses` is the PSS tree walk (datahike's `-mark`).
+            addresses to spare, e.g. retained commit objects).
      SWEEP  `konserve.gc/sweep!` deletes every store key NOT in the reachable set
-            whose last-write is before `before` (so keys written during the GC,
-            and all reachable nodes, are spared).
+            whose last-write is before the cutoff (reachable nodes + anything
+            written after the cutoff are spared).
 
-   After `-join`/union, the superseded (content-addressed) root trees become
-   unreferenced and accumulate forever without this. `before` defaults to now.
-   Returns the set of deleted keys. (async+sync)"
-  ([kv-store roots] (gc! kv-store roots nil {:sync? true}))
-  ([kv-store roots before] (gc! kv-store roots before {:sync? true}))
-  ([kv-store roots before opts]
+   SAFE BY DEFAULT — the sweep cutoff is `(t/gc-cutoff opts)`, the ONE shared GC
+   convention: `:remove-before` (a Date) ∨ `:grace-period-ms` (a window ⇒ now − ms)
+   ∨ EPOCH ⇒ reclaim NOTHING. With no window, `gc!` never sweeps a node an in-flight
+   lazy read might hold — but superseded trees then accumulate without bound
+   (`-join`/flush orphan the old root each time), so pass a window in production
+   (≥ your longest lazy-read drain; ~60 s tight, hours/a day looser). Returns the
+   set of deleted keys. (async+sync)"
+  ([kv-store roots] (gc! kv-store roots {:sync? true}))
+  ([kv-store roots opts]
    (async+sync (:sync? opts)
                (async
-                (let [before (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
+                (let [before (t/gc-cutoff opts)
                       ;; A SHARED-store composite sweeps ONCE over the UNION of every
                       ;; sub's roots (a per-sub gc! would delete siblings, unreachable
                       ;; from one sub's roots) and passes `:spare-keys` = all the extra

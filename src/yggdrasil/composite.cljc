@@ -210,7 +210,7 @@
    manifest). A per-sub gc! would delete siblings (unreachable from one sub's
    roots), so the composite must sweep as a whole. (async+sync) Returns the
    reclamation report {:deleted <set-of-keys>}."
-  [kv-store storage index-atom systems opts before]
+  [kv-store storage index-atom systems opts gc-opts]
   (async+sync (:sync? opts)
               (async
                ;; persist the latest state we mean to keep
@@ -232,10 +232,12 @@
                      spare (into #{composite-subs-key}
                                  (mapcat (fn [m] [(:roots-key m) (:freed-key m)]))
                                  manifest)
-                     deleted (await (d/gc! kv-store roots before
-                                           (assoc opts :roots-key composite-root-key
-                                                  :freed-key composite-freed-key
-                                                  :spare-keys spare)))]
+                     deleted (await (d/gc! kv-store roots
+                                           (-> opts
+                                               (merge (select-keys gc-opts [:remove-before :grace-period-ms]))
+                                               (assoc :roots-key composite-root-key
+                                                      :freed-key composite-freed-key
+                                                      :spare-keys spare))))]
                  {:deleted deleted}))))
 
 ;; ============================================================
@@ -541,8 +543,7 @@
                           (every? (fn [[_ sys]] (colocated? kv-store sys)) systems))
                    ;; SHARED store → ONE unified mark-and-sweep over the union of roots
                    ;; (a per-sub sweep would delete siblings/index nodes).
-                   (await (unified-gc! kv-store storage index-atom systems opts
-                                       (:remove-before gopts)))
+                   (await (unified-gc! kv-store storage index-atom systems opts gopts))
                    ;; SEPARATE stores → each sub owns its store, safe to fan out.
                    (loop [ss (seq systems) acc {}]
                      (if ss

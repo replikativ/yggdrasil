@@ -210,7 +210,7 @@
    2P-Set members; this reclaims the old index-tree versions. Returns the set of
    deleted node keys."
   ([^Registry registry] (d2p/gc! @(:tpset-atom registry)))
-  ([^Registry registry before] (d2p/gc! @(:tpset-atom registry) before)))
+  ([^Registry registry opts] (d2p/gc! @(:tpset-atom registry) opts)))
 
 (defn close!
   "Flush and close the registry."

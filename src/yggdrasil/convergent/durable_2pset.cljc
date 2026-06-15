@@ -128,13 +128,14 @@
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
   ;; node reclamation: flush, then mark-and-sweep nodes unreachable from the
   ;; live adds/removals roots. (async+sync)
-  (gc-sweep! [this snapshot-ids before]
+  (gc-sweep! [this snapshot-ids gc-opts]
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
                  ;; retain held snapshots: a 2P-Set snapshot-id is a COMMIT addr
                  ;; ({:adds r :removals r}); keep the commit object + both halves'
-                 ;; nodes so as-of/frozen on that id survives GC.
+                 ;; nodes so as-of/frozen on that id survives GC. The cutoff
+                 ;; (`:remove-before`/`:grace-period-ms`) rides in `gc-opts`.
                  (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
                        retain-roots (loop [cs (seq commit-addrs) acc []]
                                       (if cs
@@ -142,9 +143,8 @@
                                           (recur (next cs) (conj acc (:adds c) (:removals c))))
                                         acc))]
                    (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                                 (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
-                                 (assoc opts :retain-roots retain-roots
-                                        :retain-keys commit-addrs)))))))
+                                 (merge gc-opts opts {:retain-roots retain-roots
+                                                      :retain-keys commit-addrs})))))))
 
   p/Overlayable
   ;; :frozen → carry BOTH halves (immutable PSS values; isolated by value).
@@ -265,7 +265,7 @@
   "Reclaim PSS nodes unreachable from the live adds/removals roots (mark-and-sweep).
    Returns the set of deleted node keys."
   ([s] (p/gc-sweep! s nil nil))
-  ([s before] (p/gc-sweep! s nil before)))
+  ([s opts] (p/gc-sweep! s nil opts)))
 
 ;; ============================================================
 ;; Factory

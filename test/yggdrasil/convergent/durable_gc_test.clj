@@ -15,6 +15,24 @@
 (defn- mem [] {:backend :memory :id (random-uuid)})
 (defn- raw-keys [kv] (map #(if (map? %) (:key %) %) (k/keys kv {:sync? true})))
 (defn- node-key-count [kv] (count (remove keyword? (raw-keys kv))))
+;; gc! is SAFE BY DEFAULT (reclaims nothing); pass a cutoff of `now` to reclaim
+;; every superseded node up to this instant (the explicit "reclaim now" window).
+;; Offset 1s ahead so a fast test's just-written orphans (same-millisecond
+;; last-write) fall strictly before the cutoff; reachable nodes are spared by the
+;; whitelist regardless of timestamp.
+(defn- now [] (java.util.Date. (+ (System/currentTimeMillis) 1000)))
+
+(deftest gc-safe-default-reclaims-nothing
+  (testing "gc! with NO window reclaims NOTHING (never sweeps a node an in-flight
+            lazy read might hold); a `:grace-period-ms 0` / `now` cutoff reclaims orphans"
+    (let [gs (-> (g/durable-gset "t" :store-config (mem)) (g/add :a) g/flush! (g/add :b) g/flush!)
+          kv (:kv-store gs)
+          roots (vals (d/load-roots kv))]
+      (is (empty? (d/gc! kv roots)) "default (epoch cutoff) ⇒ reclaim nothing")
+      (is (empty? (d/gc! kv roots {:sync? true :grace-period-ms 600000}))
+          "a 10-min grace still spares the just-written orphans")
+      (is (pos? (count (d/gc! kv roots {:sync? true :grace-period-ms 0})))
+          ":grace-period-ms 0 reclaims orphans older than now"))))
 
 (deftest gset-gc-reclaims-superseded-nodes
   (testing "many flushes accumulate superseded trees; gc! reclaims them"
@@ -26,14 +44,14 @@
       (let [kv (:kv-store gs)
             before (node-key-count kv)
             live-before (g/elements gs)
-            deleted (g/gc! gs)
+            deleted (g/gc! gs {:remove-before (now)})
             after (node-key-count kv)]
         (is (pos? (count deleted)) "GC deleted superseded nodes")
         (is (< after before) "node count dropped")
         (is (= live-before (g/elements gs)) "live set unchanged after GC")
         (is (= (set (range 300)) (g/elements gs)))
         (testing "GC is idempotent — a second sweep on the quiescent store deletes nothing"
-          (is (empty? (g/gc! gs))))
+          (is (empty? (g/gc! gs {:remove-before (now)}))))
         (testing "every node reachable from the current root survived"
           (let [root (get (d/load-roots kv) :main)]
             (is (every? #(some? (k/get kv % {:sync? true}))
@@ -47,7 +65,7 @@
           gs   (-> gs0 (g/add :c) g/flush! (g/add :d) g/flush!)]
       ;; GC pinning S0: its now-unreferenced nodes must be RETAINED (else as-of
       ;; below would read a swept node). Guards the gc-sweep! :retain-roots wiring.
-      (p/gc-sweep! gs #{snap} nil)
+      (p/gc-sweep! gs #{snap} {:remove-before (now)})
       (is (= #{:a :b} (p/as-of gs snap)) "held snapshot survived GC (retention works)")
       (is (= #{:a :b :c :d} (g/elements gs)) "live set intact after GC"))))
 
@@ -58,7 +76,7 @@
                      (partition-all 30 (range 150)))
           s  (d2p/flush! (-> s0 (d2p/remove-elem 7) (d2p/remove-elem 42)))]
       (let [live-before (d2p/elements s)
-            deleted (d2p/gc! s)]
+            deleted (d2p/gc! s {:remove-before (now)})]
         (is (pos? (count deleted)))
         (is (= live-before (d2p/elements s)) "live (adds − removals) unchanged")
         (is (not (contains? (d2p/elements s) 7)) "tombstoned element stays removed")))))
@@ -74,7 +92,7 @@
       (let [kv (:kv-store r)
             before (node-key-count kv)
             n-before (reg/entry-count r)
-            deleted (reg/gc! r)
+            deleted (reg/gc! r {:remove-before (now)})
             after (node-key-count kv)]
         (is (pos? (count deleted)))
         (is (<= after before))
