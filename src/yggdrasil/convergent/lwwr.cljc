@@ -1,28 +1,53 @@
 (ns yggdrasil.convergent.lwwr
   "Last-Writer-Wins Register — a conflict-free yggdrasil system. value =
-   `{:register v :timestamp ms}`; join = keep the greater timestamp, breaking
-   ties deterministically (so all replicas converge on the same winner).
+   `{:register v :hlc [physical logical]}`; join = keep the greater HLC, breaking
+   exactly-equal HLCs deterministically (so all replicas converge on the same
+   winner).
 
-   This is the honest convergent form of a server-authoritative signal (the
-   checkout descriptor) AND the building block for presence: stamp every write
-   with a clock, last-writer-wins. Ported from replikativ.crdt.lwwr."
+   The clock is a HYBRID LOGICAL CLOCK stored as a plain `[physical logical]`
+   vector (trivially serializable; ordered by `compare`). `physical` is the
+   wall-clock ms (read it for 'when this was written'); `logical` is a tie counter
+   that ticks when the wall-clock can't advance. Two properties wall-clock-only LWW
+   lacks:
+   - **monotonic**: each write's HLC is strictly greater than the previous, even if
+     the wall-clock steps BACKWARD (NTP) — so a single writer's register never
+     silently loses a write to clock regression;
+   - **causal**: `set-register` ticks from the register's CURRENT HLC (which, after
+     a join, is the winner's), so a write that OBSERVED a peer ticks past it and
+     wins even under clock skew. Genuinely-concurrent writes (equal/incomparable
+     HLCs) still resolve by wall-clock then hash — the honest LWW behaviour.
+
+   This is the convergent form of a server-authoritative signal (the checkout
+   descriptor) AND the building block for presence. Generalizes
+   replikativ.crdt.lwwr (plain wall-clock + pr-str tiebreak) to an HLC + a
+   cross-platform hash tiebreak."
   (:require [yggdrasil.convergent.system :as sys]
             [yggdrasil.types :as t]
             [hasch.core :as hasch]))
 
+(defn bump-hlc
+  "Monotonic HLC tick from `[physical logical]` (or nil → epoch): advance physical
+   to the wall-clock if it moved forward, else bump the logical counter — so the
+   result is ALWAYS strictly greater than the input, even if the wall-clock stepped
+   back. Reads the clock via `yggdrasil.types/now-ms` (injectable for replay)."
+  [hlc]
+  (let [[physical logical] (or hlc [0 0])
+        now (t/now-ms)]
+    (if (> now physical) [now 0] [physical (inc logical)])))
+
 (defn lwwr-join
-  "Least-upper-bound of two LWW registers: greater timestamp wins; on a tie, a
-   deterministic, CROSS-PLATFORM-stable comparison picks the same winner on every
-   replica. The tiebreak hashes via `hasch` (order-canonical) rather than `pr-str`,
-   whose map/set iteration order can differ JVM↔cljs and make two replicas pick
-   DIFFERENT winners for the same pair (a convergence break)."
+  "Least-upper-bound of two LWW registers: greater HLC wins (`compare` is
+   lexicographic on `[physical logical]`); on an EXACTLY-equal HLC (genuinely
+   concurrent), a deterministic, CROSS-PLATFORM-stable `hasch` tiebreak picks the
+   same winner on every replica (NOT `pr-str`, whose map/set iteration order can
+   differ JVM↔cljs and break convergence)."
   [a b]
   (cond
     (nil? a) b
     (nil? b) a
-    :else (let [ta (:timestamp a 0) tb (:timestamp b 0)]
-            (cond (> tb ta) b
-                  (< tb ta) a
+    :else (let [c (compare (:hlc a) (:hlc b))]
+            (cond (pos? c) a
+                  (neg? c) b
                   :else (if (pos? (compare (str (hasch/uuid b)) (str (hasch/uuid a)))) b a)))))
 
 (defn lwwr
@@ -31,16 +56,24 @@
   [id & {:keys [branch init] :or {branch :main}}]
   (sys/conflict-free-system id :lwwr
                             :branch branch
-                            :init (when (some? init) {:register init :timestamp (t/now-ms)})
+                            :init (when (some? init) {:register init :hlc [(t/now-ms) 0]})
                             :vjoin lwwr-join :bottom nil))
 
 (defn set-register
-  "Write `v` (stamped now) — the local op."
+  "Write `v`, stamped with a monotonic HLC ticked from the register's CURRENT hlc
+   (so observed/causally-later writes win, and a single writer never regresses).
+   The local op."
   [l v]
-  (let [reg {:register v :timestamp (t/now-ms)}]
+  (let [reg {:register v :hlc (bump-hlc (:hlc (sys/cur l)))}]
     (sys/record-delta (sys/put! l reg) reg)))
 
 (defn value
   "Read the current register value (nil if unset)."
   [l]
   (:register (sys/cur l)))
+
+(defn timestamp
+  "The wall-clock millis of the current register's write (the HLC's physical part),
+   or nil if unset."
+  [l]
+  (first (:hlc (sys/cur l))))

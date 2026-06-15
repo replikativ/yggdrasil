@@ -28,13 +28,20 @@
       (compare (:logical a) (:logical b))
       pc)))
 
+(def ^:dynamic *now-fn*
+  "Optional clock override — a 0-arg fn returning millis. `nil` ⇒ the real
+   wall-clock. Bind it for deterministic spindel replay / tests (O5): a replay
+   context fixes physical time rather than reading the host clock. HLC's logical
+   counter still ticks under a fixed clock, so order stays monotonic."
+  nil)
+
 (defn now-ms
-  "Portable wall-clock millis since epoch (JVM + cljs).
-   NOTE (O5): for deterministic spindel replay the clock should be injectable;
-   a replay context must pass a fixed physical time rather than rely on this."
+  "Portable wall-clock millis since epoch (JVM + cljs), via `*now-fn*` when bound."
   []
-  #?(:clj (System/currentTimeMillis)
-     :cljs (.getTime (js/Date.))))
+  (if *now-fn*
+    (*now-fn*)
+    #?(:clj (System/currentTimeMillis)
+       :cljs (.getTime (js/Date.)))))
 
 ;; A single shared literal (NOT Integer/MAX_VALUE on JVM vs MAX_SAFE_INTEGER on
 ;; cljs): the `as-of` ceiling HLC must be byte-identical across platforms so an
