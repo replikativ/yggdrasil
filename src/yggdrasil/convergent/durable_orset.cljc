@@ -213,7 +213,8 @@
                               (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
                        rems (loop [r (:removals o) ps (seq (:removals delta))]
                               (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
-                   (assoc o :adds adds :removals rems :dirty true))))))
+                   ;; clear δ: a remote-integrated value re-propagates nothing.
+                   (c/clear-delta (assoc o :adds adds :removals rems :dirty true)))))))
 
 (defn elements
   "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"

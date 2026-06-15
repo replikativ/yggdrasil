@@ -52,9 +52,13 @@
 ;; The δ rides in record METADATA, so it never affects value equality (two
 ;; replicas with equal content but different in-flight δ are `=`), needs no
 ;; defrecord field, and is uniform across the whole catalog. Mutators ACCRUE
-;; their op (`with-delta`); the consumer (signal layer) CLEARS it at the
-;; propagation boundary (`clear-delta`); `-join` returns fresh records that carry
-;; no δ, so remote-integrated changes never re-propagate.
+;; their op (`with-delta`). INTEGRATING A PEER yields a δ-FREE value: both
+;; `-apply-delta` (op-path) and `-join`'s *changed* branch `clear-delta`, so the
+;; signal layer's export-on-change watch ships NOTHING after an integration — the
+;; receiver's own ops were already shipped at their mutation, and the peer's ops
+;; must not echo. A *no-op* `-join` returns the receiver IDENTICAL (the signal
+;; layer's `identical?`-skip suppresses its watch, so its residual δ is never
+;; acted on — harmless). So the δ is only ever "this turn's local op, in flight".
 
 (def ^:const delta-key
   "Metadata key under which a replica carries its local, not-yet-propagated δ."

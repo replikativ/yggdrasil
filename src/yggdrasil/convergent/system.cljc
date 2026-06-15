@@ -97,6 +97,9 @@
 
 (defn apply-delta
   "Consume a peer's δ — `vjoin` it into the current value (the OP-path; cf. -join
-   the STATE-path). Returns a NEW system."
+   the STATE-path). Returns a NEW system WITHOUT a local δ: integrating a peer
+   re-propagates nothing (no echo), and the receiver's own ops were already
+   shipped at their mutation by the export-on-change watch — so the residual δ is
+   safe to drop, which keeps the post-integration watch from re-shipping it."
   [s d]
-  (upd! s (:vjoin s) d))
+  (c/clear-delta (upd! s (:vjoin s) d)))

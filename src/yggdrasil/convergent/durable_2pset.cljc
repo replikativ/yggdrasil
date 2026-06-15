@@ -206,7 +206,8 @@
                               (if es (recur (await (d/set-conj a (first es) (:comparator s) opts)) (next es)) a))
                        rems (loop [r (:removals s) es (seq (:removals delta))]
                               (if es (recur (await (d/set-conj r (first es) (:comparator s) opts)) (next es)) r))]
-                   (assoc s :adds adds :removals rems :dirty true))))))
+                   ;; clear δ: a remote-integrated value re-propagates nothing.
+                   (c/clear-delta (assoc s :adds adds :removals rems :dirty true)))))))
 
 (defn elements
   "Live elements: adds − removals. (async+sync)"

@@ -191,8 +191,10 @@
                               (if es
                                 (recur (await (d/set-conj s (first es) (:comparator g) opts)) (next es))
                                 s))]
-                   (assoc g :roots (assoc (:roots g) cur s')
-                          :dirty (conj (:dirty g) cur)))))))
+                   ;; clear δ: a remote-integrated value re-propagates nothing
+                   ;; (the receiver's own ops shipped at their mutation).
+                   (c/clear-delta (assoc g :roots (assoc (:roots g) cur s')
+                                         :dirty (conj (:dirty g) cur))))))))
 
 (defn elements
   "Read the current branch's set as a plain Clojure set. (async+sync)"

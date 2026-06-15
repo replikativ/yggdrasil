@@ -196,9 +196,10 @@
       (let [peer   (-> (g/durable-gset "b" :store-config {:backend :memory :id (random-uuid)}) (g/add :z))
             via-op (g/apply-delta peer (c/delta-of g))]
         (is (= #{:x :y :z} (g/elements via-op)) "apply-delta unions the peer's ops in")
-        (is (= #{:z} (c/delta-of via-op))
-            "remote-integrated ops are NOT added to the local δ — only the peer's own
-             un-propagated :z remains, so remote ops never echo back to the sender"))
+        (is (nil? (c/delta-of via-op))
+            "integrating a peer's δ yields a δ-FREE value — the peer's ops don't echo
+             back, and the post-integration export-on-change watch re-ships nothing
+             (the receiver's own ops shipped at their own mutation)"))
       ;; op-path ≡ state-path: same converged value as a full -join
       (let [peer2 (-> (g/durable-gset "c" :store-config {:backend :memory :id (random-uuid)}) (g/add :z))]
         (is (= (g/elements (g/apply-delta peer2 (c/delta-of g)))
