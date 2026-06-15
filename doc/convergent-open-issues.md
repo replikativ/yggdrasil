@@ -79,10 +79,15 @@ build rc=0 (all changes + composite.cljc compile on cljs).
   content-defined-chunking structural-merge** follow-up — see
   `persistent-sorted-set/doc/prolly-tree-requirements.md`. Not fixable in yggdrasil
   alone. (Pass A.)
-- **Df2 — lazy-read vs concurrent GC.** A lazy PSS traversal can hit a GC'd node if
-  reads and GC aren't serialized; mitigated by single-writer-per-store but **not
-  enforced in-process**. Fold into the single-writer-enforcement work (the same
-  invariant D2/the durable mutators assume). (Pass C.)
+- **Df2 — lazy-read vs concurrent GC. RESOLVED (safe-by-default cutoff).** GC now
+  reclaims NOTHING unless the caller opts into a window: the GC machinery is unified
+  on `types/gc-cutoff` (`:remove-before` ∨ `:grace-period-ms` ∨ EPOCH ⇒ keep all),
+  so a node written after the cutoff is always spared — a deref'd value stays
+  drainable for ≥ the window. With the epoch default, no in-flight lazy read can hit
+  a swept node; production passes a window ≥ its longest drain (~60 s tight, hours/a
+  day looser; documented in the `gc-cutoff`/`durable/gc!` docstrings). The residual
+  in-process single-writer enforcement folds into the same work as D2's durable
+  mutators. Commit `123c398`. (Pass C.)
 
 ## Test-coverage gaps (not bugs)
 
