@@ -58,12 +58,19 @@ build rc=0 (all changes + composite.cljc compile on cljs).
   reality; no node-id; injectable. Tests: monotonic-under-regression + causal-across-
   peers. (The reference, replikativ.crdt.lwwr, is plain wall-clock + pr-str tiebreak;
   we generalized it.)
-- **D2 — δ on a no-op `-join`.** The no-op branch returns `this` *with* its local δ
-  while the changed branch returns a fresh δ-free handle (inconsistent post-condition).
-  Verified **sound as used** (the signal layer clears δ at the export boundary, so a
-  retained δ never double-propagates), so left as-is — but if op-streaming ever runs
-  `-join` while a local δ is un-exported, decide whether the result should preserve the
-  receiver's own δ or drop it. Pin the intended contract with a test. (Pass A.)
+- **D2 — δ on integration. DONE (2026-06-15, ygg `9fd4e92`).** Re-diagnosed against
+  the real signal-sync model: export is ON-CHANGE (the watch ships a local op's δ at
+  mutation, doesn't clear), so a value's δ is "this turn's op, already shipped" residue
+  — and any committed value carrying a δ gets RE-SHIPPED by the post-commit watch (a
+  spurious echo). `-join` was already correct (changed → fresh δ-free; no-op → returns
+  the receiver identical → `identical?`-skip suppresses the watch). The real gap was
+  **`-apply-delta`**, which preserved the receiver's residue δ (assoc keeps meta)
+  against its own docstring → fix: wrap every `apply-delta` result in `clear-delta`
+  (in-mem `system` + durable `gset`/`2pset`/`orset`). Contract tightened in
+  `convergent.cljc`; op-perspective test now asserts `delta-of = nil` after integration
+  (primary guarantee — no echo, no re-ship — holds). Decision recorded: clear-on-
+  integration (not the rejected preserve-δ or clear-on-export, which re-triggers the
+  watch). Green: ygg JVM 47/161, cljs 7/20, spindel 843/2866.
 
 ## Deferred (tied to other work)
 
