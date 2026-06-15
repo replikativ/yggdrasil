@@ -36,9 +36,11 @@
   #?(:clj (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
 
-(def ^:private logical-max
-  #?(:clj Integer/MAX_VALUE
-     :cljs (.-MAX_SAFE_INTEGER js/Number)))
+;; A single shared literal (NOT Integer/MAX_VALUE on JVM vs MAX_SAFE_INTEGER on
+;; cljs): the `as-of` ceiling HLC must be byte-identical across platforms so an
+;; HLC compare against a JVM-written vs cljs-written ceiling agrees, and a
+;; cljs-minted `:logical` never exceeds JVM int range when serialized.
+(def ^:private logical-max 2147483647)
 
 (defn hlc-now
   "Create HLC from current time."

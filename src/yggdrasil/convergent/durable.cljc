@@ -173,21 +173,30 @@
    doesn't (e.g. ones a synced peer added to the store). For a shared branch the
    incoming root wins; that's safe because mutually-merged peers compute the SAME
    content-addressed root per branch, so the cell converges rather than losing a
-   branch under blind LWW. (async+sync)"
+   branch under blind LWW.
+
+   The merge is done ATOMICALLY (konserve `update`, go-locked per key) — NOT
+   get-then-assoc — so two concurrent flushes, or a synced peer adding a branch
+   between the read and the write, cannot lose an interleaved branch (TOCTOU).
+   (async+sync)"
   ([kv-store roots] (save-roots! kv-store roots {:sync? true}))
   ([kv-store roots opts]
    (async+sync (:sync? opts)
                (async
-                (let [rkey (rk opts)
-                      existing (or (await (kb/k-get kv-store rkey opts)) {})]
-                  (await (kb/k-assoc kv-store rkey (merge existing roots) opts)))))))
+                (await (kb/k-update kv-store (rk opts)
+                                    (fn [existing] (merge (or existing {}) roots))
+                                    opts))))))
 
 (defn save-freed!
-  "Persist a KonserveStorage's freed-set under the CRDT freed cell (async+sync)."
+  "Persist a KonserveStorage's freed-set under the CRDT freed cell, MERGED
+   ATOMICALLY (konserve `update`) so a concurrent writer's freed entries are not
+   lost to a blind overwrite. (async+sync)"
   ([kv-store storage] (save-freed! kv-store storage {:sync? true}))
   ([kv-store storage opts]
    (async+sync (:sync? opts)
-               (async (await (kb/k-assoc kv-store (fk opts) @(:freed-atom storage) opts))))))
+               (async (await (kb/k-update kv-store (fk opts)
+                                          (fn [existing] (merge (or existing {}) @(:freed-atom storage)))
+                                          opts))))))
 
 ;; ============================================================
 ;; Commit objects — addressable snapshots of a MULTI-root CRDT
@@ -264,9 +273,13 @@
 (defn gc!
   "Reclaim unreferenced PSS nodes by mark-and-sweep, mirroring datahike's
    `gc-storage!`:
-     MARK   reachable = every node reachable from each root in `roots` ∪ the
-            mutable pointer keys (:crdt/roots, :crdt/freed) — `reachable-addresses`
-            is the PSS tree walk (datahike's `-mark`).
+     MARK   reachable = every node reachable from each root in `roots` ∪
+            `(:retain-roots opts)` (extra PSS roots to KEEP — e.g. outstanding
+            `as-of`/frozen-overlay snapshots, so GC never reclaims a held
+            snapshot's nodes) ∪ the mutable pointer keys (:crdt/roots,
+            :crdt/freed) ∪ `(:spare-keys opts)` ∪ `(:retain-keys opts)` (bare
+            addresses to spare, e.g. retained commit objects). `reachable-
+            addresses` is the PSS tree walk (datahike's `-mark`).
      SWEEP  `konserve.gc/sweep!` deletes every store key NOT in the reachable set
             whose last-write is before `before` (so keys written during the GC,
             and all reachable nodes, are spared).
@@ -285,7 +298,9 @@
                       ;; from one sub's roots) and passes `:spare-keys` = all the extra
                       ;; pointer cells to keep (each sub's [:crdt/roots id]/[:crdt/freed
                       ;; id] + the composite manifest). Standalone CRDTs leave it nil.
-                      reachable (loop [rs (seq roots) acc (into #{(rk opts) (fk opts)} (:spare-keys opts))]
+                      reachable (loop [rs (seq (concat roots (:retain-roots opts)))
+                                       acc (into #{(rk opts) (fk opts)}
+                                                 (concat (:spare-keys opts) (:retain-keys opts)))]
                                   (if rs
                                     (recur (next rs)
                                            (into acc (await (reachable-addresses kv-store (first rs) opts))))

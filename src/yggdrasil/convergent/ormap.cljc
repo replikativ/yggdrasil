@@ -12,7 +12,11 @@
                    associative, idempotent — globally-unique uids make it a CRDT).
 
    NB (O5): `uid` uses random-uuid for global uniqueness; in a deterministic
-   replay context the tag source must be injected."
+   replay context the tag source must be injected — and MUST be value-inclusive
+   (distinct values ⇒ distinct uids). The inner `merge` is right-biased on a uid
+   collision, so two replicas assoc'ing the SAME k with the SAME uid but DIFFERENT
+   v would make the join order-dependent (non-commutative). random-uuid and a
+   content-hash-of-[k v] tag both satisfy this; a content-hash-of-k-only does not."
   (:require [clojure.set :as set]
             [yggdrasil.convergent.system :as sys]))
 

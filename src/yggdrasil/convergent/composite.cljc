@@ -22,7 +22,12 @@
 ;; composite doesn't capture. The OP path is therefore per-LEAF: sync each
 ;; sub-system as its own ygg-signal (the dissolution model). Forcing an aggregate
 ;; δ onto the composite would be a duplication against the grain.
-(extend-type yggdrasil.composite.CompositeSystem
+;;
+;; cljc: the only platform-specific token is the record TYPE symbol (a Java class
+;; on JVM, the cljs var on cljs) — mirrors overlay.cljc's `extend-type` over the
+;; reader-conditional type. Everything else is plain cross-platform protocol code,
+;; so a browser peer can `-join` two composite workspaces too.
+(extend-type #?(:clj yggdrasil.composite.CompositeSystem :cljs comp/CompositeSystem)
   c/PConvergent
   (-join [this other]
     (let [others (:systems other)

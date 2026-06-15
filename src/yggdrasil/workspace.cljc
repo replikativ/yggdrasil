@@ -457,7 +457,11 @@
    Returns {:swept [...] :errors {...} :freed-nodes-swept count}"
   ([workspace] (gc! workspace {}))
   ([workspace opts]
-   (let [gc-sweep! #?(:clj (requiring-resolve 'yggdrasil.gc/gc-sweep!) :cljs nil)]
+   ;; coordinated GC spans native adapters (git/btrfs/zfs/…) → JVM-only. On cljs
+   ;; fail legibly instead of calling `nil` (a silent NPE); durable-CRDT GC is
+   ;; available cross-platform via yggdrasil.convergent.durable/gc!.
+   (let [gc-sweep! #?(:clj (requiring-resolve 'yggdrasil.gc/gc-sweep!)
+                      :cljs (fn [& _] (throw (ex-info "coordinated workspace gc! is JVM-only; use durable-CRDT gc! on cljs" {:platform :cljs}))))]
      (gc-sweep! (:registry workspace)
                 (vals @(:systems workspace))
                 opts))))

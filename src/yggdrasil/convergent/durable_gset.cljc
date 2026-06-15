@@ -136,12 +136,15 @@
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this _snapshot-ids before]
+  (gc-sweep! [this snapshot-ids before]
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
+                 ;; retain held snapshots: a G-Set snapshot-id IS a PSS root address,
+                 ;; so keep its reachable nodes (else as-of/frozen on it breaks post-GC).
                  (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts)))))
+                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
+                               (assoc opts :retain-roots (seq snapshot-ids)))))))
 
   p/Overlayable
   ;; :frozen → a fresh-atoms CLONE at the current value (isolated snapshot).

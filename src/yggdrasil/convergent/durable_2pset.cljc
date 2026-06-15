@@ -48,7 +48,11 @@
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] :2p-set)
-  (capabilities [_] {:snapshotable true :branchable true :mergeable true
+  ;; single logical branch (replicas are separate stores synced by konserve-sync):
+  ;; isolation is via Overlayable, peer-merge via -join (PConvergent). branch!/
+  ;; merge! (the hierarchical tier) are no-ops here, so we do NOT advertise them —
+  ;; else composite cap-aggregation / compliance would treat a no-op as working.
+  (capabilities [_] {:snapshotable true :branchable false :mergeable false
                      :garbage-collectable true :overlayable true
                      :graphable false})
 
@@ -117,12 +121,23 @@
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
   ;; node reclamation: flush, then mark-and-sweep nodes unreachable from the
   ;; live adds/removals roots. (async+sync)
-  (gc-sweep! [this _snapshot-ids before]
+  (gc-sweep! [this snapshot-ids before]
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
-                 (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                               (or before #?(:clj (java.util.Date.) :cljs (js/Date.))) opts)))))
+                 ;; retain held snapshots: a 2P-Set snapshot-id is a COMMIT addr
+                 ;; ({:adds r :removals r}); keep the commit object + both halves'
+                 ;; nodes so as-of/frozen on that id survives GC.
+                 (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
+                       retain-roots (loop [cs (seq commit-addrs) acc []]
+                                      (if cs
+                                        (let [c (await (d/read-commit kv-store (first cs) opts))]
+                                          (recur (next cs) (conj acc (:adds c) (:removals c))))
+                                        acc))]
+                   (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
+                                 (or before #?(:clj (java.util.Date.) :cljs (js/Date.)))
+                                 (assoc opts :retain-roots retain-roots
+                                        :retain-keys commit-addrs)))))))
 
   p/Overlayable
   ;; :frozen → clone BOTH halves (isolated snapshot). :following → empty delta

@@ -7,11 +7,15 @@
    checkout descriptor) AND the building block for presence: stamp every write
    with a clock, last-writer-wins. Ported from replikativ.crdt.lwwr."
   (:require [yggdrasil.convergent.system :as sys]
-            [yggdrasil.types :as t]))
+            [yggdrasil.types :as t]
+            [hasch.core :as hasch]))
 
 (defn lwwr-join
-  "Least-upper-bound of two LWW registers: greater timestamp wins; on a tie,
-   a deterministic `pr-str` comparison picks the same winner on every replica."
+  "Least-upper-bound of two LWW registers: greater timestamp wins; on a tie, a
+   deterministic, CROSS-PLATFORM-stable comparison picks the same winner on every
+   replica. The tiebreak hashes via `hasch` (order-canonical) rather than `pr-str`,
+   whose map/set iteration order can differ JVM↔cljs and make two replicas pick
+   DIFFERENT winners for the same pair (a convergence break)."
   [a b]
   (cond
     (nil? a) b
@@ -19,7 +23,7 @@
     :else (let [ta (:timestamp a 0) tb (:timestamp b 0)]
             (cond (> tb ta) b
                   (< tb ta) a
-                  :else (if (pos? (compare (pr-str b) (pr-str a))) b a)))))
+                  :else (if (pos? (compare (str (hasch/uuid b)) (str (hasch/uuid a)))) b a)))))
 
 (defn lwwr
   "An LWW-Register conflict-free system. Optional `:init` seeds the register

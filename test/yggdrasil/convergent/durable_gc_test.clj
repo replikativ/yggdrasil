@@ -39,6 +39,19 @@
             (is (every? #(some? (k/get kv % {:sync? true}))
                         (d/reachable-addresses kv root)))))))))
 
+(deftest gc-retains-held-snapshot
+  (testing "a snapshot-id passed to gc-sweep! survives GC — as-of still resolves it"
+    (let [gs (g/durable-gset "t" :store-config (mem))]
+      (g/add gs :a) (g/add gs :b) (g/flush! gs)
+      (let [snap (p/snapshot-id gs)]              ; S0 names the {:a :b} root
+        (g/add gs :c) (g/flush! gs)               ; supersede S0's root tree…
+        (g/add gs :d) (g/flush! gs)               ; …twice, so S0's nodes are non-live
+        ;; GC pinning S0: its now-unreferenced nodes must be RETAINED (else as-of
+        ;; below would read a swept node). Guards the gc-sweep! :retain-roots wiring.
+        (p/gc-sweep! gs #{snap} nil)
+        (is (= #{:a :b} (p/as-of gs snap)) "held snapshot survived GC (retention works)")
+        (is (= #{:a :b :c :d} (g/elements gs)) "live set intact after GC")))))
+
 (deftest two-pset-gc-keeps-both-halves
   (testing "2P-Set GC keeps adds + removals roots (tombstones are live members)"
     (let [s (d2p/durable-2pset "t" :store-config (mem) :comparator compare)]

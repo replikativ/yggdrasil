@@ -57,3 +57,13 @@
   (if (:sync? opts)
     (k/dissoc store key opts)
     (chan->cps (k/dissoc store key opts))))
+
+(defn k-update
+  "ATOMIC per-key read-modify-write via konserve's `update` (go-locked — no
+   get-then-assoc TOCTOU). `f` receives the current value (nil if absent) and
+   returns the new value. Use for convergent grow-cells (roots/freed) so a
+   concurrent flush or synced peer can't lose an interleaved write."
+  [store key f opts]
+  (if (:sync? opts)
+    (k/update store key f opts)
+    (chan->cps (k/update store key f opts))))
