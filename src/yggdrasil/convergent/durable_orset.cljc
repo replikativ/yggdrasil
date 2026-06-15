@@ -20,7 +20,12 @@
    `tag-fn` for an idempotent add (re-adding the same element is a no-op) — the
    shape the snapshot registry wants.
 
-   Implements `PConvergent` (-join) + `Branchable`. **Fully cross-platform**: the
+   VALUE SEMANTICS: the record holds the two halves (`adds`/`removals`, immutable
+   PSS-set values) and a `dirty` flag as PLAIN fields; every mutator returns a NEW
+   record (never mutates in place). The mutable cell lives in the HOLDER — a
+   spindel signal-atom or the registry conn — which swaps this value.
+
+   Implements `PConvergent` (-join) + `Overlayable`. **Fully cross-platform**: the
    record carries its sync-mode (`opts`), so EVERY content-touching op — the
    functional API AND the protocol methods (-join/snapshot-id/as-of/gc-sweep!) —
    dispatches through `async+sync` (sync on JVM, async/CPS on cljs)."
@@ -47,18 +52,17 @@
 
 (defrecord DurableORSet
            [id kv-store store-config storage comparator tag-fn
-            adds-atom      ; atom of PSS set of [element tag]
-            removals-atom  ; atom of PSS set of [element tag]
-            dirty-atom     ; atom boolean
-            opts]          ; the record's sync-mode
+            adds        ; immutable PSS set of [element tag]
+            removals    ; immutable PSS set of [element tag]
+            dirty       ; boolean — content changed since last flush
+            opts]       ; the record's sync-mode
 
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] :orset)
   ;; single logical branch (replicas are separate stores synced by konserve-sync):
   ;; isolation is via Overlayable, peer-merge via -join (PConvergent). branch!/
-  ;; merge! (the hierarchical tier) are no-ops here, so we do NOT advertise them —
-  ;; else composite cap-aggregation / compliance would treat a no-op as working.
+  ;; merge! (the hierarchical tier) are no-ops here, so we do NOT advertise them.
   (capabilities [_] {:snapshotable true :branchable false :mergeable false
                      :garbage-collectable true :overlayable true
                      :graphable false})
@@ -69,8 +73,8 @@
   (snapshot-id [_]
     (async+sync (:sync? opts)
                 (async
-                 (let [adds-root (await (d/store-set! @adds-atom storage opts))
-                       rem-root  (await (d/store-set! @removals-atom storage opts))]
+                 (let [adds-root (await (d/store-set! adds storage opts))
+                       rem-root  (await (d/store-set! removals storage opts))]
                    (str (await (d/store-commit! kv-store {:adds adds-root :removals rem-root} opts)))))))
   (parent-ids [_] #{})
   (as-of [this snap-id] (p/as-of this snap-id nil))
@@ -113,13 +117,13 @@
   (-join [this other]
     (async+sync (:sync? opts)
                 (async
-                 (let [adds' (await (d/set-union @adds-atom @(:adds-atom other) comparator opts))
-                       rems' (await (d/set-union @removals-atom @(:removals-atom other) comparator opts))]
+                 (let [adds' (await (d/set-union adds (:adds other) comparator opts))
+                       rems' (await (d/set-union removals (:removals other) comparator opts))]
                    ;; IDEMPOTENCE: a no-op join returns the receiver identical.
-                   (if (and (= adds' @adds-atom) (= rems' @removals-atom))
+                   (if (and (= adds' adds) (= rems' removals))
                      this
                      (->DurableORSet id kv-store store-config storage comparator tag-fn
-                                     (atom adds') (atom rems') (atom true) opts))))))
+                                     adds' rems' true opts))))))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
@@ -148,74 +152,68 @@
                                         :retain-keys commit-addrs)))))))
 
   p/Overlayable
-  ;; :frozen → clone BOTH halves. :following → empty delta halves; `overlay-value`
-  ;; joins with the LIVE parent on read (add-wins convergent).
+  ;; :frozen → carry BOTH halves (immutable PSS values; isolated by value).
+  ;; :following → empty delta halves; `overlay-value` joins with the LIVE parent
+  ;; on read (add-wins convergent). Mutate the clone via `ovl/overlay-swap!`.
   (overlay [this opts]
     (let [mode (or (:mode opts) :frozen)
           lw   (if (= :following mode)
-                 (assoc this :adds-atom (atom (d/empty-set storage comparator))
-                        :removals-atom (atom (d/empty-set storage comparator)) :dirty-atom (atom false))
-                 (assoc this :adds-atom (atom @adds-atom)
-                        :removals-atom (atom @removals-atom) :dirty-atom (atom false)))]
+                 (assoc this :adds (d/empty-set storage comparator)
+                        :removals (d/empty-set storage comparator) :dirty false)
+                 (assoc this :dirty false))]
       (ovl/convergent-overlay this mode lw))))
 
 ;; ============================================================
-;; Value ops
+;; Value ops — each returns a NEW OR-Set value (value-semantic)
 ;; ============================================================
 
 (defn add
-  "Add `elem` with a fresh tag (from `tag-fn`). Marks dirty. (async+sync) Returns o."
+  "Add `elem` with a fresh tag (from `tag-fn`). (async+sync) Returns a NEW o."
   ([o elem] (add o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
                 (let [pair [elem ((:tag-fn o) elem)]
-                      s'   (await (d/set-conj @(:adds-atom o) pair (:comparator o) opts))]
-                  (reset! (:adds-atom o) s')
-                  (reset! (:dirty-atom o) true)
-                  (c/with-delta o half-accrue {:adds #{pair}}))))))
+                      s'   (await (d/set-conj (:adds o) pair (:comparator o) opts))]
+                  (c/with-delta (assoc o :adds s' :dirty true) half-accrue {:adds #{pair}}))))))
 
 (defn- live-pairs
   "async+sync: the live [elem tag] add-pairs (in adds, not removals)."
   [o opts]
   (async+sync (:sync? opts)
               (async
-               (set/difference (await (d/set->clj @(:adds-atom o) opts))
-                               (await (d/set->clj @(:removals-atom o) opts))))))
+               (set/difference (await (d/set->clj (:adds o) opts))
+                               (await (d/set->clj (:removals o) opts))))))
 
 (defn remove-elem
   "Observed-remove `elem`: tombstone exactly the add-tags currently observed for
-   it. A concurrent (unobserved) add survives — add-wins. (async+sync) Returns o."
+   it. A concurrent (unobserved) add survives — add-wins. (async+sync) Returns a
+   NEW o."
   ([o elem] (remove-elem o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
-                (let [tombstones (filter (fn [[e _]] (= e elem)) (await (live-pairs o opts)))]
-                  (loop [ts (seq tombstones)]
-                    (when ts
-                      (let [s' (await (d/set-conj @(:removals-atom o) (first ts) (:comparator o) opts))]
-                        (reset! (:removals-atom o) s')
-                        (reset! (:dirty-atom o) true)
-                        (recur (next ts)))))
-                  (c/with-delta o half-accrue {:removals (set tombstones)}))))))
+                (let [tombstones (filter (fn [[e _]] (= e elem)) (await (live-pairs o opts)))
+                      removals'  (loop [r (:removals o) ts (seq tombstones)]
+                                   (if ts
+                                     (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
+                                     r))]
+                  (c/with-delta (assoc o :removals removals' :dirty true)
+                                half-accrue {:removals (set tombstones)}))))))
 
 (defn apply-delta
   "Consume a peer's OR-Set δ ({:adds #{[e tag]..} :removals #{[e tag]..}}) by
    unioning each half of [elem tag] pairs into the local halves — the OP-path
-   apply (O(δ); cf. -join the STATE-path). Returns o WITHOUT a local δ.
-   (async+sync)"
+   apply (O(δ); cf. -join the STATE-path). Returns a NEW o. (async+sync)"
   [o delta]
   (let [opts (:opts o)]
     (async+sync (:sync? opts)
                 (async
-                 (let [adds (loop [a @(:adds-atom o) ps (seq (:adds delta))]
+                 (let [adds (loop [a (:adds o) ps (seq (:adds delta))]
                               (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
-                       rems (loop [r @(:removals-atom o) ps (seq (:removals delta))]
+                       rems (loop [r (:removals o) ps (seq (:removals delta))]
                               (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
-                   (reset! (:adds-atom o) adds)
-                   (reset! (:removals-atom o) rems)
-                   (reset! (:dirty-atom o) true)
-                   o)))))
+                   (assoc o :adds adds :removals rems :dirty true))))))
 
 (defn elements
   "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"
@@ -237,39 +235,36 @@
 
 (defn flush!
   "Persist both halves, update the :crdt/roots cell ({:adds :removals}) + freed.
-   (async+sync)"
+   Returns a NEW o with `dirty` cleared (callers must ADOPT it). (async+sync)"
   ([o] (flush! o (:opts o)))
   ([o opts]
    (async+sync (:sync? opts)
                (async
-                (when @(:dirty-atom o)
+                (if (:dirty o)
                   (let [storage       (:storage o)
-                        adds-root     (await (d/store-set! @(:adds-atom o) storage opts))
-                        removals-root (await (d/store-set! @(:removals-atom o) storage opts))]
+                        adds-root     (await (d/store-set! (:adds o) storage opts))
+                        removals-root (await (d/store-set! (:removals o) storage opts))]
                     (await (d/save-roots! (:kv-store o)
                                           {adds-branch adds-root removals-branch removals-root} opts))
                     (await (d/save-freed! (:kv-store o) storage opts))
-                    (reset! (:dirty-atom o) false)))
-                o))))
+                    (assoc o :dirty false))
+                  o)))))
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's adds+removals nodes into this store and
-   union both halves. (async+sync) Returns o."
+   union both halves. Returns a NEW o. (async+sync)"
   [o other]
   (let [opts (:opts o) cmp (:comparator o)]
     (async+sync (:sync? opts)
                 (async
                  (let [ostorage (:storage other)
-                       a-root (await (d/store-set! @(:adds-atom other) ostorage opts))
-                       r-root (await (d/store-set! @(:removals-atom other) ostorage opts))]
+                       a-root (await (d/store-set! (:adds other) ostorage opts))
+                       r-root (await (d/store-set! (:removals other) ostorage opts))]
                    (await (d/ship! (:kv-store other) (:kv-store o) a-root opts))
                    (await (d/ship! (:kv-store other) (:kv-store o) r-root opts))
-                   (reset! (:adds-atom o)
-                           (await (d/set-union @(:adds-atom o) (d/restore-set cmp a-root (:storage o) opts) cmp opts)))
-                   (reset! (:removals-atom o)
-                           (await (d/set-union @(:removals-atom o) (d/restore-set cmp r-root (:storage o) opts) cmp opts)))
-                   (reset! (:dirty-atom o) true)
-                   o)))))
+                   (let [adds' (await (d/set-union (:adds o) (d/restore-set cmp a-root (:storage o) opts) cmp opts))
+                         rems' (await (d/set-union (:removals o) (d/restore-set cmp r-root (:storage o) opts) cmp opts))]
+                     (assoc o :adds adds' :removals rems' :dirty true)))))))
 
 (defn gc!
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
@@ -304,6 +299,6 @@
                                               (d/restore-set comparator root storage opts)
                                               (d/empty-set storage comparator)))]
                    (->DurableORSet id kv-store store-config storage comparator tag-fn
-                                   (atom (restore adds-branch))
-                                   (atom (restore removals-branch))
-                                   (atom false) opts))))))
+                                   (restore adds-branch)
+                                   (restore removals-branch)
+                                   false opts))))))

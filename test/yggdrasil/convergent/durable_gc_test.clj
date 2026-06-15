@@ -18,11 +18,11 @@
 
 (deftest gset-gc-reclaims-superseded-nodes
   (testing "many flushes accumulate superseded trees; gc! reclaims them"
-    (let [gs (g/durable-gset "t" :store-config (mem))]
-      ;; 6 flush generations → 6 superseded root trees pile up
-      (doseq [batch (partition-all 50 (range 300))]
-        (doseq [i batch] (g/add gs i))
-        (g/flush! gs))
+    (let [;; 6 flush generations → 6 superseded root trees pile up (value-semantic:
+          ;; thread gs through each batch's adds + flush)
+          gs (reduce (fn [gs batch] (g/flush! (reduce g/add gs batch)))
+                     (g/durable-gset "t" :store-config (mem))
+                     (partition-all 50 (range 300)))]
       (let [kv (:kv-store gs)
             before (node-key-count kv)
             live-before (g/elements gs)
@@ -41,24 +41,22 @@
 
 (deftest gc-retains-held-snapshot
   (testing "a snapshot-id passed to gc-sweep! survives GC — as-of still resolves it"
-    (let [gs (g/durable-gset "t" :store-config (mem))]
-      (g/add gs :a) (g/add gs :b) (g/flush! gs)
-      (let [snap (p/snapshot-id gs)]              ; S0 names the {:a :b} root
-        (g/add gs :c) (g/flush! gs)               ; supersede S0's root tree…
-        (g/add gs :d) (g/flush! gs)               ; …twice, so S0's nodes are non-live
-        ;; GC pinning S0: its now-unreferenced nodes must be RETAINED (else as-of
-        ;; below would read a swept node). Guards the gc-sweep! :retain-roots wiring.
-        (p/gc-sweep! gs #{snap} nil)
-        (is (= #{:a :b} (p/as-of gs snap)) "held snapshot survived GC (retention works)")
-        (is (= #{:a :b :c :d} (g/elements gs)) "live set intact after GC")))))
+    (let [gs0  (-> (g/durable-gset "t" :store-config (mem)) (g/add :a) (g/add :b) g/flush!)
+          snap (p/snapshot-id gs0)                  ; S0 names the {:a :b} root
+          ;; supersede S0's root tree twice, so S0's nodes are non-live
+          gs   (-> gs0 (g/add :c) g/flush! (g/add :d) g/flush!)]
+      ;; GC pinning S0: its now-unreferenced nodes must be RETAINED (else as-of
+      ;; below would read a swept node). Guards the gc-sweep! :retain-roots wiring.
+      (p/gc-sweep! gs #{snap} nil)
+      (is (= #{:a :b} (p/as-of gs snap)) "held snapshot survived GC (retention works)")
+      (is (= #{:a :b :c :d} (g/elements gs)) "live set intact after GC"))))
 
 (deftest two-pset-gc-keeps-both-halves
   (testing "2P-Set GC keeps adds + removals roots (tombstones are live members)"
-    (let [s (d2p/durable-2pset "t" :store-config (mem) :comparator compare)]
-      (doseq [batch (partition-all 30 (range 150))]
-        (doseq [i batch] (d2p/add s i))
-        (d2p/flush! s))
-      (d2p/remove-elem s 7) (d2p/remove-elem s 42) (d2p/flush! s)
+    (let [s0 (reduce (fn [s batch] (d2p/flush! (reduce d2p/add s batch)))
+                     (d2p/durable-2pset "t" :store-config (mem) :comparator compare)
+                     (partition-all 30 (range 150)))
+          s  (d2p/flush! (-> s0 (d2p/remove-elem 7) (d2p/remove-elem 42)))]
       (let [live-before (d2p/elements s)
             deleted (d2p/gc! s)]
         (is (pos? (count deleted)))

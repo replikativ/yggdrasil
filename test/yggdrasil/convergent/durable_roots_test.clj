@@ -25,10 +25,10 @@
                 (p/branch! :fa) (p/checkout :fa) (g/add :a-only) g/flush!)
           b (-> (g/durable-gset "kb" :store-config (mem))
                 (g/add :shared)
-                (p/branch! :fb) (p/checkout :fb) (g/add :b-only) g/flush!)]
-      ;; converge both directions
-      (g/merge-peer! a b) (g/flush! a)
-      (g/merge-peer! b a) (g/flush! b)
+                (p/branch! :fb) (p/checkout :fb) (g/add :b-only) g/flush!)
+          ;; converge both directions (value-semantic: thread the merged handles)
+          a (g/flush! (g/merge-peer! a b))
+          b (g/flush! (g/merge-peer! b a))]
       ;; every branch present on both peers (none lost to LWW)
       (is (= #{:main :fa :fb} (p/branches a)))
       (is (= #{:main :fa :fb} (p/branches b)))

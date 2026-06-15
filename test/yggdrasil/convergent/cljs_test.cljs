@@ -33,7 +33,7 @@
 (deftest ormap-add-wins-on-cljs
   (let [a (-> (om/ormap "kb") (om/assoc-key :k 1))
         b (-> (om/ormap "kb") (om/assoc-key :k 2))
-        _ (om/dissoc-key a :k)]
+        a (om/dissoc-key a :k)]                 ; value-semantic: rebind
     (is (= #{:k} (om/ormap-keys (c/-join a b))))
     (is (= #{2} (om/lookup (c/-join a b) :k)))))
 

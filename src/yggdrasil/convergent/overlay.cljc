@@ -48,6 +48,21 @@
   [overlay]
   @(:local-writes overlay))
 
+(defn overlay-swap!
+  "Apply value-semantic mutator `f` (system → new-system, possibly async) to the
+   overlay's isolated writable system and RE-SEAT the result in `:local-writes`.
+   Returns the overlay. (async+sync — `f` may return an async value.)
+
+   Use this instead of mutating `(overlay-system ov)` in place: a value-semantic
+   CRDT op returns a NEW system, so the overlay (a conn over `:local-writes`) must
+   adopt it."
+  [ov f]
+  (let [parent (:parent ov)]
+    (async+sync (:sync? (:opts parent))
+                (async
+                 (reset! (:local-writes ov) (await (f @(:local-writes ov))))
+                 ov))))
+
 (defn convergent-overlay
   "Build an Overlay over a convergent `parent`. `local-writes-system` is the
    isolated writable system the caller built for the mode:

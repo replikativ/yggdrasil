@@ -284,10 +284,20 @@
     nil))
 
 (defn overlay-subsystem
-  "The writable clone for sub-system `sid` inside a CompositeOverlay — mutate it
-   with that sub's normal ops; `merge-down!` joins all subs back."
+  "The writable clone VALUE for sub-system `sid` inside a CompositeOverlay — read
+   it with that sub's normal ops. Mutate via `overlay-subsystem-swap!`."
   [composite-overlay sid]
   (ovl/overlay-system (get (:sub-overlays composite-overlay) sid)))
+
+(defn overlay-subsystem-swap!
+  "Apply value-semantic mutator `f` to sub-system `sid`'s overlay clone and
+   re-seat it (the sub-overlay is a conn over `:local-writes`). Returns the
+   composite-overlay. (async+sync)"
+  [composite-overlay sid f]
+  (async+sync (:sync? (:opts composite-overlay))
+              (async
+               (await (ovl/overlay-swap! (get (:sub-overlays composite-overlay) sid) f))
+               composite-overlay)))
 
 ;; ============================================================
 ;; CompositeSystem (fiber product / pullback)
@@ -672,6 +682,17 @@
 ;; ============================================================
 
 (defn get-subsystem
-  "Get a sub-system by its system-id from a CompositeSystem."
+  "Get a sub-system VALUE by its system-id from a CompositeSystem."
   [composite system-id]
   (get (:systems composite) system-id))
+
+(defn update-subsystem
+  "Apply value-semantic mutator `f` (sub-system → new sub-system, possibly async)
+   to sub-system `id` and RE-SEAT the result. Returns a NEW composite. (async+sync)
+   The value-semantic way to evolve a sub inside a composite — a `get-subsystem`
+   handle is an immutable value, so mutating it in place is a no-op."
+  [composite id f]
+  (async+sync (:sync? (:opts composite))
+              (async
+               (assoc-in composite [:systems id]
+                         (await (f (get (:systems composite) id)))))))

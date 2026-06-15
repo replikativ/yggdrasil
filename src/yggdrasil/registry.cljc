@@ -52,18 +52,24 @@
 ;; Registry — a lens over a durable 2P-Set
 ;; ============================================================
 
-(defrecord Registry [tpset kv-store store-config])
+;; The registry is a CONN: a stable handle whose `tpset-atom` holds the durable
+;; 2P-Set VALUE (value-semantic — every d2p op returns a new value, which the
+;; mutators `swap!` in). The one mutable cell is this atom (the service boundary,
+;; like a datahike conn) — the CRDT it holds carries no internal mutable state.
+;; The external API (register!/deregister!/flush!/queries) is unchanged, so
+;; callers (workspace/gc) are unaffected by the value-semantic conversion.
+(defrecord Registry [tpset-atom kv-store store-config])
 
 (defn registry-system
-  "The underlying durable 2P-Set — a first-class conflict-free yggdrasil system
-   (SystemIdentity/Snapshotable/Branchable/Mergeable/PConvergent). This is what
-   another yggdrasil (a composite or meta-registry) tracks, forks, or merges:
-   the registry, being content-addressed, has a stable snapshot identity."
+  "A SNAPSHOT of the underlying durable 2P-Set value — a first-class conflict-free
+   yggdrasil system (SystemIdentity/Snapshotable/Branchable/Mergeable/PConvergent).
+   This is what another yggdrasil (a composite or meta-registry) tracks, forks, or
+   merges: the registry, being content-addressed, has a stable snapshot identity."
   [^Registry registry]
-  (:tpset registry))
+  @(:tpset-atom registry))
 
 (defn- live-entries [^Registry registry]
-  (d2p/elements (:tpset registry)))
+  (d2p/elements @(:tpset-atom registry)))
 
 ;; ============================================================
 ;; CRUD
@@ -72,25 +78,26 @@
 (defn register!
   "Add a RegistryEntry (idempotent — content-addressed)."
   [^Registry registry entry]
-  (d2p/add (:tpset registry) entry)
+  (swap! (:tpset-atom registry) #(d2p/add % entry))
   registry)
 
 (defn register-batch!
   "Register multiple entries at once."
   [^Registry registry entries]
-  (d2p/add-all (:tpset registry) entries)
+  (swap! (:tpset-atom registry) #(d2p/add-all % entries))
   registry)
 
 (defn deregister!
   "Convergent observed-remove: tombstone the entry (permanent per content)."
   [^Registry registry entry]
-  (d2p/remove-elem (:tpset registry) entry)
+  (swap! (:tpset-atom registry) #(d2p/remove-elem % entry))
   registry)
 
 (defn flush!
-  "Persist the 2P-Set (both halves + the :crdt/roots cell + freed)."
+  "Persist the 2P-Set (both halves + the :crdt/roots cell + freed) and adopt the
+   flushed (dirty-cleared) value back into the conn."
   [^Registry registry]
-  (d2p/flush! (:tpset registry))
+  (swap! (:tpset-atom registry) d2p/flush!)
   registry)
 
 ;; ============================================================
@@ -195,15 +202,15 @@
                                   :comparator tsbs-comparator
                                   :key-encode store/entry->map
                                   :key-decode store/map->entry)]
-     (->Registry tpset (:kv-store tpset) store-config))))
+     (->Registry (atom tpset) (:kv-store tpset) store-config))))
 
 (defn gc!
   "Reclaim PSS B-tree nodes superseded by prior flushes (mark-and-sweep over the
    underlying 2P-Set). Tombstoned (deregistered) entries remain — they're live
    2P-Set members; this reclaims the old index-tree versions. Returns the set of
    deleted node keys."
-  ([^Registry registry] (d2p/gc! (:tpset registry)))
-  ([^Registry registry before] (d2p/gc! (:tpset registry) before)))
+  ([^Registry registry] (d2p/gc! @(:tpset-atom registry)))
+  ([^Registry registry before] (d2p/gc! @(:tpset-atom registry) before)))
 
 (defn close!
   "Flush and close the registry."

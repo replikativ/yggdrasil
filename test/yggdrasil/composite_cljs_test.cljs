@@ -35,11 +35,11 @@
             ;; the composite opened :sync? false → its sub-touching methods are async
             [tc comp]    (<! (realize (cmp/composite [(gset-opener "a") (gset-opener "b")]
                                                      :store-config sc :sync? false)))
-            a            (cmp/get-subsystem comp "a")
-            b            (cmp/get-subsystem comp "b")
-            [ta _]       (<! (realize (g/add a :a1)))
-            [_ _]        (<! (realize (g/add a :a2)))
-            [_ _]        (<! (realize (g/add b :b1)))
+            ;; value-semantic: evolve subs via update-subsystem (re-seats the new
+            ;; sub value into the composite), threading the composite each step.
+            [ta comp]    (<! (realize (cmp/update-subsystem comp "a" #(g/add % :a1))))
+            [_ comp]     (<! (realize (cmp/update-subsystem comp "a" #(g/add % :a2))))
+            [_ comp]     (<! (realize (cmp/update-subsystem comp "b" #(g/add % :b1))))
             ;; transactional commit: flush both subs durable, write :composite/root LAST
             [tcommit committed] (<! (realize (p/commit! comp "snap-1")))
             [tsid sid]   (<! (realize (p/snapshot-id committed)))

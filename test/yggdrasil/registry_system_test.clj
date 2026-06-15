@@ -23,7 +23,9 @@
       (testing "snapshot-id is content-addressed: changes with content, stable for equal content"
         (let [id1 (p/snapshot-id sys)
               _ (reg/register! r (entry "s2" "git:a" "main" 200))
-              id2 (p/snapshot-id sys)
+              ;; registry-system returns a SNAPSHOT value — re-fetch after the
+              ;; mutation to observe the new content (value-semantic registry conn).
+              id2 (p/snapshot-id (reg/registry-system r))
               r' (-> (reg/create-registry)
                      (reg/register! (entry "s1" "git:a" "main" 100))
                      (reg/register! (entry "s2" "git:a" "main" 200)))]
@@ -61,7 +63,8 @@
             "and pins its content-addressed snapshot id"))
       ;; advancing the inner registry changes its id → a NEW meta entry would pin it
       (reg/register! inner (entry "s3" "git:a" "main" 300))
-      (is (not= (p/snapshot-id inner-sys)
+      ;; re-fetch the inner system (value-semantic: registry-system is a snapshot)
+      (is (not= (p/snapshot-id (reg/registry-system inner))
                 (:snapshot-id (get (reg/as-of meta (t/->HLC 9999 0)) ["registry" "main"])))
           "the pinned id is the old snapshot; the inner registry has moved on")
       (reg/close! inner) (reg/close! meta))))

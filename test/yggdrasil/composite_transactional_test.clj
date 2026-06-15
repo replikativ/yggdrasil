@@ -44,18 +44,18 @@
           opener (fn [id] (fn [kv o] (g/durable-gset id :kv-store kv
                                                      :roots-key [:crdt/roots id]
                                                      :sync? (:sync? o))))
-          comp   (cmp/composite [(opener "a")] :store-config sc)
-          a      (cmp/get-subsystem comp "a")]
-      (g/add a :x) (g/add a :y)
+          comp   (-> (cmp/composite [(opener "a")] :store-config sc)
+                     (cmp/update-subsystem "a" #(g/add % :x))
+                     (cmp/update-subsystem "a" #(g/add % :y)))]
       (let [comp (p/commit! comp "v1")
-            sid  (p/snapshot-id comp)]              ; FREEZE the composite at a:{:x :y}
-        (g/add a :z) (p/commit! comp "v2")          ; evolve the live composite → a:{:x :y :z}
+            sid  (p/snapshot-id comp)               ; FREEZE the composite at a:{:x :y}
+            comp (p/commit! (cmp/update-subsystem comp "a" #(g/add % :z)) "v2")] ; → a:{:x :y :z}
         (let [frozen (-> comp (p/branch! :iso sid) (p/checkout :iso))
-              fa     (cmp/get-subsystem frozen "a")]
-          (is (= #{:x :y} (g/elements fa)) "sub a is frozen at the composite snapshot")
-          (g/add fa :w)
-          (is (= #{:x :y :w} (g/elements fa)) "the isolated branch evolves independently")
-          (is (= #{:x :y :z} (g/elements a)) "the live composite is untouched"))))))
+              fa0    (cmp/get-subsystem frozen "a")]
+          (is (= #{:x :y} (g/elements fa0)) "sub a is frozen at the composite snapshot")
+          (let [fa (g/add fa0 :w)]
+            (is (= #{:x :y :w} (g/elements fa)) "the isolated branch evolves independently")
+            (is (= #{:x :y :z} (g/elements (cmp/get-subsystem comp "a"))) "the live composite is untouched")))))))
 
 (deftest composite-overlay-isolate-and-merge-down
   (testing "composite overlay = per-sub overlays; mutate the sub clones in
@@ -65,14 +65,13 @@
           opener (fn [id] (fn [kv o] (g/durable-gset id :kv-store kv
                                                      :roots-key [:crdt/roots id]
                                                      :sync? (:sync? o))))
-          comp   (cmp/composite [(opener "a") (opener "b")] :store-config sc)]
-      (g/add (cmp/get-subsystem comp "a") :x)
-      (g/add (cmp/get-subsystem comp "b") :y)
-      (let [ov (p/overlay comp {})
-            ca (cmp/overlay-subsystem ov "a")
-            cb (cmp/overlay-subsystem ov "b")]
-        (g/add ca :x2) (g/add cb :y2)
-        (is (= #{:x :x2} (g/elements ca)) "sub a's overlay evolves in isolation")
+          comp   (-> (cmp/composite [(opener "a") (opener "b")] :store-config sc)
+                     (cmp/update-subsystem "a" #(g/add % :x))
+                     (cmp/update-subsystem "b" #(g/add % :y)))]
+      (let [ov (p/overlay comp {})]
+        (cmp/overlay-subsystem-swap! ov "a" #(g/add % :x2))
+        (cmp/overlay-subsystem-swap! ov "b" #(g/add % :y2))
+        (is (= #{:x :x2} (g/elements (cmp/overlay-subsystem ov "a"))) "sub a's overlay evolves in isolation")
         (is (= #{:x} (g/elements (cmp/get-subsystem comp "a"))) "parent sub a untouched while open")
         (let [merged (p/merge-down! ov)]
           (is (= #{:x :x2} (g/elements (cmp/get-subsystem merged "a"))) "merge-down! joined sub a")
@@ -87,11 +86,11 @@
           opener (fn [id] (fn [kv o] (g/durable-gset id :kv-store kv
                                                      :roots-key [:crdt/roots id]
                                                      :sync? (:sync? o))))
-          comp   (cmp/composite [(opener "a")] :store-config sc)
-          a      (cmp/get-subsystem comp "a")]
-      (g/add a :x) (g/add a :y)
-      (p/commit! comp "c1")
-      (g/add a :z)
+          comp   (-> (cmp/composite [(opener "a")] :store-config sc)
+                     (cmp/update-subsystem "a" #(g/add % :x))
+                     (cmp/update-subsystem "a" #(g/add % :y)))
+          comp   (p/commit! comp "c1")
+          comp   (cmp/update-subsystem comp "a" #(g/add % :z))]
       (let [comp   (p/commit! comp "c2")          ; supersedes c1's index + sub trees
             before (count (k/keys (:kv-store comp) {:sync? true}))
             report (p/gc-sweep! comp nil)
