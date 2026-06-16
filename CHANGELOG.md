@@ -7,8 +7,9 @@ All notable changes to yggdrasil are documented here. The format is based on
 
 The headline of 0.3 is a **convergent CRDT catalog** that runs on the JVM *and*
 ClojureScript, on the same persistent-sorted-set + konserve substrate as the snapshot
-registry. This is a breaking release (API renames + one on-disk registry change); a
-migration is provided.
+registry. It is **additive** for existing 0.2 API (the protocol / adapter / workspace /
+registry surfaces are preserved); the one breaking change is the snapshot registry's
+on-disk format, for which an in-place migration is provided.
 
 ### Added
 
@@ -21,8 +22,11 @@ migration is provided.
     an explicit `merge`. See [doc/cdvcs-convergent-system.md](doc/cdvcs-convergent-system.md).
   - All durable by construction (content-addressed PSS over konserve), **read on the
     fly** (per-key reads are O(log n) range slices through an in-memory node cache — no
-    full in-memory materialization), and cross-platform via `async+sync` (sync on JVM,
-    CPS on cljs).
+    full in-memory materialization), and cross-platform via `async+sync`.
+  - The collection CRDTs read like Clojure collections — `conj`/`disj`/`contains?`/
+    `into` (sets), `assoc`/`dissoc`/`get`/`keys` (maps) — aliased at the call site. They
+    are **synchronous on the JVM and asynchronous on ClojureScript** (`:sync? false` +
+    `await`); `lwwr` is in-memory and synchronous on both.
 - **Cross-platform core.** `storage`, `registry`, `workspace` (and the convergent
   catalog) are now `.cljc` — yggdrasil's durable systems run in the browser/Node.
 - `yggdrasil.composite` `-join` — composites are the **product** in the systems
@@ -34,37 +38,20 @@ migration is provided.
 
 ### Changed (breaking)
 
-- **CRDT API uses bare Clojure collection verbs.** Alias the namespace at the call
-  site; only the defining ns excludes them from `clojure.core`:
-  - sets: `add → conj`, `remove-elem → disj`, `contains-elem? → contains?`,
-    2P-Set `add-all → into`
-  - OR-Map: `assoc-key → assoc`, `dissoc-key → dissoc`, `lookup → get`,
-    `ormap-keys → keys`
-  - LWW-Register unchanged (`set-register` / `value`)
-- **Namespace renames** (the `durable-` prefix is dropped — there is one
-  implementation per CRDT now): `convergent.durable-gset → convergent.gset`,
-  `durable-orset → orset`, `durable-2pset → twopset`, `durable-ormap → ormap`
-  (`durable-merging-ormap → merging-ormap`). The substrate ns
-  `yggdrasil.convergent.durable` keeps its name.
-- **No separate in-memory CRDTs.** The pure-map in-memory G-Set / OR-Map / Merging-
-  OR-Map are removed; the (formerly `durable-`) versions are canonical and default to
-  an in-memory konserve store when constructed without one. Consequence: collection
-  CRDTs are **asynchronous on ClojureScript** (`:sync? false` + `await`). `lwwr`
-  remains in-memory and synchronous on both platforms.
-- The **snapshot registry is now a durable 2P-Set** (adds + removals halves), giving
-  it convergent removal; queries are unchanged.
+- **The snapshot registry's on-disk format changed.** It is now a durable **2P-Set**
+  (adds + removals halves) — giving it convergent removal — instead of a single index.
+  The PSS *node* format is unchanged, but the root cell moved from
+  `:registry/roots {:tsbs <root>}` to `:crdt/roots {:adds <root> :removals <root>}`. The
+  public registry API (`create-registry` / `register!` / `deregister!` / queries) and
+  all other 0.2 surfaces are unchanged; only the persisted bytes differ, so a 0.2
+  registry store needs the one-time migration below. (Adapter stores — datahike/git/… —
+  are untouched; the convergent CRDT catalog is new, so it has no prior data.)
 
 ### Migration
 
-**Source.** Update callers for the verb + namespace renames above. On ClojureScript,
-collection-CRDT (and registry) operations now return continuations — construct with
-`:sync? false` and `await`.
-
-**On-disk (registry only).** The PSS *node* format is unchanged, but the registry's
-root cell moved from `:registry/roots {:tsbs <root>}` (a single index) to
-`:crdt/roots {:adds <root> :removals <root>}` (a 2P-Set). The durable CRDT catalog is
-new in 0.3, so it has no prior data to migrate; adapter stores (datahike/git/…) are
-untouched. To migrate a 0.2 registry store in place:
+A 0.2 deployment upgrades with **no source changes** — the protocol, adapter,
+workspace, and registry APIs are preserved. The only step is migrating an existing
+**registry** store in place:
 
 ```clojure
 (require '[yggdrasil.migrate :as migrate])
