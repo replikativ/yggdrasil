@@ -29,9 +29,9 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->DurableGSet flush! apply-delta)
+(declare ->GSet flush! apply-delta)
 
-(defrecord DurableGSet
+(defrecord GSet
            [id kv-store store-config storage comparator
             roots       ; {branch → immutable PSS set}
             current     ; current branch keyword
@@ -122,11 +122,11 @@
                    ;; forever. Only mark genuinely-changed branches dirty.
                    (if (= joined roots)
                      this
-                     (->DurableGSet id kv-store store-config storage comparator
-                                    joined current
-                                    (into #{} (remove #(= (get joined %) (get roots %)))
-                                          (keys joined))
-                                    opts))))))
+                     (->GSet id kv-store store-config storage comparator
+                             joined current
+                             (into #{} (remove #(= (get joined %) (get roots %)))
+                                   (keys joined))
+                             opts))))))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
@@ -301,5 +301,5 @@
                        cur-branch (if (seq loaded)
                                     (or (some #{branch} (keys loaded)) (first (keys loaded)))
                                     branch)]
-                   (->DurableGSet id kv-store store-config storage comparator
-                                  roots cur-branch #{} opts))))))
+                   (->GSet id kv-store store-config storage comparator
+                           roots cur-branch #{} opts))))))

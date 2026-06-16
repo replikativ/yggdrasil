@@ -35,14 +35,14 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->DurableCDVCS flush! cdvcs)
+(declare ->CDVCS flush! cdvcs)
 
 (def ^:private state-cell :cdvcs/state)
 (defn- sk [opts] (:state-key opts state-cell))
 
 (defn- state-of
   "The convergent state map of `x` — `x` itself if it is a bare state map (has
-   `:commit-graph`), else `(:state x)` for a DurableCDVCS record. Avoids an
+   `:commit-graph`), else `(:state x)` for a CDVCS record. Avoids an
    `instance?` against the not-yet-defined record class in the verbs below."
   [x]
   (if (:commit-graph x) x (:state x)))
@@ -88,8 +88,8 @@
   (async+sync (:sync? (:opts cd))
               (async
                (await (persist-commits! (:kv-store cd) commits (:opts cd)))
-               (->DurableCDVCS (:id cd) (:kv-store cd) (:store-config cd)
-                               state true (:opts cd)))))
+               (->CDVCS (:id cd) (:kv-store cd) (:store-config cd)
+                        state true (:opts cd)))))
 
 (defn commit
   "Commit `transactions` onto a single-head CDVCS (throws on multiple heads).
@@ -98,7 +98,7 @@
   (with-step cd (core/commit (:state cd) author transactions)))
 
 (defn merge
-  "Reconcile this CDVCS with `remote` (another DurableCDVCS or a bare state map),
+  "Reconcile this CDVCS with `remote` (another CDVCS or a bare state map),
    or its OWN multiple heads (pass it itself): join the graphs + record a merge
    commit. Returns a NEW single-head record. (async+sync)"
   ([cd author remote] (merge cd author remote []))
@@ -155,7 +155,7 @@
 ;; Record
 ;; ============================================================
 
-(defrecord DurableCDVCS
+(defrecord CDVCS
            [id kv-store store-config
             state     ; {:commit-graph :heads :version} — the convergent value
             dirty     ; unsaved state cell?
@@ -214,7 +214,7 @@
                    (if (= joined state)
                      this   ; idempotent no-op
                      (do (await (save-state! kv-store joined opts))
-                         (->DurableCDVCS id kv-store store-config joined false opts)))))))
+                         (->CDVCS id kv-store store-config joined false opts)))))))
   (-conflict-free? [_] false)   ; CDVCS LIFTS conflict into the head set
 
   p/GarbageCollectable
@@ -261,7 +261,7 @@
 (defn cdvcs
   "Open (or create) a durable CDVCS. Loads the state cell if present; otherwise
    seeds a fresh single-base-commit CDVCS for `:author` and persists it. Returns
-   (async+sync) a DurableCDVCS.
+   (async+sync) a CDVCS.
 
    opts: :store-config (konserve cfg) | :kv-store (pre-opened, for a shared store),
          :author, :sync? (default true), :state-key (cell key, default :cdvcs/state)."
@@ -272,8 +272,8 @@
                  (let [{:keys [kv-store store-config]} (await (d/open (:store-config opts) opts))
                        existing (await (kb/k-get kv-store (sk opts) opts))]
                    (if existing
-                     (->DurableCDVCS id kv-store store-config existing false opts)
+                     (->CDVCS id kv-store store-config existing false opts)
                      (let [{:keys [state commits]} (core/new-cdvcs author)]
                        (await (persist-commits! kv-store commits opts))
                        (await (save-state! kv-store state opts))
-                       (->DurableCDVCS id kv-store store-config state false opts))))))))
+                       (->CDVCS id kv-store store-config state false opts))))))))

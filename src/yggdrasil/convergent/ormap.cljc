@@ -41,10 +41,7 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->DurableORMap flush! apply-delta)
-
-(def ^:private adds-branch :adds)
-(def ^:private removals-branch :removals)
+(declare ->ORMap flush! apply-delta)
 
 ;; The sort prefix (hk) and uid are stored as STRINGS, not uuids: default `compare`
 ;; then orders them LEXICALLY — identical on JVM and cljs. (uuid OBJECTS compare by
@@ -96,7 +93,7 @@
 ;; Record
 ;; ============================================================
 
-(defrecord DurableORMap
+(defrecord ORMap
            [id kv-store store-config storage comparator merge-fn
             adds        ; immutable PSS set of [hk uid k v]
             removals    ; immutable PSS set of [hk uid k v]
@@ -110,22 +107,16 @@
                      :garbage-collectable true :overlayable true :graphable false})
 
   p/Snapshotable
-  (snapshot-id [_]
-    (async+sync (:sync? opts)
-                (async
-                 (let [a (await (d/store-set! adds storage opts))
-                       r (await (d/store-set! removals storage opts))]
-                   (str (await (d/store-commit! kv-store {:adds a :removals r} opts)))))))
+  ;; shared two-half snapshot; `as-of` projects the FROZEN map {k value-or-set}.
+  (snapshot-id [this] (d/two-half-snapshot-id this opts))
   (parent-ids [_] #{})
   (as-of [this snap-id] (p/as-of this snap-id nil))
-  (as-of [_ snap-id _opts]
+  (as-of [this snap-id _opts]
     (async+sync (:sync? opts)
                 (async
-                 (let [commit (await (d/read-commit kv-store (parse-uuid (str snap-id)) opts))
-                       adds*  (await (d/set->clj (d/restore-set comparator (:adds commit) storage opts) opts))
-                       rems*  (await (d/set->clj (d/restore-set comparator (:removals commit) storage opts) opts))
+                 (let [[adds* rems*] (await (d/two-half-restore-halves this snap-id opts))
                        rm-uids (into #{} (map #(nth % 1)) rems*)
-                       live   (remove (fn [t] (rm-uids (nth t 1))) adds*)]
+                       live    (remove (fn [t] (rm-uids (nth t 1))) adds*)]
                    (reduce (fn [m [_hk _uid k v]]
                              (if merge-fn (update m k merge-fn v) (update m k (fnil conj #{}) v)))
                            {} live)))))
@@ -149,15 +140,7 @@
   (commit! [this _message _opts] (flush! this))
 
   c/PConvergent
-  (-join [this other]
-    (async+sync (:sync? opts)
-                (async
-                 (let [adds' (await (d/set-union adds (:adds other) comparator opts))
-                       rems' (await (d/set-union removals (:removals other) comparator opts))]
-                   (if (and (= adds' adds) (= rems' removals))
-                     this
-                     (->DurableORMap id kv-store store-config storage comparator merge-fn
-                                     adds' rems' true opts))))))
+  (-join [this other] (d/two-half-join this other opts))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
@@ -167,19 +150,7 @@
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids gc-opts]
-    (async+sync (:sync? opts)
-                (async
-                 (await (flush! this))
-                 (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
-                       retain-roots (loop [cs (seq commit-addrs) acc []]
-                                      (if cs
-                                        (let [c (await (d/read-commit kv-store (first cs) opts))]
-                                          (recur (next cs) (clojure.core/conj acc (:adds c) (:removals c))))
-                                        acc))]
-                   (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                                 (merge gc-opts opts {:retain-roots retain-roots
-                                                      :retain-keys commit-addrs})))))))
+  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids gc-opts opts))
 
   p/Overlayable
   (overlay [this opts]
@@ -258,36 +229,14 @@
 ;; ============================================================
 
 (defn flush!
-  "Persist both halves, update :crdt/roots + freed. NEW o, dirty cleared. (async+sync)"
-  ([o] (flush! o (:opts o)))
-  ([o opts]
-   (async+sync (:sync? opts)
-               (async
-                (if (:dirty o)
-                  (let [storage       (:storage o)
-                        adds-root     (await (d/store-set! (:adds o) storage opts))
-                        removals-root (await (d/store-set! (:removals o) storage opts))]
-                    (await (d/save-roots! (:kv-store o)
-                                          {adds-branch adds-root removals-branch removals-root} opts))
-                    (await (d/save-freed! (:kv-store o) storage opts))
-                    (clojure.core/assoc o :dirty false))
-                  o)))))
+  "Persist both halves + :crdt/roots + freed; clear `dirty`. (async+sync)"
+  ([o] (d/two-half-flush! o (:opts o)))
+  ([o opts] (d/two-half-flush! o opts)))
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's nodes into this store and union both halves.
    Returns a NEW o. (async+sync)"
-  [o other]
-  (let [opts (:opts o) cmp (:comparator o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [ostorage (:storage other)
-                       a-root (await (d/store-set! (:adds other) ostorage opts))
-                       r-root (await (d/store-set! (:removals other) ostorage opts))]
-                   (await (d/ship! (:kv-store other) (:kv-store o) a-root opts))
-                   (await (d/ship! (:kv-store other) (:kv-store o) r-root opts))
-                   (let [adds' (await (d/set-union (:adds o) (d/restore-set cmp a-root (:storage o) opts) cmp opts))
-                         rems' (await (d/set-union (:removals o) (d/restore-set cmp r-root (:storage o) opts) cmp opts))]
-                     (clojure.core/assoc o :adds adds' :removals rems' :dirty true)))))))
+  [o other] (d/two-half-merge-peer! o other (:opts o)))
 
 (defn gc!
   ([o] (p/gc-sweep! o nil nil))
@@ -300,22 +249,14 @@
 (defn- open-ormap
   [id merge-fn {:keys [store-config comparator sync? kv-store roots-key freed-key]
                 :or {comparator compare sync? true}}]
-  (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))
-        freed-key (or freed-key (when (vector? roots-key) (clojure.core/assoc roots-key 0 :crdt/freed)))
-        opts (cond-> {:sync? sync?}
-               kv-store  (clojure.core/assoc :kv-store kv-store)
-               roots-key (clojure.core/assoc :roots-key roots-key)
-               freed-key (clojure.core/assoc :freed-key freed-key))]
-    (async+sync sync?
-                (async
-                 (let [{:keys [kv-store storage]} (await (d/open store-config opts))
-                       roots   (await (d/load-roots kv-store opts))
-                       restore (fn [branch] (if-let [root (clojure.core/get roots branch)]
-                                              (d/restore-set comparator root storage opts)
-                                              (d/empty-set storage comparator)))]
-                   (->DurableORMap id kv-store store-config storage comparator (wrap merge-fn)
-                                   (restore adds-branch) (restore removals-branch)
-                                   false opts))))))
+  (async+sync sync?
+              (async
+               (let [{:keys [kv-store storage store-config opts adds removals]}
+                     (await (d/two-half-open store-config
+                                             {:comparator comparator :sync? sync? :kv-store kv-store
+                                              :roots-key roots-key :freed-key freed-key}))]
+                 (->ORMap id kv-store store-config storage comparator (wrap merge-fn)
+                          adds removals false opts)))))
 
 (defn ormap
   "Open (or create) a durable OR-Map (multi-value: `get` returns the live value-set)."

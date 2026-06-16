@@ -41,17 +41,14 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->DurableORSet flush! apply-delta)
+(declare ->ORSet flush! apply-delta)
 
 (defn- half-accrue
   "Accrue δ half-maps {:adds #{[e tag]..} :removals #{[e tag]..}} by union."
   [a b]
   (merge-with into a b))
 
-(def ^:private adds-branch :adds)
-(def ^:private removals-branch :removals)
-
-(defrecord DurableORSet
+(defrecord ORSet
            [id kv-store store-config storage comparator tag-fn
             adds        ; immutable PSS set of [element tag]
             removals    ; immutable PSS set of [element tag]
@@ -69,26 +66,17 @@
                      :graphable false})
 
   p/Snapshotable
-  ;; addressable snapshot = a content-addressed COMMIT object {:adds :removals}
-  ;; over the two halves' PSS roots (re-openable via `as-of`, the freeze handle).
-  (snapshot-id [_]
-    (async+sync (:sync? opts)
-                (async
-                 (let [adds-root (await (d/store-set! adds storage opts))
-                       rem-root  (await (d/store-set! removals storage opts))]
-                   (str (await (d/store-commit! kv-store {:adds adds-root :removals rem-root} opts)))))))
+  ;; addressable snapshot = a content-addressed COMMIT {:adds :removals} over the
+  ;; two halves' roots (shared two-half machinery); `as-of` projects the FROZEN
+  ;; live elements (add-wins: adds − removals, by first).
+  (snapshot-id [this] (d/two-half-snapshot-id this opts))
   (parent-ids [_] #{})
   (as-of [this snap-id] (p/as-of this snap-id nil))
-  (as-of [_ snap-id _opts]
-    ;; restore the FIXED live elements (add-wins: adds − removals, by first) at
-    ;; that commit, not the current state.
+  (as-of [this snap-id _opts]
     (async+sync (:sync? opts)
                 (async
-                 (let [commit (await (d/read-commit kv-store (parse-uuid (str snap-id)) opts))]
-                   (into #{} (map first)
-                         (set/difference
-                          (await (d/set->clj (d/restore-set comparator (:adds commit) storage opts) opts))
-                          (await (d/set->clj (d/restore-set comparator (:removals commit) storage opts) opts))))))))
+                 (let [[a r] (await (d/two-half-restore-halves this snap-id opts))]
+                   (into #{} (map first) (set/difference a r))))))
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
   p/Branchable
@@ -114,17 +102,8 @@
   (commit! [this _message _opts] (flush! this))
 
   c/PConvergent
-  ;; PURE same-store join: union both grow-only halves with the peer. (async+sync)
-  (-join [this other]
-    (async+sync (:sync? opts)
-                (async
-                 (let [adds' (await (d/set-union adds (:adds other) comparator opts))
-                       rems' (await (d/set-union removals (:removals other) comparator opts))]
-                   ;; IDEMPOTENCE: a no-op join returns the receiver identical.
-                   (if (and (= adds' adds) (= rems' removals))
-                     this
-                     (->DurableORSet id kv-store store-config storage comparator tag-fn
-                                     adds' rems' true opts))))))
+  ;; PURE same-store join: union both grow-only halves with the peer (shared). (async+sync)
+  (-join [this other] (d/two-half-join this other opts))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
@@ -134,23 +113,7 @@
   (gc-roots [this]
     (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids gc-opts]
-    (async+sync (:sync? opts)
-                (async
-                 (await (flush! this))
-                 ;; retain held snapshots: an OR-Set snapshot-id is a COMMIT addr
-                 ;; ({:adds r :removals r}); keep the commit object + both halves'
-                 ;; nodes so as-of/frozen on that id survives GC. The cutoff
-                 ;; (`:remove-before`/`:grace-period-ms`) rides in `gc-opts`.
-                 (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
-                       retain-roots (loop [cs (seq commit-addrs) acc []]
-                                      (if cs
-                                        (let [c (await (d/read-commit kv-store (first cs) opts))]
-                                          (recur (next cs) (clojure.core/conj acc (:adds c) (:removals c))))
-                                        acc))]
-                   (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
-                                 (merge gc-opts opts {:retain-roots retain-roots
-                                                      :retain-keys commit-addrs})))))))
+  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids gc-opts opts))
 
   p/Overlayable
   ;; :frozen → carry BOTH halves (immutable PSS values; isolated by value).
@@ -236,37 +199,14 @@
 ;; ============================================================
 
 (defn flush!
-  "Persist both halves, update the :crdt/roots cell ({:adds :removals}) + freed.
-   Returns a NEW o with `dirty` cleared (callers must ADOPT it). (async+sync)"
-  ([o] (flush! o (:opts o)))
-  ([o opts]
-   (async+sync (:sync? opts)
-               (async
-                (if (:dirty o)
-                  (let [storage       (:storage o)
-                        adds-root     (await (d/store-set! (:adds o) storage opts))
-                        removals-root (await (d/store-set! (:removals o) storage opts))]
-                    (await (d/save-roots! (:kv-store o)
-                                          {adds-branch adds-root removals-branch removals-root} opts))
-                    (await (d/save-freed! (:kv-store o) storage opts))
-                    (assoc o :dirty false))
-                  o)))))
+  "Persist both halves + the :crdt/roots cell + freed; clear `dirty`. (async+sync)"
+  ([o] (d/two-half-flush! o (:opts o)))
+  ([o opts] (d/two-half-flush! o opts)))
 
 (defn merge-peer!
-  "Cross-store -join: ship the peer's adds+removals nodes into this store and
-   union both halves. Returns a NEW o. (async+sync)"
-  [o other]
-  (let [opts (:opts o) cmp (:comparator o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [ostorage (:storage other)
-                       a-root (await (d/store-set! (:adds other) ostorage opts))
-                       r-root (await (d/store-set! (:removals other) ostorage opts))]
-                   (await (d/ship! (:kv-store other) (:kv-store o) a-root opts))
-                   (await (d/ship! (:kv-store other) (:kv-store o) r-root opts))
-                   (let [adds' (await (d/set-union (:adds o) (d/restore-set cmp a-root (:storage o) opts) cmp opts))
-                         rems' (await (d/set-union (:removals o) (d/restore-set cmp r-root (:storage o) opts) cmp opts))]
-                     (assoc o :adds adds' :removals rems' :dirty true)))))))
+  "Cross-store -join: ship the peer's nodes into this store and union both halves.
+   Returns a NEW o. (async+sync)"
+  [o other] (d/two-half-merge-peer! o other (:opts o)))
 
 (defn gc!
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
@@ -286,22 +226,12 @@
    :tag-fn  element -> tag (default: ignore element, fresh random-uuid → true
             OR-Set). Pass a content-hash fn for idempotent add (registry shape).
    Restores both halves from the store's :crdt/roots cell when present."
-  [id & {:keys [store-config comparator tag-fn sync? kv-store roots-key freed-key]
+  [id & {:keys [comparator tag-fn sync? store-config kv-store roots-key freed-key]
          :or {comparator compare tag-fn (fn [_] (random-uuid)) sync? true}}]
-  (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))
-        freed-key (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
-        opts (cond-> {:sync? sync?}
-               kv-store  (assoc :kv-store kv-store)
-               roots-key (assoc :roots-key roots-key)
-               freed-key (assoc :freed-key freed-key))]
-    (async+sync sync?
-                (async
-                 (let [{:keys [kv-store storage]} (await (d/open store-config opts))
-                       roots (await (d/load-roots kv-store opts))
-                       restore (fn [branch] (if-let [root (get roots branch)]
-                                              (d/restore-set comparator root storage opts)
-                                              (d/empty-set storage comparator)))]
-                   (->DurableORSet id kv-store store-config storage comparator tag-fn
-                                   (restore adds-branch)
-                                   (restore removals-branch)
-                                   false opts))))))
+  (async+sync sync?
+              (async
+               (let [{:keys [kv-store storage store-config opts adds removals]}
+                     (await (d/two-half-open store-config
+                                             {:comparator comparator :sync? sync? :kv-store kv-store
+                                              :roots-key roots-key :freed-key freed-key}))]
+                 (->ORSet id kv-store store-config storage comparator tag-fn adds removals false opts)))))

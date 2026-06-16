@@ -144,6 +144,12 @@ A durable CRDT store holds:
 - **GC.** `gc-sweep!` is mark-and-sweep: reachable nodes from the live + retained
   snapshot roots are kept, the rest swept past a cutoff (`:remove-before` /
   `:grace-period-ms`; epoch default reclaims nothing — pass a window in production).
+- **Two joins — same-store vs cross-store.** `-join` (the `PConvergent` method) is the
+  *same-store* join: both replicas' values live in one konserve store, so it just
+  unions the halves. `merge-peer!` is the *cross-store* counterpart: it first `ship!`s
+  the peer's missing nodes into this store, then unions — use it when the two replicas
+  are backed by separate stores. Both yield the same converged value; pick by store
+  topology.
 - **Sync.** Distribution is konserve-sync: because nodes are content-addressed, a peer
   ships only the nodes the destination is missing. `merge-peer!` / `ship!` are the
   store-to-store primitives; no kabel, no op-log — the PSS *is* the sync granularity.

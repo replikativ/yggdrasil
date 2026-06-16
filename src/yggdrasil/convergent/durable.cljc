@@ -349,3 +349,121 @@
                                            (into acc (await (reachable-addresses kv-store (first rs) opts))))
                                     acc))]
                   (await (kb/await-chan (kgc/sweep! kv-store reachable before) opts)))))))
+
+;; ============================================================
+;; Two-half CRDT shared logic (OR-Set / 2P-Set / OR-Map)
+;; ============================================================
+;; Each is TWO grow-only PSS sets under `:crdt/roots {:adds :removals}`, add-wins,
+;; `set-union` join. The record carries `[… storage comparator adds removals dirty
+;; opts]` (+ a per-type field: tag-fn / merge-fn / none); only the VALUE-OPS and the
+;; `as-of` projection differ. The persistence / join / snapshot / gc machinery is
+;; identical and lives here — records delegate, reconstructing via `assoc this`
+;; (which preserves their concrete type AND their extra field).
+
+(defn two-half-snapshot-id
+  "Content-addressed snapshot = a commit `{:adds <root> :removals <root>}`; returns
+   its address string. (async+sync)"
+  [{:keys [adds removals storage kv-store]} opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [a (await (store-set! adds storage opts))
+                     r (await (store-set! removals storage opts))]
+                 (str (await (store-commit! kv-store {:adds a :removals r} opts)))))))
+
+(defn two-half-restore-halves
+  "Restore + drain both halves of the commit at `snap-id` → `[adds-clj removals-clj]`.
+   The caller projects (live elements / value-set / map). (async+sync)"
+  [{:keys [kv-store comparator storage]} snap-id opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [commit (await (read-commit kv-store (parse-uuid (str snap-id)) opts))]
+                 [(await (set->clj (restore-set comparator (:adds commit) storage opts) opts))
+                  (await (set->clj (restore-set comparator (:removals commit) storage opts) opts))]))))
+
+(defn two-half-join
+  "Symmetric same-store join — union both grow-only halves with `other`. Returns the
+   receiver UNCHANGED on a no-op (idempotence — a signal holding it won't re-fire),
+   else `assoc`-s the new halves + `:dirty` (preserving the record's type/fields).
+   (async+sync)"
+  [{:keys [adds removals comparator] :as this} other opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [a' (await (set-union adds (:adds other) comparator opts))
+                     r' (await (set-union removals (:removals other) comparator opts))]
+                 (if (and (= a' adds) (= r' removals))
+                   this
+                   (assoc this :adds a' :removals r' :dirty true))))))
+
+(defn two-half-flush!
+  "Persist both halves, update `:crdt/roots {:adds :removals}` + freed; clear
+   `:dirty`. Returns the clean record (a no-op when not dirty). (async+sync)"
+  [{:keys [adds removals storage kv-store dirty] :as this} opts]
+  (async+sync (:sync? opts)
+              (async
+               (if dirty
+                 (let [a (await (store-set! adds storage opts))
+                       r (await (store-set! removals storage opts))]
+                   (await (save-roots! kv-store {:adds a :removals r} opts))
+                   (await (save-freed! kv-store storage opts))
+                   (assoc this :dirty false))
+                 this))))
+
+(defn two-half-merge-peer!
+  "Cross-store join — ship `other`'s nodes into this store, then union both halves.
+   Returns the new record. (async+sync)"
+  [{:keys [adds removals comparator storage kv-store] :as this} other opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [ostorage (:storage other)
+                     a-root   (await (store-set! (:adds other) ostorage opts))
+                     r-root   (await (store-set! (:removals other) ostorage opts))]
+                 (await (ship! (:kv-store other) kv-store a-root opts))
+                 (await (ship! (:kv-store other) kv-store r-root opts))
+                 (assoc this
+                        :adds (await (set-union adds (restore-set comparator a-root storage opts) comparator opts))
+                        :removals (await (set-union removals (restore-set comparator r-root storage opts) comparator opts))
+                        :dirty true)))))
+
+(defn two-half-gc-sweep!
+  "Flush, then mark-and-sweep nodes unreachable from the live roots — retaining the
+   commit objects (and both halves' nodes) named by `snapshot-ids` so a frozen
+   `as-of` survives. (async+sync)"
+  [{:keys [kv-store] :as this} snapshot-ids gc-opts opts]
+  (async+sync (:sync? opts)
+              (async
+               (await (two-half-flush! this opts))
+               (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
+                     retain-roots (loop [cs (seq commit-addrs) acc []]
+                                    (if cs
+                                      (let [c (await (read-commit kv-store (first cs) opts))]
+                                        (recur (next cs) (conj acc (:adds c) (:removals c))))
+                                      acc))]
+                 (await (gc! kv-store (vals (await (load-roots kv-store opts)))
+                             (merge gc-opts opts {:retain-roots retain-roots
+                                                  :retain-keys commit-addrs})))))))
+
+(defn two-half-open
+  "Open a two-half CRDT's store and restore both halves from `:crdt/roots`. Returns
+   `{:kv-store :storage :store-config :opts :adds :removals}`. `:store-config`
+   defaults to a fresh in-memory store. `factory-opts` may carry
+   `:comparator`/`:sync?`/`:kv-store`/`:roots-key`/`:freed-key`/`:key-encode`/
+   `:key-decode`. (async+sync)"
+  [store-config {:keys [comparator sync? kv-store roots-key freed-key key-encode key-decode]
+                 :or {comparator compare sync? true}}]
+  (let [store-config (or store-config (when-not kv-store (mem-store-config)))
+        freed-key    (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
+        opts (cond-> {:sync? sync?}
+               kv-store   (assoc :kv-store kv-store)
+               roots-key  (assoc :roots-key roots-key)
+               freed-key  (assoc :freed-key freed-key)
+               key-encode (assoc :key-encode key-encode)
+               key-decode (assoc :key-decode key-decode))]
+    (async+sync sync?
+                (async
+                 (let [{:keys [kv-store storage]} (await (open store-config opts))
+                       roots   (await (load-roots kv-store opts))
+                       restore (fn [b] (if-let [root (get roots b)]
+                                         (restore-set comparator root storage opts)
+                                         (empty-set storage comparator)))]
+                   {:kv-store kv-store :storage storage :store-config store-config :opts opts
+                    :adds (restore :adds) :removals (restore :removals)})))))
