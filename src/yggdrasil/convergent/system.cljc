@@ -21,9 +21,12 @@
 
 (declare ->ConflictFreeSystem apply-delta)
 
-(defrecord ConflictFreeSystem [id stype store current vjoin bottom]
-  ;; store : a plain {branch -> value} map, rebuilt copy-on-write by each mutator
-  ;; (never mutated in place).
+(defrecord ConflictFreeSystem [id stype store current vjoin bottom config]
+  ;; store  : a plain {branch -> value} map, rebuilt copy-on-write by each mutator
+  ;;          (never mutated in place).
+  ;; config : optional per-CRDT config map carried with the instance (survives
+  ;;          -join), e.g. the MergingORMap merge-fn that reads/joins need. nil for
+  ;;          the config-less CRDTs (G-Set/LWWR/OR-Map).
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] stype)
@@ -67,17 +70,18 @@
     (let [joined (merge-with vjoin store (:store other))]
       (if (= joined store)
         this
-        (->ConflictFreeSystem id stype joined current vjoin bottom))))
+        (->ConflictFreeSystem id stype joined current vjoin bottom config))))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
   (-apply-delta [this delta] (apply-delta this delta)))
 
 (defn conflict-free-system
-  "Construct a conflict-free system. `vjoin`/`bottom` define the CRDT."
-  [id stype & {:keys [branch init vjoin bottom] :or {branch :main}}]
+  "Construct a conflict-free system. `vjoin`/`bottom` define the CRDT; optional
+   `config` is a per-CRDT config map carried with the instance (survives -join)."
+  [id stype & {:keys [branch init vjoin bottom config] :or {branch :main}}]
   (->ConflictFreeSystem id stype {branch (if (nil? init) bottom init)}
-                        branch vjoin bottom))
+                        branch vjoin bottom config))
 
 ;; value-level accessors (operate on the current branch's value)
 (defn cur "Current branch's value." [s] (get (:store s) (:current s) (:bottom s)))

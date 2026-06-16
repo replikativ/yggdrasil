@@ -105,7 +105,25 @@ is a DVCS, so it keeps **git-like verbs**, which are idiomatic for it:
 (explicit, author-driven, resolves heads) are the two distinct operations — this
 is the entire point of the datatype.
 
-## Difficulty & sequencing — MEDIUM
+## Status — DONE (steps 1–4), MergingORMap optional
+
+All four steps landed and are green on JVM **and** cljs/node:
+- `cdvcs.graph` + `cdvcs.core` (pure) — commit `9ae8018`.
+- `yggdrasil.convergent.cdvcs` durable system + cross-store spike — commit `81f490f`.
+- Suite: JVM convergent 129/451, cljs node 68/243, 0 failures.
+
+Implemented exactly as designed below: content-addressed commit blobs, the
+convergent state cell written via `downstream` (so a shared-store peer joins, never
+LWW-clobbers), `-join`≡downstream / `-conflict-free? false`, content-hash
+`snapshot-id`/`as-of`, key-spared GC, git-like verbs, and `ship!` (copy missing
+blobs by id — konserve-sync transport, no kabel). The cross-store spike proves
+`-join` converges on metadata ALONE (strong eventual consistency), with `ship!`
+making full history readable on both peers afterward.
+
+Remaining optional: **MergingORMap**; and L4/L5 (spindel signal + dvergr/simmis
+adoption) when a consumer needs it.
+
+## Difficulty & sequencing — MEDIUM (as built)
 
 1. **`cdvcs.graph` (pure)** — port `meta.cljc` + `commit-history` verbatim to
    `.cljc`; portable test: `downstream` is commutative/associative/idempotent;
