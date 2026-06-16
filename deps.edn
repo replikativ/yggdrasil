@@ -4,7 +4,7 @@
         cheshire/cheshire {:mvn/version "5.11.0"}
         org.replikativ/konserve {:mvn/version "0.9.345"}
         org.replikativ/persistent-sorted-set {:mvn/version "0.4.122"}
-        is.simm/partial-cps {:mvn/version "0.1.57"}
+        is.simm/partial-cps {:mvn/version "0.1.58"}
         org.clojure/core.async {:mvn/version "1.6.681"}}
 
  :aliases
