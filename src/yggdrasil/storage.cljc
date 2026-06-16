@@ -113,42 +113,42 @@
              (if (> (count (:kv c)) cache-limit)
                (let [[lo k] (first (:gen->key c))]         ; lowest gen = oldest-inserted
                  (-> c (update :kv dissoc k)
-                       (update :gen->key dissoc lo)
-                       (update :key->gen dissoc k)))
+                     (update :gen->key dissoc lo)
+                     (update :key->gen dissoc k)))
                c)))))
 
 (defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode content-addressed?]
   IStorage
   #?@(:clj
       [(store [_ node]
-         (let [^ANode node node
-               node-data {:level     (.level node)
-                          :keys      (mapv key-encode (.keys node))
-                          :addresses (when (instance? Branch node)
-                                       (vec (.addresses ^Branch node)))}
+              (let [^ANode node node
+                    node-data {:level     (.level node)
+                               :keys      (mapv key-encode (.keys node))
+                               :addresses (when (instance? Branch node)
+                                            (vec (.addresses ^Branch node)))}
                ;; content-addressed: the address IS the hasch UUID of the node
                ;; content. Branch content includes child addresses (themselves
                ;; content hashes) ⇒ a Merkle tree: identical subtrees share an
                ;; address, so successive versions ship incrementally and peers
                ;; dedup. Else a random UUID (registry default — unchanged).
-               address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
-           (kb/k-assoc kv-store address node-data {:sync? true})
-           (cache-put! cache address node)
-           address))
+                    address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
+                (kb/k-assoc kv-store address node-data {:sync? true})
+                (cache-put! cache address node)
+                address))
 
        (restore [_ address]
-         (or (cache-lookup cache address)
-             (let [node-data (kb/k-get kv-store address {:sync? true})
-                   keys (mapv key-decode (:keys node-data))
-                   addresses (:addresses node-data)
-                   node (if addresses
-                          (Branch. (int (:level node-data))
-                                   ^java.util.List keys
-                                   ^java.util.List (vec addresses)
-                                   settings)
-                          (Leaf. ^java.util.List keys settings))]
-               (cache-put! cache address node)
-               node)))
+                (or (cache-lookup cache address)
+                    (let [node-data (kb/k-get kv-store address {:sync? true})
+                          keys (mapv key-decode (:keys node-data))
+                          addresses (:addresses node-data)
+                          node (if addresses
+                                 (Branch. (int (:level node-data))
+                                          ^java.util.List keys
+                                          ^java.util.List (vec addresses)
+                                          settings)
+                                 (Leaf. ^java.util.List keys settings))]
+                      (cache-put! cache address node)
+                      node)))
 
        (accessed [_ _address] nil)
        (markFreed [_ address] (when address (swap! freed-atom assoc address (t/now-ms))))
@@ -157,21 +157,21 @@
 
       :cljs
       [(store [_ node opts]
-         (async+sync (:sync? opts)
-                     (async
-                      (let [node-data {:level     (node/level node)
-                                       :keys      (mapv key-encode (.-keys node))
-                                       :addresses (when (instance? Branch node)
-                                                    (vec (.-addresses node)))}
-                            address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
-                        (await (kb/k-assoc kv-store address node-data opts))
-                        (cache-put! cache address node)
-                        address))))
+              (async+sync (:sync? opts)
+                          (async
+                           (let [node-data {:level     (node/level node)
+                                            :keys      (mapv key-encode (.-keys node))
+                                            :addresses (when (instance? Branch node)
+                                                         (vec (.-addresses node)))}
+                                 address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
+                             (await (kb/k-assoc kv-store address node-data opts))
+                             (cache-put! cache address node)
+                             address))))
 
        (restore [_ address opts]
-         (async+sync (:sync? opts)
-                     (async
-                      (or (cache-lookup cache address)
+                (async+sync (:sync? opts)
+                            (async
+                             (or (cache-lookup cache address)
                           ;; PSS cljs nodes hold their `keys`/`addresses` as JS
                           ;; ARRAYS (`.slice`/`aget`/`aconcat` are used on them).
                           ;; konserve round-trips them as Clojure vectors, so the
@@ -181,15 +181,15 @@
                           ;; cache-HIT path returns the original PSS node, so this
                           ;; only bites a true cache miss: ship-to-fresh-store or
                           ;; reopen — caught by the cross-peer/merge-peer! tests.)
-                          (let [node-data (await (kb/k-get kv-store address opts))
-                                node (if (:addresses node-data)
-                                       (branch/from-map (assoc node-data
-                                                               :keys (to-array (mapv key-decode (:keys node-data)))
-                                                               :addresses (to-array (:addresses node-data))
-                                                               :settings settings))
-                                       (Leaf. (to-array (mapv key-decode (:keys node-data))) settings (:measure node-data)))]
-                            (cache-put! cache address node)
-                            node)))))
+                                 (let [node-data (await (kb/k-get kv-store address opts))
+                                       node (if (:addresses node-data)
+                                              (branch/from-map (assoc node-data
+                                                                      :keys (to-array (mapv key-decode (:keys node-data)))
+                                                                      :addresses (to-array (:addresses node-data))
+                                                                      :settings settings))
+                                              (Leaf. (to-array (mapv key-decode (:keys node-data))) settings (:measure node-data)))]
+                                   (cache-put! cache address node)
+                                   node)))))
 
        (accessed [_ _address] nil)
        (delete [_ _addresses] nil)

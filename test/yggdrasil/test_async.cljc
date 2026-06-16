@@ -91,16 +91,16 @@
   (if (cljs-env? &env)
     `(cljs.test/deftest ~tname
        (cljs.test/async done#
-         ((is.simm.partial-cps.async/async
-            (try ~@body
-                 (catch :default e#
-                   (cljs.test/is false (str "deftest-async threw: "
-                                            (or (.-message e#) e#) "\n"
-                                            (.-stack e#))))))
-          (fn [_#] (done#))
-          (fn [e#]
-            (cljs.test/is false (str "deftest-async rejected: "
-                                     (or (.-message e#) e#) "\n"
-                                     (when (and e# (.-stack e#)) (.-stack e#))))
-            (done#)))))
+                        ((is.simm.partial-cps.async/async
+                          (try ~@body
+                               (catch :default e#
+                                 (cljs.test/is false (str "deftest-async threw: "
+                                                          (or (.-message e#) e#) "\n"
+                                                          (.-stack e#))))))
+                         (fn [_#] (done#))
+                         (fn [e#]
+                           (cljs.test/is false (str "deftest-async rejected: "
+                                                    (or (.-message e#) e#) "\n"
+                                                    (when (and e# (.-stack e#)) (.-stack e#))))
+                           (done#)))))
     `(clojure.test/deftest ~tname ~@body)))

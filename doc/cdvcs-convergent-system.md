@@ -1,7 +1,7 @@
 # CDVCS as a durable convergent yggdrasil system
 
-Status: design (task #132). Porting replikativ's CDVCS (Confree Distributed
-Version Control System) into yggdrasil's convergent catalog.
+CDVCS (Confree Distributed Version Control System) is a versioned, multi-head
+convergent datatype ported from replikativ into yggdrasil's convergent catalog.
 
 ## Why CDVCS belongs here
 
@@ -105,49 +105,30 @@ is a DVCS, so it keeps **git-like verbs**, which are idiomatic for it:
 (explicit, author-driven, resolves heads) are the two distinct operations — this
 is the entire point of the datatype.
 
-## Status — DONE (steps 1–4), MergingORMap optional
+## Implementation
 
-All four steps landed and are green on JVM **and** cljs/node:
-- `cdvcs.graph` + `cdvcs.core` (pure) — commit `9ae8018`.
-- `yggdrasil.convergent.cdvcs` durable system + cross-store spike — commit `81f490f`.
-- Suite: JVM convergent 129/451, cljs node 68/243, 0 failures.
+The datatype is split into a pure core and a durable wrapping:
 
-Implemented exactly as designed below: content-addressed commit blobs, the
-convergent state cell written via `downstream` (so a shared-store peer joins, never
-LWW-clobbers), `-join`≡downstream / `-conflict-free? false`, content-hash
-`snapshot-id`/`as-of`, key-spared GC, git-like verbs, and `ship!` (copy missing
-blobs by id — konserve-sync transport, no kabel). The cross-store spike proves
-`-join` converges on metadata ALONE (strong eventual consistency), with `ship!`
-making full history readable on both peers afterward.
+- **`yggdrasil.convergent.cdvcs.graph`** — the pure commit-graph algebra
+  (`lowest-common-ancestors`, `remove-ancestors`, `downstream`, `commit-history`),
+  ported from replikativ's `crdt.cdvcs.meta`. No store, no async, no clock.
+- **`yggdrasil.convergent.cdvcs.core`** — the pure value verbs (`new-cdvcs`,
+  `commit`, `merge`, `pull`, `fork`) over hasch (commit ids) + `yggdrasil.types`
+  (HLC timestamps). No kabel, no core.async — replikativ's op-log/missing-commits
+  machinery is replaced by content-addressing + konserve-sync.
+- **`yggdrasil.convergent.cdvcs`** — the durable system: a record implementing
+  `PConvergent` (`-join` ≡ `downstream`, `-conflict-free?` `false`), `Snapshotable`
+  (snapshot-id = content hash of the state; `as-of` restores the frozen state),
+  and `GarbageCollectable`, all through `async+sync` (cross-platform). The commit
+  graph + heads live in a root cell written *convergently* via `downstream` (a
+  shared-store peer joins rather than LWW-clobbers); commit blobs are content-
+  addressed by id. `ship!` copies a peer's missing blobs (the commit ids are the
+  addresses — konserve-sync transport).
 
-Remaining optional: **MergingORMap**; and L4/L5 (spindel signal + dvergr/simmis
-adoption) when a consumer needs it.
+`-join` converges on the metadata graph alone (strong eventual consistency); the
+commit blobs are needed only to *realize* a head's value, and `ship!` brings them
+across after a join. Realization (linearize via `commit-history`, reduce with an
+app-supplied eval-fn) is left to the consumer.
 
-## Difficulty & sequencing — MEDIUM (as built)
-
-1. **`cdvcs.graph` (pure)** — port `meta.cljc` + `commit-history` verbatim to
-   `.cljc`; portable test: `downstream` is commutative/associative/idempotent;
-   LCA on hand-built graphs; head recomputation. *No store, no async — fast,
-   decisive.* ← the proven heart.
-2. **`cdvcs` value verbs** — port `core.cljc` (`new-cdvcs`/`commit`/`merge`/
-   `pull`/`fork`) over hasch + `types/*now-fn*`; portable test: linear history,
-   divergence → 2 heads, `merge` → single head with a merge commit, `pull`
-   fast-forward + the conflict guard.
-3. **Durable wrapping** — a record implementing `PConvergent` (`-join`=downstream),
-   `Snapshotable` (snapshot-id = content hash of the graph; `as-of` restores a
-   frozen graph), `Branchable`/`Overlayable` (native — it is a DAG), storing the
-   commit-graph in the root cell and commit blobs content-addressed, all through
-   `async+sync` (cross-platform like the durable sets). GC: retain commits
-   reachable from retained snapshot heads (same retain-roots pattern as 2P-Set).
-4. **Decisive cross-peer spike** — two peers commit concurrently into separate
-   stores, `ship!`/konserve-sync the blobs, `-join` the graphs → both converge to
-   the same 2-head value; `merge` on one → single head; verify on JVM **and**
-   cljs/node (the portable-harness pattern that caught the to-array/adopt bugs).
-
-Optional alongside: **MergingORMap** (replikativ's pluggable per-key merge) — a
-small additive catalog member, independent of CDVCS.
-
-The pure graph core (steps 1–2) is the proven, portable heart and ports almost
-verbatim; the integration (step 3) follows the now-cross-platform durable-CRDT
-pattern; step 4 is the same decisive-spike discipline as the rest of the catalog.
-No kabel, no core.async — `async+sync` + konserve-sync throughout.
+**MergingORMap** — replikativ's pluggable per-key merge — is a small, independent
+catalog member; see `yggdrasil.convergent.ormap`.

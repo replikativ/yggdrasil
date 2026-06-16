@@ -200,7 +200,7 @@
                                      (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
                                      r))]
                   (c/with-delta (assoc o :removals removals' :dirty true)
-                                half-accrue {:removals (set tombstones)}))))))
+                    half-accrue {:removals (set tombstones)}))))))
 
 (defn apply-delta
   "Consume a peer's OR-Set δ ({:adds #{[e tag]..} :removals #{[e tag]..}}) by

@@ -203,7 +203,7 @@
                  (let [entry [(hk k) (str (random-uuid)) k v]
                        s'    (await (d/set-conj (:adds o) entry (:comparator o) opts))]
                    (c/with-delta (clojure.core/assoc o :adds s' :dirty true)
-                                 half-accrue {:adds #{entry}}))))))
+                     half-accrue {:adds #{entry}}))))))
 
 (defn dissoc
   "Observed-remove `k`: tombstone exactly the entries currently live for it
@@ -218,7 +218,7 @@
                                       (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
                                       r))]
                    (c/with-delta (clojure.core/assoc o :removals removals' :dirty true)
-                                 half-accrue {:removals (set tombstones)}))))))
+                     half-accrue {:removals (set tombstones)}))))))
 
 (defn apply-delta
   "Consume a peer's δ ({:adds #{entries} :removals #{entries}}) — union each half

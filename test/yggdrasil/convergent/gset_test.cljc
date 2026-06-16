@@ -193,18 +193,18 @@
                is independently durable and restores only its own state"
        (let [sc {:backend :file :id (random-uuid) :path (tmpdir)}
              a (-> (g/gset "a" :store-config sc
-                                   :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"])
+                           :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"])
                    (g/conj :a1) (g/conj :a2))
              b (-> (g/gset "b" :kv-store (:kv-store a)
-                                   :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"])
+                           :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"])
                    (g/conj :b1))]
          (g/flush! a) (g/flush! b)
          (is (some? (k/get (:kv-store a) [:crdt/roots "a"] nil {:sync? true})))
          (is (some? (k/get (:kv-store a) [:crdt/roots "b"] nil {:sync? true})))
          (let [a' (g/gset "a" :store-config sc
-                                  :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"])
+                          :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"])
                b' (g/gset "b" :kv-store (:kv-store a')
-                                  :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"])]
+                          :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"])]
            (is (= #{:a1 :a2} (g/elements a')) "a restores only its own elements")
            (is (= #{:b1} (g/elements b')) "b restores only its own elements"))))))
 

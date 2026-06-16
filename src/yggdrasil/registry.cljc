@@ -198,10 +198,10 @@
                                            "{:store-config …} | {:ephemeral true}")
                                       {:opts opts})))
          tpset (d2p/twopset "registry"
-                                  :store-config store-config
-                                  :comparator tsbs-comparator
-                                  :key-encode store/entry->map
-                                  :key-decode store/map->entry)]
+                            :store-config store-config
+                            :comparator tsbs-comparator
+                            :key-encode store/entry->map
+                            :key-decode store/map->entry)]
      (->Registry (atom tpset) (:kv-store tpset) store-config))))
 
 (defn gc!

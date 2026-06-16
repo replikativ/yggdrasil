@@ -176,7 +176,7 @@
                        s'   (await (d/set-conj base x (:comparator g) opts))]
                    (c/with-delta (assoc g :roots (assoc (:roots g) cur s')
                                         :dirty (clojure.core/conj (:dirty g) cur))
-                                 set/union #{x}))))))
+                     set/union #{x}))))))
 
 (defn apply-delta
   "Consume a peer's G-Set δ — a set of added elements — by unioning it into the

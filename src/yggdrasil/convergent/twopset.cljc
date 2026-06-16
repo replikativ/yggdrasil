@@ -171,8 +171,8 @@
               (async
                (let [s' (await (d/set-conj (get s field) elem (:comparator s) opts))]
                  (c/with-delta (assoc s field s' :dirty true)
-                               half-accrue
-                               (if (= field :adds) {:adds #{elem}} {:removals #{elem}}))))))
+                   half-accrue
+                   (if (= field :adds) {:adds #{elem}} {:removals #{elem}}))))))
 
 (defn conj
   "Add `elem`. (async+sync) Returns a NEW s."
@@ -290,7 +290,7 @@
     (async+sync sync?
                 (async
                  (let [{:keys [kv-store storage]} (await (d/open store-config (assoc opts :key-encode key-encode
-                                                                                    :key-decode key-decode)))
+                                                                                     :key-decode key-decode)))
                        roots (await (d/load-roots kv-store opts))
                        restore (fn [branch] (if-let [root (get roots branch)]
                                               (d/restore-set comparator root storage opts)

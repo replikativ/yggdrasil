@@ -20,14 +20,14 @@
 
 (deftest pss-konserve-roundtrip
   (async done
-    (go
-      (let [store (<! (new-mem-store))
-            stg   (storage/create-storage store)
-            s     (into (pss/sorted-set-by compare) (range 64))
-            [tag address] (<! (realize (pss/store s stg {:sync? false})))]
-        (is (= :ok tag) "store returned an address via the async IStorage")
-        (let [restored        (pss/restore address stg {:sync? false})
-              [tag2 ok]       (<! (realize (pss/equiv-sequential? restored (range 64) {:sync? false})))]
-          (is (= :ok tag2) "restore + lazy traversal completed async")
-          (is (true? ok) "restored set equals the original 0..63 — round-trip through konserve"))
-        (done)))))
+         (go
+           (let [store (<! (new-mem-store))
+                 stg   (storage/create-storage store)
+                 s     (into (pss/sorted-set-by compare) (range 64))
+                 [tag address] (<! (realize (pss/store s stg {:sync? false})))]
+             (is (= :ok tag) "store returned an address via the async IStorage")
+             (let [restored        (pss/restore address stg {:sync? false})
+                   [tag2 ok]       (<! (realize (pss/equiv-sequential? restored (range 64) {:sync? false})))]
+               (is (= :ok tag2) "restore + lazy traversal completed async")
+               (is (true? ok) "restored set equals the original 0..63 — round-trip through konserve"))
+             (done)))))
