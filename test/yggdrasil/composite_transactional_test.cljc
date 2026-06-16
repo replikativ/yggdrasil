@@ -15,7 +15,7 @@
             [konserve.core :as k]
             [yggdrasil.protocols :as p]
             [yggdrasil.composite :as cmp]
-            [yggdrasil.convergent.durable-gset :as g]
+            [yggdrasil.convergent.gset :as g]
             #?(:cljs [is.simm.partial-cps.async])
             #?(:cljs [is.simm.partial-cps.runtime]))
   #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]]
@@ -23,7 +23,7 @@
 
 ;; an opener co-locating a durable G-Set in the composite's store under its own cell
 (defn- opener [id]
-  (fn [kv o] (g/durable-gset id :kv-store kv :roots-key [:crdt/roots id] :sync? (:sync? o))))
+  (fn [kv o] (g/gset id :kv-store kv :roots-key [:crdt/roots id] :sync? (:sync? o))))
 
 (defn- future-date []
   #?(:clj  (java.util.Date. (+ (System/currentTimeMillis) 1000))
@@ -32,20 +32,20 @@
 (deftest-async commit-flushes-all-subs-then-root
   (testing "sub-systems are durable only after the composite commits"
     (let [sc-a (file-cfg) sc-b (file-cfg) sc-comp (file-cfg)
-          a (<? (g/durable-gset "a" :store-config sc-a :sync? sync?))
+          a (<? (g/gset "a" :store-config sc-a :sync? sync?))
           a (<? (g/conj a :a1)) a (<? (g/conj a :a2))
-          b (<? (g/durable-gset "b" :store-config sc-b :sync? sync?))
+          b (<? (g/gset "b" :store-config sc-b :sync? sync?))
           b (<? (g/conj b :b1))
           comp (<? (cmp/composite [a b] :store-config sc-comp :sync? sync?))]
       ;; pre-commit: the sub edits are in-memory only — a fresh reopen sees nothing
-      (is (empty? (<? (g/elements (<? (g/durable-gset "a" :store-config sc-a :sync? sync?))))))
-      (is (empty? (<? (g/elements (<? (g/durable-gset "b" :store-config sc-b :sync? sync?))))))
+      (is (empty? (<? (g/elements (<? (g/gset "a" :store-config sc-a :sync? sync?))))))
+      (is (empty? (<? (g/elements (<? (g/gset "b" :store-config sc-b :sync? sync?))))))
       (let [committed (<? (p/commit! comp "snapshot-1"))
             sid       (<? (p/snapshot-id committed))]
         (is (some? sid))
         ;; post-commit: every sub is durable (reopen each store → merged state)
-        (is (= #{:a1 :a2} (<? (g/elements (<? (g/durable-gset "a" :store-config sc-a :sync? sync?))))))
-        (is (= #{:b1} (<? (g/elements (<? (g/durable-gset "b" :store-config sc-b :sync? sync?))))))
+        (is (= #{:a1 :a2} (<? (g/elements (<? (g/gset "a" :store-config sc-a :sync? sync?))))))
+        (is (= #{:b1} (<? (g/elements (<? (g/gset "b" :store-config sc-b :sync? sync?))))))
         (is (some? (<? (kb/k-get (:kv-store committed) :composite/root {:sync? sync?}))) ":composite/root advanced")
         (let [meta (p/snapshot-meta committed sid)]
           (is (= #{"a" "b"} (set (keys (:sub-snapshots meta))))
@@ -106,9 +106,9 @@
 
 (deftest-async merge-commits-transactionally
   (testing "composite merge! delegates to the transactional commit"
-    (let [a (<? (g/durable-gset "a" :store-config (file-cfg) :sync? sync?))
+    (let [a (<? (g/gset "a" :store-config (file-cfg) :sync? sync?))
           a (<? (g/conj a :x))
-          b (<? (g/durable-gset "b" :store-config (file-cfg) :sync? sync?))
+          b (<? (g/gset "b" :store-config (file-cfg) :sync? sync?))
           b (<? (g/conj b :y))
           comp (<? (cmp/composite [a b] :store-config (file-cfg) :sync? sync?))
           merged (<? (p/merge! comp :main {}))

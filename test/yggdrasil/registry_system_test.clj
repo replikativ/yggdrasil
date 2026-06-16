@@ -6,7 +6,7 @@
             [yggdrasil.types :as t]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
-            [yggdrasil.convergent.durable-2pset :as d2p]
+            [yggdrasil.convergent.twopset :as d2p]
             [yggdrasil.registry :as reg]))
 
 (defn- entry [snap sys branch phys]

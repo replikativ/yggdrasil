@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.durable-gset
+(ns yggdrasil.convergent.gset
   "Grow-only Set (G-Set) as a DURABLE conflict-free yggdrasil system.
 
    Same algebra as the in-memory `yggdrasil.convergent.gset` (value = a set,
@@ -274,12 +274,12 @@
 ;; Factory — cross-platform
 ;; ============================================================
 
-(defn durable-gset
+(defn gset
   "Open (or create) a durable G-Set on a per-system konserve store. (async+sync —
    pass `:sync? false` on cljs and `await`; the returned record then carries that
    mode, so all its ops are async too.)
 
-     (durable-gset \"kb\" :store-config {:backend :memory :id (random-uuid)})"
+     (gset \"kb\" :store-config {:backend :memory :id (random-uuid)})"
   [id & {:keys [store-config comparator branch sync? kv-store roots-key freed-key]
          :or {comparator compare branch :main sync? true}}]
   (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))

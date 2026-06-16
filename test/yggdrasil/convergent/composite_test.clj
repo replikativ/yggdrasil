@@ -6,7 +6,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.composite :as comp]
             [yggdrasil.convergent.composite]
-            [yggdrasil.convergent.durable-gset :as g]))
+            [yggdrasil.convergent.gset :as g]))
 
 ;; A minimal VERSIONED (non-convergent) system fixture: a register on a shared
 ;; store, Mergeable (merge! = take-theirs) but NOT PConvergent — so a composite
@@ -42,7 +42,7 @@
   "A workspace composite with G-Sets {id -> initial-elems}."
   [systems]
   (comp/composite (for [[id elems] systems]
-                    (reduce g/conj (g/durable-gset id) elems))
+                    (reduce g/conj (g/gset id) elems))
                   :name "ws"))
 
 (defn- kb [composite id]
@@ -81,9 +81,9 @@
             (the versioned branch = merge-to-parent!'s per-system logic, now in
             the composite). Versioned subs share a store (resolvable ancestor)."
     (let [cell-store (atom {:a "val-a" :b "val-b"})
-          ws-a (comp/composite [(reduce g/conj (g/durable-gset "kb") [:a1 :shared])
+          ws-a (comp/composite [(reduce g/conj (g/gset "kb") [:a1 :shared])
                                 (->VersionedCell "cfg" cell-store :a)] :name "ws")
-          ws-b (comp/composite [(reduce g/conj (g/durable-gset "kb") [:b1 :shared])
+          ws-b (comp/composite [(reduce g/conj (g/gset "kb") [:b1 :shared])
                                 (->VersionedCell "cfg" cell-store :b)] :name "ws")
           merged (c/-join ws-a ws-b)]
       (testing "CRDT sub joins (union)"

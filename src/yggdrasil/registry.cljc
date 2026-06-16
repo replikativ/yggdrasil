@@ -1,6 +1,6 @@
 (ns yggdrasil.registry
   "Cross-system snapshot registry — a query lens over a durable 2P-Set of
-   RegistryEntry (`yggdrasil.convergent.durable-2pset`).
+   RegistryEntry (`yggdrasil.convergent.twopset`).
 
    The registry is a conflict-free yggdrasil system: it grows and reconciles by
    union, but also needs convergent REMOVE (deregister a head, GC an old
@@ -21,7 +21,7 @@
    Queries full-scan the live set — fast enough at the expected scale."
   (:require [yggdrasil.types :as t]
             [yggdrasil.storage :as store]
-            [yggdrasil.convergent.durable-2pset :as d2p]))
+            [yggdrasil.convergent.twopset :as d2p]))
 
 ;; ============================================================
 ;; tsbs comparator
@@ -197,7 +197,7 @@
                                       (str "Registry requires an explicit persistence choice: "
                                            "{:store-config …} | {:ephemeral true}")
                                       {:opts opts})))
-         tpset (d2p/durable-2pset "registry"
+         tpset (d2p/twopset "registry"
                                   :store-config store-config
                                   :comparator tsbs-comparator
                                   :key-encode store/entry->map

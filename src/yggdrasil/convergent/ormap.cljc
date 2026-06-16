@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.durable-ormap
+(ns yggdrasil.convergent.ormap
   "Observed-Remove Map (OR-Map) — and its merging variant — as a DURABLE
    conflict-free yggdrasil system, on the SAME PSS+konserve substrate as the
    durable sets, READ ON THE FLY (datahike-style): the value is NEVER materialized
@@ -14,7 +14,7 @@
    slices `[hk MIN-UUID]…[hk MAX-UUID]` — O(log n + matches) nodes, then filters
    stored-`k = k` (hash-collision safety) and diffs the removals slice by uid.
 
-   So a durable OR-Map is structurally a `durable-orset` of entries (two halves
+   So a durable OR-Map is structurally a `orset` of entries (two halves
    `:adds`/`:removals` under `:crdt/roots`, add-wins, `set-union` join); the ONLY
    differences are the flattened entry + the SLICE-based per-key projection.
 
@@ -317,12 +317,12 @@
                                    (restore adds-branch) (restore removals-branch)
                                    false opts))))))
 
-(defn durable-ormap
+(defn ormap
   "Open (or create) a durable OR-Map (multi-value: `get` returns the live value-set)."
   [id & {:as opts}]
   (open-ormap id nil opts))
 
-(defn durable-merging-ormap
+(defn merging-ormap
   "Open (or create) a durable Merging-OR-Map: concurrent per-key values FOLD via
    `merge-fn` (commutative/associative/idempotent) to a single value on `get`."
   [id merge-fn & {:as opts}]

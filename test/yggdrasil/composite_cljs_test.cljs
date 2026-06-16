@@ -14,7 +14,7 @@
             ;; (extends CompositeSystem with PConvergent; logic proven on JVM by
             ;; composite-test). TODO: a cljs peer -join assertion (PARITY gap).
             [yggdrasil.convergent.composite]
-            [yggdrasil.convergent.durable-gset :as g]))
+            [yggdrasil.convergent.gset :as g]))
 
 (defn- realize [cps]
   (let [ch (a/promise-chan)]
@@ -26,7 +26,7 @@
    own [:crdt/roots id] cell."
   [id]
   (fn [kv o]
-    (g/durable-gset id :kv-store kv :roots-key [:crdt/roots id] :sync? (:sync? o))))
+    (g/gset id :kv-store kv :roots-key [:crdt/roots id] :sync? (:sync? o))))
 
 (deftest composite-async-transactional-end-to-end
   (async done

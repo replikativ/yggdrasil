@@ -15,14 +15,14 @@
 
    Usage (a portable `.cljc` test ns):
 
-       (ns yggdrasil.convergent.durable-gset-test
+       (ns yggdrasil.convergent.gset-test
          (:require [clojure.test :refer [is testing]]
                    [yggdrasil.test-async :refer [deftest-async <? sync? mem]]
-                   [yggdrasil.convergent.durable-gset :as g])
+                   [yggdrasil.convergent.gset :as g])
          #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]])))
 
        (deftest-async roundtrip
-         (let [g   (<? (g/durable-gset \"t\" :store-config (mem) :sync? sync?))
+         (let [g   (<? (g/gset \"t\" :store-config (mem) :sync? sync?))
                g   (<? (g/conj g :x))
                els (<? (g/elements g))]
            (is (= #{:x} els))))

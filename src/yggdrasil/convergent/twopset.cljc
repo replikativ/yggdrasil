@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.durable-2pset
+(ns yggdrasil.convergent.twopset
   "Two-Phase Set (2P-Set) as a DURABLE conflict-free yggdrasil system.
 
    TWO grow-only, content-addressed PSS sets of BARE elements —
@@ -7,7 +7,7 @@
    with live(e) ⇔ e ∈ adds ∧ e ∉ removals. Convergent add+remove where REMOVE
    is permanent: re-adding a removed element keeps it removed (the content-add
    re-enters `adds`, but it is also in `removals`). For re-add-after-remove use
-   the OR-Set (`durable-orset`).
+   the OR-Set (`orset`).
 
    Unlike the OR-Set this stores BARE elements (no `[elem tag]` pairs), so a
    key-level storage codec (`:key-encode`/`:key-decode` — e.g. the registry's
@@ -272,7 +272,7 @@
 ;; Factory
 ;; ============================================================
 
-(defn durable-2pset
+(defn twopset
   "Open (or create) a durable 2P-Set on a per-system konserve store.
 
    :comparator             element order (default compare)

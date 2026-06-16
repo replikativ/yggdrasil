@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.durable-orset
+(ns yggdrasil.convergent.orset
   "Observed-Remove Set (OR-Set) as a DURABLE conflict-free yggdrasil system —
    the registry's true shape (add AND convergent remove), where a grow-only
    G-Set is too restrictive.
@@ -278,10 +278,10 @@
 ;; Factory
 ;; ============================================================
 
-(defn durable-orset
+(defn orset
   "Open (or create) a durable OR-Set on a per-system konserve store.
 
-     (durable-orset \"reg\" :store-config {:backend :memory :id (random-uuid)})
+     (orset \"reg\" :store-config {:backend :memory :id (random-uuid)})
 
    :tag-fn  element -> tag (default: ignore element, fresh random-uuid → true
             OR-Set). Pass a content-hash fn for idempotent add (registry shape).

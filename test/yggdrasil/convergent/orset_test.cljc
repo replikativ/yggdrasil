@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.durable-orset-test
+(ns yggdrasil.convergent.orset-test
   "Durable OR-Set + 2P-Set: add/observed-remove/re-add, add-wins under concurrency,
    cross-store convergence, durability, content-tag (registry shape), addressable
    freeze, overlay, δ-state. PORTABLE — one `.cljc` body per concern (JVM sync /
@@ -8,8 +8,8 @@
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.durable-orset :as o]
-            [yggdrasil.convergent.durable-2pset :as t]
+            [yggdrasil.convergent.orset :as o]
+            [yggdrasil.convergent.twopset :as t]
             [yggdrasil.convergent.overlay :as ovl]
             #?(:cljs [is.simm.partial-cps.async])
             #?(:cljs [is.simm.partial-cps.runtime]))
@@ -27,7 +27,7 @@
 
 (deftest-async add-remove-readd
   (testing "remove actually removes (unlike a G-Set); re-add brings it back"
-    (let [s (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+    (let [s (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           s (<? (o/conj s :x)) s (<? (o/conj s :y))]
       (is (= #{:x :y} (<? (o/elements s))))
       (let [s (<? (o/disj s :x))]
@@ -39,9 +39,9 @@
 
 (deftest-async add-wins-concurrency
   (testing "a concurrent add the remover didn't observe SURVIVES the merge"
-    (let [a (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+    (let [a (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           a (<? (o/conj a :k))
-          b (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+          b (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           b (<? (o/conj b :k))
           a (<? (o/disj a :k))]
       (is (= #{} (<? (o/elements a))) "a removed its own :k")
@@ -50,9 +50,9 @@
 
 (deftest-async cross-peer-converges
   (testing "two peers with disjoint add/remove ops converge to the same set"
-    (let [a (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+    (let [a (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           a (<? (o/conj a :a1)) a (<? (o/conj a :shared))
-          b (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+          b (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           b (<? (o/conj b :b1)) b (<? (o/conj b :shared))
           b (<? (o/disj b :shared))
           a (<? (o/flush! (<? (o/merge-peer! a b))))
@@ -62,7 +62,7 @@
 
 (deftest-async content-tag-idempotent-add
   (testing "with a content-hash tag-fn, re-adding the same element is a no-op (registry shape)"
-    (let [s (<? (o/durable-orset "reg" :store-config (mem) :sync? sync? :tag-fn identity))
+    (let [s (<? (o/orset "reg" :store-config (mem) :sync? sync? :tag-fn identity))
           s (<? (o/conj s :x)) s (<? (o/conj s :x)) s (<? (o/conj s :x))
           adds (<? (d/set->clj (:adds s) {:sync? sync?}))]
       (is (= #{:x} (<? (o/elements s))))
@@ -71,7 +71,7 @@
 
 (deftest-async orset-addressable-snapshot-freeze
   (testing "OR-Set snapshot-id (commit object) + as-of restores the frozen value"
-    (let [s0  (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+    (let [s0  (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           s0  (<? (o/conj s0 :a)) s0 (<? (o/conj s0 :b))
           sid (<? (p/snapshot-id s0))
           s   (<? (o/disj s0 :a)) s (<? (o/conj s :c))]
@@ -80,11 +80,11 @@
 
 (deftest-async twopset-addressable-snapshot-freeze
   (testing "2P-Set snapshot-id (commit object) + as-of restores the frozen value"
-    (let [s0  (<? (t/durable-2pset "x" :store-config (mem) :sync? sync?))
+    (let [s0  (<? (t/twopset "x" :store-config (mem) :sync? sync?))
           s0  (<? (t/conj s0 :a)) s0 (<? (t/conj s0 :b))
           sid (<? (p/snapshot-id s0))
           s   (<? (t/disj s0 :a))
-          y0  (<? (t/durable-2pset "y" :store-config (mem) :sync? sync?))
+          y0  (<? (t/twopset "y" :store-config (mem) :sync? sync?))
           y0  (<? (t/conj y0 :b)) y0 (<? (t/conj y0 :a))
           ysid (<? (p/snapshot-id y0))]
       (is (= #{:b} (<? (t/elements s))))
@@ -93,7 +93,7 @@
 
 (deftest-async orset-overlay-isolate-merge-down
   (testing "OR-Set overlay isolates (the residue fix); merge-down! joins (add-wins)"
-    (let [s  (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+    (let [s  (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           s  (<? (o/conj s :a)) s (<? (o/conj s :b))
           ov (p/overlay s {})]
       (<? (ovl/overlay-swap! ov (fn [c] (o/conj c :c))))
@@ -103,7 +103,7 @@
 
 (deftest-async twopset-overlay-isolate-merge-down
   (testing "2P-Set overlay isolates; merge-down! joins BOTH halves (remove propagates)"
-    (let [s  (<? (t/durable-2pset "x" :store-config (mem) :sync? sync?))
+    (let [s  (<? (t/twopset "x" :store-config (mem) :sync? sync?))
           s  (<? (t/conj s :a)) s (<? (t/conj s :b))
           ov (p/overlay s {})]
       (<? (ovl/overlay-swap! ov two-op-2pset))
@@ -114,7 +114,7 @@
 
 (deftest-async orset-store-layout-is-crdt-walkable
   (testing "both halves live under :crdt/roots — the shape konserve-sync's crdt walker syncs"
-    (let [s (<? (o/durable-orset "reg" :store-config (mem) :sync? sync?))
+    (let [s (<? (o/orset "reg" :store-config (mem) :sync? sync?))
           s (<? (o/conj s :a)) s (<? (o/conj s :b)) s (<? (o/disj s :a)) s (<? (o/flush! s))
           roots (<? (d/load-roots (:kv-store s) {:sync? sync?}))]
       (is (contains? roots :adds))
@@ -122,11 +122,11 @@
 
 (deftest-async twopset-delta-op-perspective
   (testing "2P-Set δ: add/remove-elem record {:adds}/{:removals} ops; apply-delta ≡ -join"
-    (let [s (<? (t/durable-2pset "a" :store-config (mem) :sync? sync?))
+    (let [s (<? (t/twopset "a" :store-config (mem) :sync? sync?))
           s (<? (t/conj s :x)) s (<? (t/conj s :y)) s (<? (t/disj s :x))]
       (is (= {:adds #{:x :y} :removals #{:x}} (c/delta-of s)) "δ = the ops, accrued")
       (is (= #{:y} (<? (t/elements s))) "live = adds − removals; δ in meta doesn't affect value")
-      (let [peer   (<? (t/durable-2pset "b" :store-config (mem) :sync? sync?))
+      (let [peer   (<? (t/twopset "b" :store-config (mem) :sync? sync?))
             peer   (<? (t/conj peer :z))
             via-op (<? (c/-apply-delta peer (c/delta-of s)))]
         (is (= #{:y :z} (<? (t/elements via-op))) "ops integrated: :x removed, :y + peer's :z live")
@@ -134,11 +134,11 @@
 
 (deftest-async orset-delta-op-perspective
   (testing "OR-Set δ: add records {:adds #{[elem tag]}} ops; apply-delta ≡ -join"
-    (let [oo (<? (o/durable-orset "a" :store-config (mem) :sync? sync?))
+    (let [oo (<? (o/orset "a" :store-config (mem) :sync? sync?))
           oo (<? (o/conj oo :x)) oo (<? (o/conj oo :y))
           dl (c/delta-of oo)]
       (is (= #{:x :y} (set (map first (:adds dl)))) "δ :adds carries the [elem tag] add-pairs")
-      (let [peer   (<? (o/durable-orset "b" :store-config (mem) :sync? sync?))
+      (let [peer   (<? (o/orset "b" :store-config (mem) :sync? sync?))
             peer   (<? (o/conj peer :z))
             via-op (<? (c/-apply-delta peer dl))]
         (is (= #{:x :y :z} (<? (o/elements via-op))) "ops integrated")
@@ -148,9 +148,9 @@
 (deftest-async durable-across-reopen
   (testing "flush, reopen, restore both halves (adds + removals)"
     (let [sc (file-cfg)
-          s  (<? (o/durable-orset "reg" :store-config sc :sync? sync?))
+          s  (<? (o/orset "reg" :store-config sc :sync? sync?))
           s  (<? (o/conj s :p)) s (<? (o/conj s :q)) s (<? (o/conj s :r))
           s  (<? (o/disj s :q))
           _  (<? (o/flush! s))
-          re (<? (o/durable-orset "reg" :store-config sc :sync? sync?))]
+          re (<? (o/orset "reg" :store-config sc :sync? sync?))]
       (is (= #{:p :r} (<? (o/elements re))) "removal persisted across reopen"))))

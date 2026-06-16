@@ -15,10 +15,10 @@
             [yggdrasil.types :as ytypes]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.durable-gset :as g]
+            [yggdrasil.convergent.gset :as g]
             #?(:cljs [is.simm.partial-cps.async])
             #?(:cljs [is.simm.partial-cps.runtime])
-            #?(:clj [yggdrasil.convergent.durable-2pset :as d2p])
+            #?(:clj [yggdrasil.convergent.twopset :as d2p])
             #?(:clj [yggdrasil.registry :as reg])
             #?(:clj [yggdrasil.types :as t]))
   #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]]
@@ -35,7 +35,7 @@
 (deftest-async gc-safe-default-reclaims-nothing
   (testing "gc! with NO window reclaims NOTHING (never sweeps a node an in-flight
             lazy read might hold); a `:grace-period-ms 0` / `now` cutoff reclaims orphans"
-    (let [gs (<? (g/durable-gset "t" :store-config (mem) :sync? sync?))
+    (let [gs (<? (g/gset "t" :store-config (mem) :sync? sync?))
           gs (<? (g/conj gs :a)) gs (<? (g/flush! gs))
           gs (<? (g/conj gs :b)) gs (<? (g/flush! gs))
           kv (:kv-store gs)
@@ -48,7 +48,7 @@
 
 (deftest-async gc-retains-held-snapshot
   (testing "a snapshot-id passed to gc-sweep! survives GC — as-of still resolves it"
-    (let [gs0  (<? (g/durable-gset "t" :store-config (mem) :sync? sync?))
+    (let [gs0  (<? (g/gset "t" :store-config (mem) :sync? sync?))
           gs0  (<? (g/conj gs0 :a)) gs0 (<? (g/conj gs0 :b)) gs0 (<? (g/flush! gs0))
           snap (<? (p/snapshot-id gs0))                  ; S0 names the {:a :b} root
           ;; supersede S0's root tree twice, so S0's nodes are non-live
@@ -73,7 +73,7 @@
          (let [;; 6 flush generations → 6 superseded root trees pile up (value-semantic:
                ;; thread gs through each batch's adds + flush)
                gs (reduce (fn [gs batch] (g/flush! (reduce g/conj gs batch)))
-                          (g/durable-gset "t" :store-config (mem))
+                          (g/gset "t" :store-config (mem))
                           (partition-all 50 (range 300)))]
            (let [kv (:kv-store gs)
                  before (node-key-count kv)
@@ -94,7 +94,7 @@
      (clojure.test/deftest two-pset-gc-keeps-both-halves
        (testing "2P-Set GC keeps adds + removals roots (tombstones are live members)"
          (let [s0 (reduce (fn [s batch] (d2p/flush! (reduce d2p/conj s batch)))
-                          (d2p/durable-2pset "t" :store-config (mem) :comparator compare)
+                          (d2p/twopset "t" :store-config (mem) :comparator compare)
                           (partition-all 30 (range 150)))
                s  (d2p/flush! (-> s0 (d2p/disj 7) (d2p/disj 42)))]
            (let [live-before (d2p/elements s)
