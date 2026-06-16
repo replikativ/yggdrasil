@@ -14,7 +14,7 @@
    slices `[hk MIN-UUID]…[hk MAX-UUID]` — O(log n + matches) nodes, then filters
    stored-`k = k` (hash-collision safety) and diffs the removals slice by uid.
 
-   So a durable OR-Map is structurally a `orset` of entries (two halves
+   So a durable OR-Map is structurally an `orset` of entries (two halves
    `:adds`/`:removals` under `:crdt/roots`, add-wins, `set-union` join); the ONLY
    differences are the flattened entry + the SLICE-based per-key projection.
 
