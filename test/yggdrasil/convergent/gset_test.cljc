@@ -1,7 +1,8 @@
 (ns yggdrasil.convergent.gset-test
   "Spike: prove a G-Set is a conflict-free yggdrasil system whose merge is a
    SYMMETRIC peer join (no parent, no ancestor, no conflicts)."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require #?(:clj [clojure.test :refer [deftest testing is]]
+               :cljs [cljs.test :refer-macros [deftest testing is]])
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.gset :as gs]))

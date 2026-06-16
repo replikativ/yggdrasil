@@ -1,6 +1,7 @@
 (ns yggdrasil.convergent.ormap-test
   "Observed-Remove Map as a conflict-free yggdrasil system."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require #?(:clj [clojure.test :refer [deftest testing is]]
+               :cljs [cljs.test :refer-macros [deftest testing is]])
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.ormap :as om]))

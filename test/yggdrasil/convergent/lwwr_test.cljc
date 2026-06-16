@@ -1,6 +1,7 @@
 (ns yggdrasil.convergent.lwwr-test
   "LWW-Register as a conflict-free yggdrasil system on the generic machinery."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require #?(:clj [clojure.test :refer [deftest testing is]]
+               :cljs [cljs.test :refer-macros [deftest testing is]])
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]
@@ -37,8 +38,9 @@
       (is (= :lwwr (p/system-type l)))
       (is (= :seed (lwwr/value l)))
       (testing "branch-merge is the join (take-later)"
+        ;; no sleep needed: HLC's logical counter makes the forked write strictly
+        ;; later than the seed even within the same wall-clock millisecond.
         (let [l2 (-> l (p/branch! :fork) (p/checkout :fork))
-              _ (Thread/sleep 2)
               l2 (lwwr/set-register l2 :forked)]
           (is (= :forked (lwwr/value (-> l2 (p/checkout :main) (p/merge! :fork))))))))))
 
