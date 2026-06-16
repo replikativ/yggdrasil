@@ -1,7 +1,5 @@
 {:deps {:aliases [:shadow]}
  :builds
- ;; Portable `.cljc` tests (deftest-async) + legacy `*-cljs-test` both end in `-test`.
- ;; JVM-only `.clj` tests are invisible to cljs, so `-test$` is safe.
  {:test {:target    :node-test
          :output-to "target/node-tests.js"
          :ns-regexp "-test$"

@@ -10,7 +10,7 @@
    File-backend durability/reopen tests are JVM-only (`#?(:clj …)`) — node
    konserve has no equivalent local file store in this harness."
   (:require [clojure.test :refer [is testing]]
-            [yggdrasil.test-async :refer [deftest-async <? sync? mem]]
+            [yggdrasil.test-async :refer [deftest-async <? sync? mem file-cfg]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
@@ -208,11 +208,12 @@
            (is (= #{:a1 :a2} (g/elements a')) "a restores only its own elements")
            (is (= #{:b1} (g/elements b')) "b restores only its own elements"))))))
 
-#?(:clj
-   (clojure.test/deftest durable-across-reopen
-     (testing "flush, reopen the store, restore equals the original set"
-       (let [dir (tmpdir)
-             sc  {:backend :file :id (random-uuid) :path dir}]
-         (-> (g/durable-gset "kb" :store-config sc) (g/add :p) (g/add :q) (g/add :r) g/flush!)
-         (let [reopened (g/durable-gset "kb" :store-config sc)]
-           (is (= #{:p :q :r} (g/elements reopened)) "restored from disk"))))))
+;; portable file-backed durability (JVM file store + konserve node filestore)
+(deftest-async durable-across-reopen
+  (testing "flush, reopen the store, restore equals the original set"
+    (let [sc (file-cfg)
+          g  (<? (g/durable-gset "kb" :store-config sc :sync? sync?))
+          g  (<? (g/add g :p)) g (<? (g/add g :q)) g (<? (g/add g :r))
+          _  (<? (g/flush! g))
+          reopened (<? (g/durable-gset "kb" :store-config sc :sync? sync?))]
+      (is (= #{:p :q :r} (<? (g/elements reopened))) "restored from disk"))))

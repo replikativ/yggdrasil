@@ -599,8 +599,13 @@
 (defn adopt
   "Make an already-built `system` a composite sub-provider that brings its own
    backend (ignores the composite's store). The composite auto-adopts any
-   non-fn element, so this is only needed to be explicit."
-  [system] (fn [_kv-store _opts] system))
+   non-fn element, so this is only needed to be explicit.
+
+   Returns the system wrapped in `async+sync` so `open-subs` can `await` it
+   UNIFORMLY with opener results (which are genuinely async on cljs). Without
+   this, `(await system)` on cljs awaits a plain record — not a CPS — and throws
+   (the opener path returns a CPS, so it worked; the adopt path didn't)."
+  [system] (fn [_kv-store opts] (async+sync (:sync? opts) (async system))))
 
 (defn- ->opener [x] (if (fn? x) x (adopt x)))
 

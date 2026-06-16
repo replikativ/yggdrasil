@@ -4,7 +4,7 @@
    freeze, overlay, δ-state. PORTABLE — one `.cljc` body per concern (JVM sync /
    cljs async via `<?`). VALUE SEMANTICS: mutators return new values; threaded."
   (:require [clojure.test :refer [is testing]]
-            [yggdrasil.test-async :refer [deftest-async <? sync? mem]]
+            [yggdrasil.test-async :refer [deftest-async <? sync? mem file-cfg]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
@@ -14,11 +14,7 @@
             #?(:cljs [is.simm.partial-cps.async])
             #?(:cljs [is.simm.partial-cps.runtime]))
   #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]]
-                            [is.simm.partial-cps.async :refer [async]]))
-  #?(:clj (:import [java.nio.file Files]
-                   [java.nio.file.attribute FileAttribute])))
-
-#?(:clj (defn- tmpdir [] (str (Files/createTempDirectory "ygg-orset" (make-array FileAttribute 0)))))
+                            [is.simm.partial-cps.async :refer [async]])))
 
 (defn- two-op-2pset
   "An overlay mutation that does TWO async ops (add :c, then remove :a). Two
@@ -148,12 +144,13 @@
         (is (= #{:x :y :z} (<? (o/elements via-op))) "ops integrated")
         (is (= (<? (o/elements via-op)) (<? (o/elements (<? (c/-join peer oo))))) "op-path ≡ state-path")))))
 
-;; ── JVM-only: file-backend durability across reopen ─────────────────────────────
-#?(:clj
-   (clojure.test/deftest durable-across-reopen
-     (testing "flush, reopen, restore both halves (adds + removals)"
-       (let [sc {:backend :file :id (random-uuid) :path (tmpdir)}]
-         (-> (o/durable-orset "reg" :store-config sc)
-             (o/add :p) (o/add :q) (o/add :r) (o/remove-elem :q) o/flush!)
-         (let [re (o/durable-orset "reg" :store-config sc)]
-           (is (= #{:p :r} (o/elements re)) "removal persisted across reopen"))))))
+;; portable file-backed durability (JVM file store + konserve node filestore)
+(deftest-async durable-across-reopen
+  (testing "flush, reopen, restore both halves (adds + removals)"
+    (let [sc (file-cfg)
+          s  (<? (o/durable-orset "reg" :store-config sc :sync? sync?))
+          s  (<? (o/add s :p)) s (<? (o/add s :q)) s (<? (o/add s :r))
+          s  (<? (o/remove-elem s :q))
+          _  (<? (o/flush! s))
+          re (<? (o/durable-orset "reg" :store-config sc :sync? sync?))]
+      (is (= #{:p :r} (<? (o/elements re))) "removal persisted across reopen"))))

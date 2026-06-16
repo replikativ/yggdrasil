@@ -36,9 +36,15 @@
   #?(:clj  (:require [clojure.test]
                      [is.simm.partial-cps.async])
      :cljs (:require [cljs.test]
-                     [is.simm.partial-cps.async]))
+                     [is.simm.partial-cps.async]
+                     ;; registers konserve's `:file` backend defmethods on node, so
+                     ;; `{:backend :file}` resolves via `kstore/connect-store` /
+                     ;; `create-store` / `store-exists?` exactly like the JVM file store.
+                     [konserve.node-filestore]))
   #?(:cljs (:require-macros [yggdrasil.test-async]
-                            [is.simm.partial-cps.async])))
+                            [is.simm.partial-cps.async]))
+  #?(:clj (:import [java.nio.file Files]
+                   [java.nio.file.attribute FileAttribute])))
 
 (defn- cljs-env? [env] (some? (:ns env)))
 
@@ -52,6 +58,18 @@
   "A fresh in-memory konserve store-config — the portable backend for tests."
   []
   {:backend :memory :id (random-uuid)})
+
+(defn file-cfg
+  "A fresh FILE-backed konserve store-config in a unique temp dir — portable:
+   the JVM file store and konserve's node filestore (registered via the cljs
+   require above) both back `{:backend :file …}` through the lifecycle
+   multimethods. Use for durability-across-reopen tests on BOTH platforms.
+   Durable ops over it run async on cljs (`:sync? sync?` → false) — wrap in `<?`."
+  []
+  {:backend :file
+   :id (random-uuid)
+   :path #?(:clj  (str (Files/createTempDirectory "ygg-file" (make-array FileAttribute 0)))
+            :cljs (str (.tmpdir (js/require "os")) "/ygg-file-" (random-uuid)))})
 
 (defmacro <?
   "Resolve an async durable op portably. On cljs, `await` the partial-cps CPS
