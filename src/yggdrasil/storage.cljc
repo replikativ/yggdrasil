@@ -85,19 +85,37 @@
 
 (def ^:private cache-limit
   "Max decoded PSS nodes held in a storage's in-memory node cache. Bounds memory
-   for read-on-the-fly access (datahike-style): hot nodes stay resident, cold
-   ones are evicted and re-fetched+decoded from konserve on demand. ~100k nodes."
+   for read-on-the-fly access (datahike-style): hot nodes stay resident, cold ones
+   are evicted and re-fetched+decoded from konserve on demand. ~100k nodes."
   100000)
 
-(defn- cache-assoc!
-  "Put a decoded node in the cache, evicting an arbitrary entry when over the
-   limit — a size BOUND (not strict LRU; node misses just re-fetch from konserve)."
-  [cache address node]
-  (swap! cache (fn [m]
-                 (let [m (assoc m address node)]
-                   (if (> (count m) cache-limit)
-                     (dissoc m (ffirst m))
-                     m)))))
+;; Insertion-recency LRU node cache — the `datahike.lru` pattern, inlined as a
+;; functional value over a plain map (no deftype / core.cache: core.cache's
+;; protocol machinery is JVM-only, and datahike itself hand-rolls this for the
+;; same cross-platform node cache). `:kv` is address→node; `:gen->key` (a
+;; sorted-map) + `:key->gen` track INSERTION order via a monotonic `:gen`. A
+;; lookup does NOT bump recency (a B-tree's hot upper nodes stay resident under
+;; any policy, and the read/cache-hit path stays allocation-free); `cache-put!`
+;; bumps the gen and evicts the lowest gen (oldest-inserted) when over the limit.
+(def ^:private empty-cache {:kv {} :gen->key (sorted-map) :key->gen {} :gen 0})
+
+(defn- cache-lookup [cache address]
+  (get (:kv @cache) address))
+
+(defn- cache-put! [cache address node]
+  (swap! cache
+         (fn [{:keys [kv gen->key key->gen gen]}]
+           (let [prev (get key->gen address)              ; re-put? drop its old gen slot
+                 c {:kv       (assoc kv address node)
+                    :gen->key (assoc (cond-> gen->key prev (dissoc prev)) gen address)
+                    :key->gen (assoc key->gen address gen)
+                    :gen      (inc gen)}]
+             (if (> (count (:kv c)) cache-limit)
+               (let [[lo k] (first (:gen->key c))]         ; lowest gen = oldest-inserted
+                 (-> c (update :kv dissoc k)
+                       (update :gen->key dissoc lo)
+                       (update :key->gen dissoc k)))
+               c)))))
 
 (defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode content-addressed?]
   IStorage
@@ -115,11 +133,11 @@
                ;; dedup. Else a random UUID (registry default — unchanged).
                address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
            (kb/k-assoc kv-store address node-data {:sync? true})
-           (cache-assoc! cache address node)
+           (cache-put! cache address node)
            address))
 
        (restore [_ address]
-         (or (get @cache address)
+         (or (cache-lookup cache address)
              (let [node-data (kb/k-get kv-store address {:sync? true})
                    keys (mapv key-decode (:keys node-data))
                    addresses (:addresses node-data)
@@ -129,7 +147,7 @@
                                    ^java.util.List (vec addresses)
                                    settings)
                           (Leaf. ^java.util.List keys settings))]
-               (cache-assoc! cache address node)
+               (cache-put! cache address node)
                node)))
 
        (accessed [_ _address] nil)
@@ -147,13 +165,13 @@
                                                     (vec (.-addresses node)))}
                             address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
                         (await (kb/k-assoc kv-store address node-data opts))
-                        (cache-assoc! cache address node)
+                        (cache-put! cache address node)
                         address))))
 
        (restore [_ address opts]
          (async+sync (:sync? opts)
                      (async
-                      (or (get @cache address)
+                      (or (cache-lookup cache address)
                           ;; PSS cljs nodes hold their `keys`/`addresses` as JS
                           ;; ARRAYS (`.slice`/`aget`/`aconcat` are used on them).
                           ;; konserve round-trips them as Clojure vectors, so the
@@ -170,7 +188,7 @@
                                                                :addresses (to-array (:addresses node-data))
                                                                :settings settings))
                                        (Leaf. (to-array (mapv key-decode (:keys node-data))) settings (:measure node-data)))]
-                            (cache-assoc! cache address node)
+                            (cache-put! cache address node)
                             node)))))
 
        (accessed [_ _address] nil)
@@ -200,7 +218,7 @@
    ;; durable/open threading {:key-encode nil} — still defaults to identity.
    (->KonserveStorage kv-store
                       (or settings #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
-                      (atom {}) (atom {})
+                      (atom empty-cache) (atom {})
                       (or key-encode identity) (or key-decode identity) content-addressed?)))
 
 ;; ============================================================
