@@ -138,10 +138,22 @@
          (async+sync (:sync? opts)
                      (async
                       (or (get @cache address)
+                          ;; PSS cljs nodes hold their `keys`/`addresses` as JS
+                          ;; ARRAYS (`.slice`/`aget`/`aconcat` are used on them).
+                          ;; konserve round-trips them as Clojure vectors, so the
+                          ;; cache-MISS rebuild MUST `to-array` them — else the
+                          ;; reconstructed Leaf/Branch iterates a cljs vector via
+                          ;; JS-array ops and silently reads as empty. (The
+                          ;; cache-HIT path returns the original PSS node, so this
+                          ;; only bites a true cache miss: ship-to-fresh-store or
+                          ;; reopen — caught by the cross-peer/merge-peer! tests.)
                           (let [node-data (await (kb/k-get kv-store address opts))
                                 node (if (:addresses node-data)
-                                       (branch/from-map (assoc node-data :keys (mapv key-decode (:keys node-data)) :settings settings))
-                                       (Leaf. (mapv key-decode (:keys node-data)) settings (:measure node-data)))]
+                                       (branch/from-map (assoc node-data
+                                                               :keys (to-array (mapv key-decode (:keys node-data)))
+                                                               :addresses (to-array (:addresses node-data))
+                                                               :settings settings))
+                                       (Leaf. (to-array (mapv key-decode (:keys node-data))) settings (:measure node-data)))]
                             (swap! cache assoc address node)
                             node)))))
 
