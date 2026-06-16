@@ -83,6 +83,22 @@
 ;; KonserveStorage — IStorage for PSS B-tree nodes
 ;; ============================================================
 
+(def ^:private cache-limit
+  "Max decoded PSS nodes held in a storage's in-memory node cache. Bounds memory
+   for read-on-the-fly access (datahike-style): hot nodes stay resident, cold
+   ones are evicted and re-fetched+decoded from konserve on demand. ~100k nodes."
+  100000)
+
+(defn- cache-assoc!
+  "Put a decoded node in the cache, evicting an arbitrary entry when over the
+   limit — a size BOUND (not strict LRU; node misses just re-fetch from konserve)."
+  [cache address node]
+  (swap! cache (fn [m]
+                 (let [m (assoc m address node)]
+                   (if (> (count m) cache-limit)
+                     (dissoc m (ffirst m))
+                     m)))))
+
 (defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode content-addressed?]
   IStorage
   #?@(:clj
@@ -99,7 +115,7 @@
                ;; dedup. Else a random UUID (registry default — unchanged).
                address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
            (kb/k-assoc kv-store address node-data {:sync? true})
-           (swap! cache assoc address node)
+           (cache-assoc! cache address node)
            address))
 
        (restore [_ address]
@@ -113,7 +129,7 @@
                                    ^java.util.List (vec addresses)
                                    settings)
                           (Leaf. ^java.util.List keys settings))]
-               (swap! cache assoc address node)
+               (cache-assoc! cache address node)
                node)))
 
        (accessed [_ _address] nil)
@@ -131,7 +147,7 @@
                                                     (vec (.-addresses node)))}
                             address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
                         (await (kb/k-assoc kv-store address node-data opts))
-                        (swap! cache assoc address node)
+                        (cache-assoc! cache address node)
                         address))))
 
        (restore [_ address opts]
@@ -154,7 +170,7 @@
                                                                :addresses (to-array (:addresses node-data))
                                                                :settings settings))
                                        (Leaf. (to-array (mapv key-decode (:keys node-data))) settings (:measure node-data)))]
-                            (swap! cache assoc address node)
+                            (cache-assoc! cache address node)
                             node)))))
 
        (accessed [_ _address] nil)

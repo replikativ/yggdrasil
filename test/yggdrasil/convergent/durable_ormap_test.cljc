@@ -61,7 +61,7 @@
           dl (c/delta-of m)
           peer  (<? (om/durable-ormap "b" :store-config (mem) :sync? sync?))
           peer  (<? (om/assoc peer :z 3))]
-      (is (= #{:x :y} (set (map first (:adds dl)))) "δ :adds carries the [k uid v] triples")
+      (is (= #{:x :y} (set (map #(nth % 2) (:adds dl)))) "δ :adds carries the [hk uid k v] entries")
       (let [via-op (<? (c/-apply-delta peer dl))]
         (is (= #{:x :y :z} (<? (om/keys via-op))) "ops integrated")))))
 

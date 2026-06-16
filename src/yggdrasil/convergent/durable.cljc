@@ -128,6 +128,24 @@
                                 (recur (await (aseq/rest items)) (conj! acc x))
                                 (persistent! acc))))))))
 
+(defn slice->clj
+  "Materialize the INCLUSIVE PSS range `[from to]` into a Clojure vector — reads
+   ONLY the nodes the range spans (lazy traversal + the storage node-cache), NOT a
+   full drain. This is the datahike-style read-on-the-fly primitive: a key-scoped
+   read touches O(log n + matches) nodes, not the whole set. (async+sync). On cljs
+   the slice yields an AsyncSeq drained one node at a time (the same partial-cps
+   sequence protocol `set->clj` uses); the 4-arity `pss/slice` passes the set's own
+   comparator and threads `opts` (`:sync? false` ⇒ CPS)."
+  [s from to opts]
+  (async+sync (:sync? opts)
+              (async
+               (if (nil? s) []
+                   #?(:clj  (into [] (pss/slice s from to))
+                      :cljs (loop [items (await (pss/slice s from to opts)) acc (transient [])]
+                              (if-some [x (await (aseq/first items))]
+                                (recur (await (aseq/rest items)) (conj! acc x))
+                                (persistent! acc))))))))
+
 (defn set-conj
   "conj `x` onto PSS set `s` under comparator `cmp`. (async+sync)"
   [s x cmp opts]
