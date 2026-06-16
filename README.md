@@ -239,24 +239,22 @@ Git-like version control for data lakes on object storage (S3, HDFS, etc.). Trac
 ```clojure
 (require '[yggdrasil.adapters.iceberg :as ice])
 
-;; Initialize new table
-(def sys (ice/init! "s3://my-bucket/warehouse"
-                    "db.table"
-                    {:spark-config {...}}))
+;; Initialize a new table (catalog namespace + table) against a REST catalog +
+;; S3/MinIO; creates the first yggdrasil snapshot.
+(def sys (ice/init! "db" "my_table"
+                    {:rest-endpoint "http://localhost:8181"
+                     :s3-endpoint   "http://localhost:9000"
+                     :system-name   "warehouse"}))
+;; (use `ice/create` instead of `ice/init!` to track an EXISTING table)
 
-;; Create Spark session and register table
-(def spark (ice/create-spark-session sys))
-
-;; Write data via Spark
-(.write (.format df "iceberg") "db.table")
-
-;; Yggdrasil tracks snapshots
+;; Write data with your own query engine (Spark, PyIceberg, …) against db.my_table;
+;; yggdrasil tracks the resulting snapshots.
 (p/commit! sys "Initial data load")
 
 ;; Branch for experimental schema changes
 (p/branch! sys :schema-v2)
 (p/checkout sys :schema-v2)
-;; ... modify table schema via Spark ...
+;; ... modify the table via your engine ...
 (p/commit! sys "Add new columns")
 
 ;; Merge schema changes back
