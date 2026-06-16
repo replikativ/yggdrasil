@@ -1,7 +1,8 @@
 (ns yggdrasil.convergent.composite-test
   "Spike L4-core: merging two PEER workspaces is a symmetric system-merge of
    their composites — no parent, no new interface (just -join)."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require #?(:clj [clojure.test :refer [deftest testing is]]
+               :cljs [cljs.test :refer-macros [deftest testing is]])
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.composite :as comp]
