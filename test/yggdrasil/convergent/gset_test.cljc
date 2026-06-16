@@ -9,15 +9,15 @@
 
 (deftest test-local-ops
   (testing "add accumulates into the current branch's set"
-    (let [g (-> (gs/gset "kb") (gs/add :a) (gs/add :b) (gs/add :a))]
+    (let [g (-> (gs/gset "kb") (gs/conj :a) (gs/conj :b) (gs/conj :a))]
       (is (= #{:a :b} (gs/elements g))))))
 
 (deftest test-symmetric-join
   (testing "join of two PEER replicas is commutative, idempotent, associative —
             no parent, no ancestor"
-    (let [a (-> (gs/gset "kb") (gs/add :a) (gs/add :x))
-          b (-> (gs/gset "kb") (gs/add :b) (gs/add :x))
-          cc (-> (gs/gset "kb") (gs/add :c))]
+    (let [a (-> (gs/gset "kb") (gs/conj :a) (gs/conj :x))
+          b (-> (gs/gset "kb") (gs/conj :b) (gs/conj :x))
+          cc (-> (gs/gset "kb") (gs/conj :c))]
       (testing "commutative: a∪b = b∪a"
         (is (= #{:a :b :x} (gs/elements (c/-join a b))))
         (is (= (gs/elements (c/-join a b)) (gs/elements (c/-join b a)))))
@@ -51,7 +51,7 @@
       (is (= :gset (p/system-type g)))
       (is (= :main (p/current-branch g)))
       (testing "branch! copies the branch value; fork writes are isolated (value-semantic)"
-        (let [forked (-> g (p/branch! :fork) (p/checkout :fork) (gs/add :only-fork))]
+        (let [forked (-> g (p/branch! :fork) (p/checkout :fork) (gs/conj :only-fork))]
           (is (= #{:seed :only-fork} (gs/elements forked)))
           ;; the original value on :main does NOT see the fork's write
           (is (= #{:seed} (gs/elements (p/checkout forked :main))))
@@ -69,7 +69,7 @@
   (testing "in-mem catalog δ (via the generic system): ops recorded at the write
             (no diffing); apply-delta ≡ -join; a no-op -join returns identical
             (signal-safe, like the durable runaway guard)"
-    (let [g (-> (gs/gset "a") (gs/add :x) (gs/add :y))]
+    (let [g (-> (gs/gset "a") (gs/conj :x) (gs/conj :y))]
       (is (= #{:x :y} (c/delta-of g)) "δ = the ops (accrued by vjoin), no diffing")
       (is (nil? (c/delta-of (c/clear-delta g))) "clear-delta drops it")
       ;; op-path: a peer applies just the δ; ≡ the state-path (-join)

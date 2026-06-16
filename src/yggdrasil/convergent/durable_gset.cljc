@@ -16,6 +16,7 @@
    `flush!`/…) AND the protocol methods (`-join`/`snapshot-id`/`as-of`/`merge!`/
    `gc-sweep!`) — dispatches through `async+sync`: a JVM-opened set is sync, a
    browser-opened (`:sync? false`) set is async (CPS you `await`)."
+  (:refer-clojure :exclude [conj contains?])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
@@ -90,7 +91,7 @@
                  (let [src (get roots source (d/empty-set storage comparator))
                        cur (or (get roots current) (d/empty-set storage comparator))
                        u   (await (d/set-union cur src comparator opts))]
-                   (assoc this :roots (assoc roots current u) :dirty (conj dirty current))))))
+                   (assoc this :roots (assoc roots current u) :dirty (clojure.core/conj dirty current))))))
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
@@ -162,7 +163,7 @@
 ;; Value ops — each returns a NEW G-Set value (value-semantic)
 ;; ============================================================
 
-(defn add
+(defn conj
   "Add `x` to the current branch's set; RECORD the op as a local δ (`{x}`) so a
    synced signal can ship just the op. (async+sync) Returns a NEW (δ-carrying) g."
   [g x]
@@ -174,7 +175,7 @@
                                 (d/empty-set (:storage g) (:comparator g)))
                        s'   (await (d/set-conj base x (:comparator g) opts))]
                    (c/with-delta (assoc g :roots (assoc (:roots g) cur s')
-                                        :dirty (conj (:dirty g) cur))
+                                        :dirty (clojure.core/conj (:dirty g) cur))
                                  set/union #{x}))))))
 
 (defn apply-delta
@@ -195,14 +196,14 @@
                    ;; clear δ: a remote-integrated value re-propagates nothing
                    ;; (the receiver's own ops shipped at their mutation).
                    (c/clear-delta (assoc g :roots (assoc (:roots g) cur s')
-                                         :dirty (conj (:dirty g) cur))))))))
+                                         :dirty (clojure.core/conj (:dirty g) cur))))))))
 
 (defn elements
   "Read the current branch's set as a plain Clojure set. (async+sync)"
   [g]
   (d/set->clj (get (:roots g) (:current g)) (:opts g)))
 
-(defn contains-elem?
+(defn contains?
   "Whether `x` is in the current branch's set. (async+sync)"
   [g x]
   (d/set-contains? (get (:roots g) (:current g)) x (:opts g)))
@@ -259,7 +260,7 @@
                            cur       (or (get roots branch)
                                          (d/empty-set (:storage g) (:comparator g)))
                            u         (await (d/set-union cur orestored (:comparator g) opts))]
-                       (recur (next bs) (assoc roots branch u) (conj dirty branch)))
+                       (recur (next bs) (assoc roots branch u) (clojure.core/conj dirty branch)))
                      (assoc g :roots roots :dirty dirty)))))))
 
 (defn gc!

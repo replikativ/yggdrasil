@@ -3,6 +3,7 @@
    system. value = a set; join = `set/union` (commutative/associative/idempotent).
    The system machinery (branch/checkout/merge/-join/fork-sharing) is the generic
    `yggdrasil.convergent.system`; this ns is just the value-join + helpers."
+  (:refer-clojure :exclude [conj])
   (:require [clojure.set :as set]
             [yggdrasil.convergent.system :as sys]))
 
@@ -14,8 +15,8 @@
                             :branch branch :init (set init)
                             :vjoin set/union :bottom #{}))
 
-(defn add "Add `x` to the current branch's set (local op)." [g x]
-  (sys/record-delta (sys/upd! g conj x) #{x}))
+(defn conj "Add `x` to the current branch's set (local op)." [g x]
+  (sys/record-delta (sys/upd! g clojure.core/conj x) #{x}))
 
 (defn elements "Read the current branch's set." [g]
   (sys/cur g))

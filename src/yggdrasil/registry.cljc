@@ -78,19 +78,19 @@
 (defn register!
   "Add a RegistryEntry (idempotent — content-addressed)."
   [^Registry registry entry]
-  (swap! (:tpset-atom registry) #(d2p/add % entry))
+  (swap! (:tpset-atom registry) #(d2p/conj % entry))
   registry)
 
 (defn register-batch!
   "Register multiple entries at once."
   [^Registry registry entries]
-  (swap! (:tpset-atom registry) #(d2p/add-all % entries))
+  (swap! (:tpset-atom registry) #(d2p/into % entries))
   registry)
 
 (defn deregister!
   "Convergent observed-remove: tombstone the entry (permanent per content)."
   [^Registry registry entry]
-  (swap! (:tpset-atom registry) #(d2p/remove-elem % entry))
+  (swap! (:tpset-atom registry) #(d2p/disj % entry))
   registry)
 
 (defn flush!

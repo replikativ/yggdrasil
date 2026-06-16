@@ -37,9 +37,9 @@
                                                      :store-config sc :sync? false)))
             ;; value-semantic: evolve subs via update-subsystem (re-seats the new
             ;; sub value into the composite), threading the composite each step.
-            [ta comp]    (<! (realize (cmp/update-subsystem comp "a" #(g/add % :a1))))
-            [_ comp]     (<! (realize (cmp/update-subsystem comp "a" #(g/add % :a2))))
-            [_ comp]     (<! (realize (cmp/update-subsystem comp "b" #(g/add % :b1))))
+            [ta comp]    (<! (realize (cmp/update-subsystem comp "a" #(g/conj % :a1))))
+            [_ comp]     (<! (realize (cmp/update-subsystem comp "a" #(g/conj % :a2))))
+            [_ comp]     (<! (realize (cmp/update-subsystem comp "b" #(g/conj % :b1))))
             ;; transactional commit: flush both subs durable, write :composite/root LAST
             [tcommit committed] (<! (realize (p/commit! comp "snap-1")))
             [tsid sid]   (<! (realize (p/snapshot-id committed)))

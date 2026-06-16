@@ -27,14 +27,14 @@
 (deftest-async multi-branch-peers-converge
   (testing "two peers each add a distinct branch → merge keeps BOTH branches"
     (let [a (<? (g/durable-gset "kb" :store-config (mem) :sync? sync?))
-          a (<? (g/add a :shared))
+          a (<? (g/conj a :shared))
           a (-> a (p/branch! :fa) (p/checkout :fa))
-          a (<? (g/add a :a-only))
+          a (<? (g/conj a :a-only))
           a (<? (g/flush! a))
           b (<? (g/durable-gset "kb" :store-config (mem) :sync? sync?))
-          b (<? (g/add b :shared))
+          b (<? (g/conj b :shared))
           b (-> b (p/branch! :fb) (p/checkout :fb))
-          b (<? (g/add b :b-only))
+          b (<? (g/conj b :b-only))
           b (<? (g/flush! b))
           ;; converge both directions (value-semantic: thread the merged handles)
           a (<? (g/flush! (<? (g/merge-peer! a b))))

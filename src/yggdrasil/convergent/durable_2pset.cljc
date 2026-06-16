@@ -24,6 +24,7 @@
    2P-Set (and the registry, a lens over one) is a first-class yggdrasil system
    that another yggdrasil can itself track, fork, and merge. Content-addressing
    gives it a stable snapshot identity."
+  (:refer-clojure :exclude [conj disj contains? into])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
@@ -43,7 +44,7 @@
 (defn- half-accrue
   "Accrue δ half-maps {:adds #{..} :removals #{..}} by unioning each half."
   [a b]
-  (merge-with into a b))
+  (merge-with clojure.core/into a b))
 
 (defrecord Durable2PSet
            [id kv-store store-config storage comparator
@@ -140,7 +141,7 @@
                        retain-roots (loop [cs (seq commit-addrs) acc []]
                                       (if cs
                                         (let [c (await (d/read-commit kv-store (first cs) opts))]
-                                          (recur (next cs) (conj acc (:adds c) (:removals c))))
+                                          (recur (next cs) (clojure.core/conj acc (:adds c) (:removals c))))
                                         acc))]
                    (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
                                  (merge gc-opts opts {:retain-roots retain-roots
@@ -173,14 +174,14 @@
                                half-accrue
                                (if (= field :adds) {:adds #{elem}} {:removals #{elem}}))))))
 
-(defn add
+(defn conj
   "Add `elem`. (async+sync) Returns a NEW s."
-  ([s elem] (add s elem (:opts s)))
+  ([s elem] (conj s elem (:opts s)))
   ([s elem opts] (conj-into! s :adds elem opts)))
 
-(defn add-all
+(defn into
   "Add many elements. (async+sync) Returns a NEW s."
-  ([s elems] (add-all s elems (:opts s)))
+  ([s elems] (into s elems (:opts s)))
   ([s elems opts]
    (async+sync (:sync? opts)
                (async
@@ -189,9 +190,9 @@
                     (recur (await (conj-into! s :adds (first es) opts)) (next es))
                     s))))))
 
-(defn remove-elem
+(defn disj
   "Tombstone `elem` (permanent — 2P-Set semantics). (async+sync) Returns a NEW s."
-  ([s elem] (remove-elem s elem (:opts s)))
+  ([s elem] (disj s elem (:opts s)))
   ([s elem opts] (conj-into! s :removals elem opts)))
 
 (defn apply-delta
@@ -217,12 +218,12 @@
                (async (set/difference (await (d/set->clj (:adds s) opts))
                                       (await (d/set->clj (:removals s) opts)))))))
 
-(defn contains-elem?
+(defn contains?
   "Whether `elem` is live. (async+sync)"
-  ([s elem] (contains-elem? s elem (:opts s)))
+  ([s elem] (contains? s elem (:opts s)))
   ([s elem opts]
    (async+sync (:sync? opts)
-               (async (contains? (await (elements s opts)) elem)))))
+               (async (clojure.core/contains? (await (elements s opts)) elem)))))
 
 ;; ============================================================
 ;; Persistence + cross-store sync

@@ -33,9 +33,9 @@
   (testing "sub-systems are durable only after the composite commits"
     (let [sc-a (file-cfg) sc-b (file-cfg) sc-comp (file-cfg)
           a (<? (g/durable-gset "a" :store-config sc-a :sync? sync?))
-          a (<? (g/add a :a1)) a (<? (g/add a :a2))
+          a (<? (g/conj a :a1)) a (<? (g/conj a :a2))
           b (<? (g/durable-gset "b" :store-config sc-b :sync? sync?))
-          b (<? (g/add b :b1))
+          b (<? (g/conj b :b1))
           comp (<? (cmp/composite [a b] :store-config sc-comp :sync? sync?))]
       ;; pre-commit: the sub edits are in-memory only — a fresh reopen sees nothing
       (is (empty? (<? (g/elements (<? (g/durable-gset "a" :store-config sc-a :sync? sync?))))))
@@ -55,15 +55,15 @@
   (testing "branch! from a composite snapshot-id forks every sub at ITS recorded
             sub-snapshot — the whole composite frozen at a version + isolated"
     (let [comp (<? (cmp/composite [(opener "a")] :store-config (file-cfg) :sync? sync?))
-          comp (<? (cmp/update-subsystem comp "a" #(g/add % :x)))
-          comp (<? (cmp/update-subsystem comp "a" #(g/add % :y)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :x)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :y)))
           comp (<? (p/commit! comp "v1"))
           sid  (<? (p/snapshot-id comp))                ; FREEZE the composite at a:{:x :y}
-          comp (<? (p/commit! (<? (cmp/update-subsystem comp "a" #(g/add % :z))) "v2"))] ; → a:{:x :y :z}
+          comp (<? (p/commit! (<? (cmp/update-subsystem comp "a" #(g/conj % :z))) "v2"))] ; → a:{:x :y :z}
       (let [frozen (-> comp (p/branch! :iso sid) (p/checkout :iso))
             fa0    (cmp/get-subsystem frozen "a")]
         (is (= #{:x :y} (<? (g/elements fa0))) "sub a is frozen at the composite snapshot")
-        (let [fa (<? (g/add fa0 :w))]
+        (let [fa (<? (g/conj fa0 :w))]
           (is (= #{:x :y :w} (<? (g/elements fa))) "the isolated branch evolves independently")
           (is (= #{:x :y :z} (<? (g/elements (cmp/get-subsystem comp "a")))) "the live composite is untouched"))))))
 
@@ -71,11 +71,11 @@
   (testing "composite overlay = per-sub overlays; mutate the sub clones in
             isolation; merge-down! joins every sub back into the PARENT composite"
     (let [comp (<? (cmp/composite [(opener "a") (opener "b")] :store-config (file-cfg) :sync? sync?))
-          comp (<? (cmp/update-subsystem comp "a" #(g/add % :x)))
-          comp (<? (cmp/update-subsystem comp "b" #(g/add % :y)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :x)))
+          comp (<? (cmp/update-subsystem comp "b" #(g/conj % :y)))
           ov   (p/overlay comp {})]
-      (<? (cmp/overlay-subsystem-swap! ov "a" #(g/add % :x2)))
-      (<? (cmp/overlay-subsystem-swap! ov "b" #(g/add % :y2)))
+      (<? (cmp/overlay-subsystem-swap! ov "a" #(g/conj % :x2)))
+      (<? (cmp/overlay-subsystem-swap! ov "b" #(g/conj % :y2)))
       (is (= #{:x :x2} (<? (g/elements (cmp/overlay-subsystem ov "a")))) "sub a's overlay evolves in isolation")
       (is (= #{:x} (<? (g/elements (cmp/get-subsystem comp "a")))) "parent sub a untouched while open")
       (let [merged (<? (p/merge-down! ov))]
@@ -87,10 +87,10 @@
   (testing "a co-located composite sweeps ONCE over the union of all roots —
             reclaims the orphaned superseded trees, keeps live state, and resolves"
     (let [comp (<? (cmp/composite [(opener "a")] :store-config (file-cfg) :sync? sync?))
-          comp (<? (cmp/update-subsystem comp "a" #(g/add % :x)))
-          comp (<? (cmp/update-subsystem comp "a" #(g/add % :y)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :x)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :y)))
           comp (<? (p/commit! comp "c1"))
-          comp (<? (cmp/update-subsystem comp "a" #(g/add % :z)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :z)))
           comp (<? (p/commit! comp "c2"))              ; supersedes c1's index + sub trees
           before (count (<? (kb/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))
           ;; cutoff 1s ahead = "reclaim every orphan up to now" (reachable nodes are
@@ -107,9 +107,9 @@
 (deftest-async merge-commits-transactionally
   (testing "composite merge! delegates to the transactional commit"
     (let [a (<? (g/durable-gset "a" :store-config (file-cfg) :sync? sync?))
-          a (<? (g/add a :x))
+          a (<? (g/conj a :x))
           b (<? (g/durable-gset "b" :store-config (file-cfg) :sync? sync?))
-          b (<? (g/add b :y))
+          b (<? (g/conj b :y))
           comp (<? (cmp/composite [a b] :store-config (file-cfg) :sync? sync?))
           merged (<? (p/merge! comp :main {}))
           sid (<? (p/snapshot-id merged))]

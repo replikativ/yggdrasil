@@ -15,8 +15,8 @@
             [yggdrasil.convergent.ormap :as om]))
 
 (deftest gset-converges-on-cljs
-  (let [a (-> (gs/gset "kb") (gs/add :a) (gs/add :x))
-        b (-> (gs/gset "kb") (gs/add :b) (gs/add :x))]
+  (let [a (-> (gs/gset "kb") (gs/conj :a) (gs/conj :x))
+        b (-> (gs/gset "kb") (gs/conj :b) (gs/conj :x))]
     (is (= #{:a :b :x} (gs/elements (c/-join a b))))
     (is (= (gs/elements (c/-join a b)) (gs/elements (c/-join b a))))
     (is (true? (c/-conflict-free? a)))
@@ -31,11 +31,11 @@
     (is (= (lwwr/value (c/-join a b)) (lwwr/value (c/-join b a))))))
 
 (deftest ormap-add-wins-on-cljs
-  (let [a (-> (om/ormap "kb") (om/assoc-key :k 1))
-        b (-> (om/ormap "kb") (om/assoc-key :k 2))
-        a (om/dissoc-key a :k)]                 ; value-semantic: rebind
-    (is (= #{:k} (om/ormap-keys (c/-join a b))))
-    (is (= #{2} (om/lookup (c/-join a b) :k)))))
+  (let [a (-> (om/ormap "kb") (om/assoc :k 1))
+        b (-> (om/ormap "kb") (om/assoc :k 2))
+        a (om/dissoc a :k)]                 ; value-semantic: rebind
+    (is (= #{:k} (om/keys (c/-join a b))))
+    (is (= #{2} (om/get (c/-join a b) :k)))))
 
 (defn -main [& _]
   (run-tests))

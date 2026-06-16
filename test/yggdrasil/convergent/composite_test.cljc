@@ -43,7 +43,7 @@
   "A workspace composite with G-Sets {id -> initial-elems}."
   [systems]
   (comp/composite (for [[id elems] systems]
-                    (reduce gs/add (gs/gset id) elems))
+                    (reduce gs/conj (gs/gset id) elems))
                   :name "ws"))
 
 (defn- kb [composite id]
@@ -82,9 +82,9 @@
             (the versioned branch = merge-to-parent!'s per-system logic, now in
             the composite). Versioned subs share a store (resolvable ancestor)."
     (let [cell-store (atom {:a "val-a" :b "val-b"})
-          ws-a (comp/composite [(reduce gs/add (gs/gset "kb") [:a1 :shared])
+          ws-a (comp/composite [(reduce gs/conj (gs/gset "kb") [:a1 :shared])
                                 (->VersionedCell "cfg" cell-store :a)] :name "ws")
-          ws-b (comp/composite [(reduce gs/add (gs/gset "kb") [:b1 :shared])
+          ws-b (comp/composite [(reduce gs/conj (gs/gset "kb") [:b1 :shared])
                                 (->VersionedCell "cfg" cell-store :b)] :name "ws")
           merged (c/-join ws-a ws-b)]
       (testing "CRDT sub joins (union)"

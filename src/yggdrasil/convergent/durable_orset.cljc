@@ -29,6 +29,7 @@
    record carries its sync-mode (`opts`), so EVERY content-touching op — the
    functional API AND the protocol methods (-join/snapshot-id/as-of/gc-sweep!) —
    dispatches through `async+sync` (sync on JVM, async/CPS on cljs)."
+  (:refer-clojure :exclude [conj disj contains?])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
@@ -145,7 +146,7 @@
                        retain-roots (loop [cs (seq commit-addrs) acc []]
                                       (if cs
                                         (let [c (await (d/read-commit kv-store (first cs) opts))]
-                                          (recur (next cs) (conj acc (:adds c) (:removals c))))
+                                          (recur (next cs) (clojure.core/conj acc (:adds c) (:removals c))))
                                         acc))]
                    (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
                                  (merge gc-opts opts {:retain-roots retain-roots
@@ -167,9 +168,9 @@
 ;; Value ops — each returns a NEW OR-Set value (value-semantic)
 ;; ============================================================
 
-(defn add
+(defn conj
   "Add `elem` with a fresh tag (from `tag-fn`). (async+sync) Returns a NEW o."
-  ([o elem] (add o elem (:opts o)))
+  ([o elem] (conj o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
@@ -185,11 +186,11 @@
                (set/difference (await (d/set->clj (:adds o) opts))
                                (await (d/set->clj (:removals o) opts))))))
 
-(defn remove-elem
+(defn disj
   "Observed-remove `elem`: tombstone exactly the add-tags currently observed for
    it. A concurrent (unobserved) add survives — add-wins. (async+sync) Returns a
    NEW o."
-  ([o elem] (remove-elem o elem (:opts o)))
+  ([o elem] (disj o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
@@ -223,12 +224,12 @@
    (async+sync (:sync? opts)
                (async (into #{} (map first) (await (live-pairs o opts)))))))
 
-(defn contains-elem?
+(defn contains?
   "Whether `elem` is live. (async+sync)"
-  ([o elem] (contains-elem? o elem (:opts o)))
+  ([o elem] (contains? o elem (:opts o)))
   ([o elem opts]
    (async+sync (:sync? opts)
-               (async (contains? (await (elements o opts)) elem)))))
+               (async (clojure.core/contains? (await (elements o opts)) elem)))))
 
 ;; ============================================================
 ;; Persistence + cross-store sync

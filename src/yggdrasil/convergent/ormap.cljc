@@ -16,7 +16,12 @@
    (distinct values ⇒ distinct uids). The inner `merge` is right-biased on a uid
    collision, so two replicas assoc'ing the SAME k with the SAME uid but DIFFERENT
    v would make the join order-dependent (non-commutative). random-uuid and a
-   content-hash-of-[k v] tag both satisfy this; a content-hash-of-k-only does not."
+   content-hash-of-[k v] tag both satisfy this; a content-hash-of-k-only does not.
+
+   NB: callers alias this ns (`[… :as om]`) and call `om/assoc`/`om/get`/`om/dissoc`/
+   `om/keys`, so the bare Clojure verbs read like collection ops; only this defining
+   ns excludes them from `clojure.core` and qualifies the few internal core uses."
+  (:refer-clojure :exclude [assoc dissoc get keys])
   (:require [clojure.set :as set]
             [yggdrasil.convergent.system :as sys]))
 
@@ -34,17 +39,17 @@
   (sys/conflict-free-system id :ormap :branch branch :vjoin ormap-join :bottom bottom))
 
 (defn- live-uids [val k]
-  (set/difference (set (keys (get-in val [:adds k])))
-                  (set (keys (get-in val [:removals k])))))
+  (set/difference (set (clojure.core/keys (get-in val [:adds k])))
+                  (set (clojure.core/keys (get-in val [:removals k])))))
 
-(defn assoc-key
+(defn assoc
   "Assoc `v` under `k` with a fresh observed tag (local op)."
   [m k v]
   (let [uid (random-uuid)]
     (sys/record-delta (sys/upd! m assoc-in [:adds k uid] v)
                       {:adds {k {uid v}}})))
 
-(defn dissoc-key
+(defn dissoc
   "Remove `k` — tombstone its currently-live tags (local op)."
   [m k]
   (let [val   (sys/cur m)
@@ -57,7 +62,7 @@
                            val uids)))
      delta)))
 
-(defn lookup
+(defn get
   "The live value-set for `k` (add-wins), or nil if absent."
   [m k]
   (let [val (sys/cur m)
@@ -65,8 +70,8 @@
     (when (seq cut)
       (set (map (get-in val [:adds k]) cut)))))
 
-(defn ormap-keys
+(defn keys
   "The set of keys with at least one live value."
   [m]
   (let [val (sys/cur m)]
-    (into #{} (filter #(seq (live-uids val %))) (keys (:adds val)))))
+    (into #{} (filter #(seq (live-uids val %))) (clojure.core/keys (:adds val)))))

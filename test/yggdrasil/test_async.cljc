@@ -23,7 +23,7 @@
 
        (deftest-async roundtrip
          (let [g   (<? (g/durable-gset \"t\" :store-config (mem) :sync? sync?))
-               g   (<? (g/add g :x))
+               g   (<? (g/conj g :x))
                els (<? (g/elements g))]
            (is (= #{:x} els))))
 
