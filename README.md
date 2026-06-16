@@ -582,6 +582,43 @@ Each HLC has a `physical` (millis since epoch) and a `logical` counter. The phys
 ;; garbage-collectable, addressable, committable
 ```
 
+## Convergent CRDTs
+
+Yggdrasil ships a catalog of **conflict-free replicated data types** as first-class
+systems — durable on the same persistent-sorted-set + konserve substrate as the
+snapshot registry, and cross-platform (JVM + ClojureScript). Each is a value with a
+commutative/associative/idempotent join (`-join`); a replica is a copy held in a cell,
+and convergence is the join. They are **read on the fly**: the value is never fully
+materialized — a key-scoped read pulls only the B-tree nodes it touches, through an
+in-memory node cache (a key read is an O(log n) range slice). Constructing one without
+a `:store-config` defaults to a fresh in-memory konserve store.
+
+| CRDT | namespace | use it for |
+|---|---|---|
+| G-Set | `convergent.gset` | a set that only grows |
+| OR-Set | `convergent.orset` | convergent removal, re-add allowed (add-wins) |
+| 2P-Set | `convergent.twopset` | a set where removal is final |
+| OR-Map | `convergent.ormap` | a keyed map, concurrent writes surfaced |
+| Merging-OR-Map | `convergent.ormap` (`merging-ormap`) | a keyed map, concurrent writes auto-merged by a lattice fn |
+| LWW-Register | `convergent.lwwr` | last-writer-wins single value (in-memory) |
+| CDVCS | `convergent.cdvcs` | versioned history with explicit conflict resolution |
+
+```clojure
+(require '[yggdrasil.convergent.ormap :as om])
+
+(let [m (-> (om/ormap "kb") (om/assoc :k 1) (om/assoc :k 2))]
+  (om/get m :k))                                   ;; => #{1 2}  (concurrent writes surfaced)
+
+(let [m (-> (om/merging-ormap "kb" max) (om/assoc :k 1) (om/assoc :k 9))]
+  (om/get m :k))                                   ;; => 9       (folded by the merge-fn)
+```
+
+The collection verbs are bare Clojure collection names — alias the namespace so they
+read like `(om/get m k)`. On ClojureScript the operations are asynchronous (construct
+with `:sync? false` and `await`). See **[doc/crdts.md](doc/crdts.md)** for the full
+catalog, storage layout, and sync, and **[doc/cdvcs-convergent-system.md](doc/cdvcs-convergent-system.md)**
+for CDVCS.
+
 ## Multi-System Coordination
 
 Yggdrasil provides two mechanisms for working with multiple systems together. They solve different problems at different levels:
