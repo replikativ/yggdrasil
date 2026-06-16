@@ -1,13 +1,12 @@
 (ns yggdrasil.convergent.composite-test
   "Spike L4-core: merging two PEER workspaces is a symmetric system-merge of
    their composites — no parent, no new interface (just -join)."
-  (:require #?(:clj [clojure.test :refer [deftest testing is]]
-               :cljs [cljs.test :refer-macros [deftest testing is]])
+  (:require [clojure.test :refer [deftest testing is]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.composite :as comp]
             [yggdrasil.convergent.composite]
-            [yggdrasil.convergent.gset :as gs]))
+            [yggdrasil.convergent.durable-gset :as g]))
 
 ;; A minimal VERSIONED (non-convergent) system fixture: a register on a shared
 ;; store, Mergeable (merge! = take-theirs) but NOT PConvergent — so a composite
@@ -43,11 +42,11 @@
   "A workspace composite with G-Sets {id -> initial-elems}."
   [systems]
   (comp/composite (for [[id elems] systems]
-                    (reduce gs/conj (gs/gset id) elems))
+                    (reduce g/conj (g/durable-gset id) elems))
                   :name "ws"))
 
 (defn- kb [composite id]
-  (gs/elements (comp/get-subsystem composite id)))
+  (g/elements (comp/get-subsystem composite id)))
 
 (deftest test-peer-workspace-merge
   (testing "two peer workspaces (separate replicas) converge by joining their
@@ -82,9 +81,9 @@
             (the versioned branch = merge-to-parent!'s per-system logic, now in
             the composite). Versioned subs share a store (resolvable ancestor)."
     (let [cell-store (atom {:a "val-a" :b "val-b"})
-          ws-a (comp/composite [(reduce gs/conj (gs/gset "kb") [:a1 :shared])
+          ws-a (comp/composite [(reduce g/conj (g/durable-gset "kb") [:a1 :shared])
                                 (->VersionedCell "cfg" cell-store :a)] :name "ws")
-          ws-b (comp/composite [(reduce gs/conj (gs/gset "kb") [:b1 :shared])
+          ws-b (comp/composite [(reduce g/conj (g/durable-gset "kb") [:b1 :shared])
                                 (->VersionedCell "cfg" cell-store :b)] :name "ws")
           merged (c/-join ws-a ws-b)]
       (testing "CRDT sub joins (union)"

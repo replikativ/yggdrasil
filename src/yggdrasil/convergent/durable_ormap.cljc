@@ -300,7 +300,8 @@
 (defn- open-ormap
   [id merge-fn {:keys [store-config comparator sync? kv-store roots-key freed-key]
                 :or {comparator compare sync? true}}]
-  (let [freed-key (or freed-key (when (vector? roots-key) (clojure.core/assoc roots-key 0 :crdt/freed)))
+  (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))
+        freed-key (or freed-key (when (vector? roots-key) (clojure.core/assoc roots-key 0 :crdt/freed)))
         opts (cond-> {:sync? sync?}
                kv-store  (clojure.core/assoc :kv-store kv-store)
                roots-key (clojure.core/assoc :roots-key roots-key)

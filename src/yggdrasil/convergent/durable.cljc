@@ -54,6 +54,14 @@
 ;; Store lifecycle
 ;; ============================================================
 
+(defn mem-store-config
+  "A fresh in-memory konserve store-config — the default backing when a CRDT is
+   constructed WITHOUT an explicit `:store-config`/`:kv-store`. The 'memory'
+   variant is just the durable CRDT over a memory store (read on the fly via the
+   PSS + node-cache, no separate in-memory representation)."
+  []
+  {:backend :memory :id (random-uuid)})
+
 (defn open
   "Open the konserve store for a durable CRDT and load its freed-set into a
    fresh content-addressed KonserveStorage. Returns (async+sync)

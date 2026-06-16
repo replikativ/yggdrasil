@@ -1,7 +1,9 @@
 (ns yggdrasil.convergent.cljs-test
-  "Proves the CRDT catalog (G-Set / LWWR / OR-Map) compiles AND converges on
-   ClojureScript — i.e. yggdrasil's conflict-free systems run in the browser.
-   Run: clojure -M:cljs-test (compiles to node, runs -main)."
+  "cljs compile-smoke + the in-memory LWWR convergence on ClojureScript. The
+   collection CRDTs (G-Set / OR-Map / 2P-Set / OR-Set) are now durable-only (PSS
+   over konserve, async on cljs) and proven on node by their own durable_*_test
+   ns; this file just (a) forces cljs compilation of the storage/registry/
+   composite/workspace layer and (b) covers LWWR, the one in-memory (sync) CRDT."
   (:require [cljs.test :refer-macros [deftest is testing run-tests]]
             ;; force cljs compilation of the cross-platform storage + index layer
             [yggdrasil.storage]
@@ -10,17 +12,7 @@
             [yggdrasil.workspace]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
-            [yggdrasil.convergent.gset :as gs]
-            [yggdrasil.convergent.lwwr :as lwwr]
-            [yggdrasil.convergent.ormap :as om]))
-
-(deftest gset-converges-on-cljs
-  (let [a (-> (gs/gset "kb") (gs/conj :a) (gs/conj :x))
-        b (-> (gs/gset "kb") (gs/conj :b) (gs/conj :x))]
-    (is (= #{:a :b :x} (gs/elements (c/-join a b))))
-    (is (= (gs/elements (c/-join a b)) (gs/elements (c/-join b a))))
-    (is (true? (c/-conflict-free? a)))
-    (is (= :gset (p/system-type a)))))
+            [yggdrasil.convergent.lwwr :as lwwr]))
 
 (deftest lwwr-converges-on-cljs
   (let [a (-> (lwwr/lwwr "x") (lwwr/set-register :a))
@@ -28,14 +20,8 @@
         b (-> (lwwr/lwwr "x") (lwwr/set-register :b))]
     ;; both registers carry timestamps; join keeps one deterministically
     (is (contains? #{:a :b} (lwwr/value (c/-join a b))))
-    (is (= (lwwr/value (c/-join a b)) (lwwr/value (c/-join b a))))))
-
-(deftest ormap-add-wins-on-cljs
-  (let [a (-> (om/ormap "kb") (om/assoc :k 1))
-        b (-> (om/ormap "kb") (om/assoc :k 2))
-        a (om/dissoc a :k)]                 ; value-semantic: rebind
-    (is (= #{:k} (om/keys (c/-join a b))))
-    (is (= #{2} (om/get (c/-join a b) :k)))))
+    (is (= (lwwr/value (c/-join a b)) (lwwr/value (c/-join b a))))
+    (is (true? (c/-conflict-free? a)))))
 
 (defn -main [& _]
   (run-tests))
