@@ -9,11 +9,11 @@
    re-enters `adds`, but it is also in `removals`). For re-add-after-remove use
    the OR-Set (`orset`).
 
-   Unlike the OR-Set this stores BARE elements (no `[elem tag]` pairs), so a
-   key-level storage codec (`:key-encode`/`:key-decode` — e.g. the registry's
-   entry<->map) applies cleanly and there is no doubled storage. Elements may be
-   any konserve-native value or, with a codec, records; a `:comparator` orders
-   them (default `compare`).
+   Unlike the OR-Set this stores BARE elements (no `[elem tag]` pairs), so an
+   element fressian handler (`:element-read-handlers`/`:element-write-handlers` —
+   e.g. the registry's RegistryEntry) applies cleanly and there is no doubled
+   storage. Elements may be any fressian-native value or, with a handler, records;
+   a `:comparator` orders them (default `compare`).
 
    VALUE SEMANTICS: the record holds the two halves (`adds`/`removals`, immutable
    PSS-set values) and a `dirty` flag as PLAIN fields; every mutator returns a NEW
@@ -213,10 +213,12 @@
   "Open (or create) a durable 2P-Set on a per-system konserve store.
 
    :comparator             element order (default compare)
-   :key-encode/:key-decode  node-key element codec (default identity; the
-                            registry passes its entry<->map codec)
+   :element-read-handlers/:element-write-handlers
+                            fressian handlers for the element type (default none —
+                            elements are fressian-native; the registry passes a
+                            RegistryEntry handler)
    Restores both halves from the store's :crdt/roots cell when present."
-  [id & {:keys [comparator key-encode key-decode sync? store-config kv-store roots-key freed-key]
+  [id & {:keys [comparator element-read-handlers element-write-handlers sync? store-config kv-store roots-key freed-key]
          :or {comparator compare sync? true}}]
   (async+sync sync?
               (async
@@ -224,5 +226,6 @@
                      (await (d/two-half-open store-config
                                              {:comparator comparator :sync? sync? :kv-store kv-store
                                               :roots-key roots-key :freed-key freed-key
-                                              :key-encode key-encode :key-decode key-decode}))]
+                                              :element-read-handlers element-read-handlers
+                                              :element-write-handlers element-write-handlers}))]
                  (->TwoPSet id kv-store store-config storage comparator adds removals false opts)))))

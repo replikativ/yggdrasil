@@ -21,7 +21,29 @@
    Queries full-scan the live set — fast enough at the expected scale."
   (:require [yggdrasil.types :as t]
             [yggdrasil.storage :as store]
-            [yggdrasil.convergent.twopset :as d2p]))
+            [yggdrasil.convergent.twopset :as d2p])
+  #?(:clj (:import [org.fressian.handlers WriteHandler ReadHandler]
+                   [yggdrasil.types RegistryEntry])))
+
+;; RegistryEntry is a JVM record → it needs a fressian element handler so durable
+;; (file/IndexedDB) stores serialize the registry's node keys via the canonical PSS
+;; node handlers (which recurse into element values). cljs registry entries are plain
+;; maps (fressian-native), so no handler there. The codec is the existing
+;; entry->map / map->entry (storage).
+#?(:clj
+   (def ^:private element-write-handlers
+     {RegistryEntry
+      {"yggdrasil/registry-entry"
+       (reify WriteHandler
+         (write [_ w e]
+           (.writeTag w "yggdrasil/registry-entry" 1)
+           (.writeObject w (store/entry->map e))))}}))
+
+#?(:clj
+   (def ^:private element-read-handlers
+     {"yggdrasil/registry-entry"
+      (reify ReadHandler
+        (read [_ rdr _tag _n] (store/map->entry (.readObject rdr))))}))
 
 ;; ============================================================
 ;; tsbs comparator
@@ -200,8 +222,8 @@
          tpset (d2p/twopset "registry"
                             :store-config store-config
                             :comparator tsbs-comparator
-                            :key-encode store/entry->map
-                            :key-decode store/map->entry)]
+                            :element-read-handlers  #?(:clj element-read-handlers  :cljs nil)
+                            :element-write-handlers #?(:clj element-write-handlers :cljs nil))]
      (->Registry (atom tpset) (:kv-store tpset) store-config))))
 
 (defn gc!

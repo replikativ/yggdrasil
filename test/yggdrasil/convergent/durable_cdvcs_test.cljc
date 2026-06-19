@@ -6,7 +6,7 @@
    PORTABLE — one .cljc body per concern (JVM sync / cljs async via `<?`)."
   (:require #?(:clj  [clojure.test :refer [is testing]]
                :cljs [cljs.test :refer [is testing]])
-            [yggdrasil.test-async :refer [deftest-async <? sync? mem file-cfg]]
+            [yggdrasil.test-async :refer [deftest-async <? sync? file-cfg]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.cdvcs :as cd]
@@ -31,7 +31,7 @@
 
 (deftest-async snapshot-and-as-of
   (testing "content-addressed snapshot-id freezes the value; as-of restores it"
-    (let [a   (<? (cd/cdvcs "doc" :author "alice" :store-config (mem) :sync? sync?))
+    (let [a   (<? (cd/cdvcs "doc" :author "alice" :store-config (file-cfg) :sync? sync?))
           a   (<? (cd/commit a "alice" [[:assoc :x 1]]))
           sid (<? (p/snapshot-id a))
           a   (<? (cd/commit a "alice" [[:assoc :y 2]]))]
@@ -43,7 +43,7 @@
 (deftest-async divergence-lifts-conflict-then-merge-resolves
   (testing "two lineages in ONE store: -join lifts a 2-head conflict; merge resolves it"
     ;; share one kv-store (distinct state cells); both seed the SAME base commit
-    (let [a (<? (cd/cdvcs "a" :author "root" :store-config (mem) :sync? sync?
+    (let [a (<? (cd/cdvcs "a" :author "root" :store-config (file-cfg) :sync? sync?
                           :state-key [:cdvcs/state "a"]))
           b (<? (cd/cdvcs "b" :author "root" :kv-store (:kv-store a) :sync? sync?
                           :state-key [:cdvcs/state "b"]))

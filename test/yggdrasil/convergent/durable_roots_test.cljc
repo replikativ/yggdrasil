@@ -5,7 +5,7 @@
    runs synchronously on the JVM and as a partial-cps `async` block on cljs (every
    async durable op is wrapped in `<?`; branch!/checkout/branches are plain sync)."
   (:require [clojure.test :refer [is testing]]
-            [yggdrasil.test-async :refer [deftest-async <? sync? mem]]
+            [yggdrasil.test-async :refer [deftest-async <? sync? file-cfg]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.gset :as g]
@@ -16,7 +16,7 @@
 
 (deftest-async save-roots-is-a-grow-map
   (testing "save-roots! merges, never clobbers a branch it doesn't know"
-    (let [gs (<? (g/gset "t" :store-config (mem) :sync? sync?))
+    (let [gs (<? (g/gset "t" :store-config (file-cfg) :sync? sync?))
           kv (:kv-store gs)]
       (<? (d/save-roots! kv {:main :ra} {:sync? sync?}))
       (<? (d/save-roots! kv {:feature :rf} {:sync? sync?}))        ; a writer that only knows :feature
@@ -26,12 +26,12 @@
 
 (deftest-async multi-branch-peers-converge
   (testing "two peers each add a distinct branch → merge keeps BOTH branches"
-    (let [a (<? (g/gset "kb" :store-config (mem) :sync? sync?))
+    (let [a (<? (g/gset "kb" :store-config (file-cfg) :sync? sync?))
           a (<? (g/conj a :shared))
           a (-> a (p/branch! :fa) (p/checkout :fa))
           a (<? (g/conj a :a-only))
           a (<? (g/flush! a))
-          b (<? (g/gset "kb" :store-config (mem) :sync? sync?))
+          b (<? (g/gset "kb" :store-config (file-cfg) :sync? sync?))
           b (<? (g/conj b :shared))
           b (-> b (p/branch! :fb) (p/checkout :fb))
           b (<? (g/conj b :b-only))

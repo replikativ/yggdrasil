@@ -67,21 +67,30 @@
    fresh content-addressed KonserveStorage. Returns (async+sync)
    {:kv-store :store-config :storage}.
 
-   opts may carry `:key-encode`/`:key-decode` — a node-key element codec (default
-   identity). Bare-element CRDTs (G-Set/2P-Set of records) pass the entry codec
-   here so records round-trip; element-pair CRDTs leave it identity."
+   opts may carry `:element-read-handlers`/`:element-write-handlers` — fressian
+   handlers for the CRDT's element type, attached alongside the canonical PSS node
+   handlers so durable backends round-trip non-fressian-native elements (e.g. the
+   registry's RegistryEntry). Bare-element CRDTs need none."
   ([store-config] (open store-config {:sync? true}))
   ([store-config opts]
-   (let [opts (merge {:sync? true} opts)     ; codec-only callers default to sync
-         {:keys [key-encode key-decode]} opts]
+   (let [opts     (merge {:sync? true} opts)
+         settings (or (:settings opts) (store/default-settings))]
      (async+sync (:sync? opts)
                  (async
                   (let [;; reuse a pre-opened store (the single-store composite passes
-                        ;; its own kv-store so subs co-habit it) or open store-config.
-                        kv-store (or (:kv-store opts) (await (store/open-store store-config opts)))
+                        ;; its own kv-store so subs co-habit it — already serializer-attached)
+                        ;; or open store-config and attach the canonical PSS node serializer
+                        ;; (no-op for memory; (de)serializes node objects for file/IndexedDB).
+                        ;; `:element-read-handlers`/`:element-write-handlers` let a caller add an
+                        ;; element handler (e.g. the registry's RegistryEntry); the bare catalog
+                        ;; needs none (its elements are fressian-native).
+                        kv-store (if-let [pre (:kv-store opts)]
+                                   pre
+                                   (store/attach-pss-serializer!
+                                    (await (store/open-store store-config opts)) settings
+                                    (:element-read-handlers opts) (:element-write-handlers opts)))
                         storage  (store/create-storage kv-store {:content-addressed? true
-                                                                 :key-encode key-encode
-                                                                 :key-decode key-decode})
+                                                                 :settings settings})
                         freed    (or (await (kb/k-get kv-store (fk opts) opts)) {})]
                     (reset! (:freed-atom storage) freed)
                     {:kv-store kv-store :store-config store-config :storage storage}))))))
@@ -446,18 +455,21 @@
   "Open a two-half CRDT's store and restore both halves from `:crdt/roots`. Returns
    `{:kv-store :storage :store-config :opts :adds :removals}`. `:store-config`
    defaults to a fresh in-memory store. `factory-opts` may carry
-   `:comparator`/`:sync?`/`:kv-store`/`:roots-key`/`:freed-key`/`:key-encode`/
-   `:key-decode`. (async+sync)"
-  [store-config {:keys [comparator sync? kv-store roots-key freed-key key-encode key-decode]
+   `:comparator`/`:sync?`/`:kv-store`/`:roots-key`/`:freed-key` and
+   `:element-read-handlers`/`:element-write-handlers` (a fressian handler for the
+   CRDT's element type — e.g. the registry's RegistryEntry; bare-element CRDTs need
+   none). (async+sync)"
+  [store-config {:keys [comparator sync? kv-store roots-key freed-key
+                        element-read-handlers element-write-handlers]
                  :or {comparator compare sync? true}}]
   (let [store-config (or store-config (when-not kv-store (mem-store-config)))
         freed-key    (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
         opts (cond-> {:sync? sync?}
-               kv-store   (assoc :kv-store kv-store)
-               roots-key  (assoc :roots-key roots-key)
-               freed-key  (assoc :freed-key freed-key)
-               key-encode (assoc :key-encode key-encode)
-               key-decode (assoc :key-decode key-decode))]
+               kv-store               (assoc :kv-store kv-store)
+               roots-key              (assoc :roots-key roots-key)
+               freed-key              (assoc :freed-key freed-key)
+               element-read-handlers  (assoc :element-read-handlers element-read-handlers)
+               element-write-handlers (assoc :element-write-handlers element-write-handlers))]
     (async+sync sync?
                 (async
                  (let [{:keys [kv-store storage]} (await (open store-config opts))

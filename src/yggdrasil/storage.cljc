@@ -1,38 +1,37 @@
 (ns yggdrasil.storage
-  "Persistent storage layer for the snapshot registry — cross-platform.
+  "Persistent storage layer for the convergent CRDT catalog + snapshot registry —
+   cross-platform.
 
-   Implements PSS IStorage backed by konserve for durable B-tree indices. Each
-   PSS node (Leaf or Branch) is serialized as a PLAIN MAP
-   ({:level :keys :addresses}); konserve round-trips plain maps natively on both
-   platforms, so the format is portable JVM<->cljs with NO fressian/transit
-   handlers (unlike datahike, which serializes node objects and needs handlers).
-   The only platform-specific part is reconstructing the node from the map.
+   Implements PSS `IStorage` backed by konserve for durable B-tree indices. Nodes are
+   stored as PSS Leaf/Branch OBJECTS and (de)serialized by the canonical, SHARED
+   `org.replikativ.persistent-sorted-set.fressian` handlers attached to the konserve
+   store (`attach-pss-serializer!`) — the same node wire/storage form datahike,
+   proximum and stratum use, so there is one codec and no bespoke node↔map conversion
+   here. A konserve MEMORY store holds the node object as-is (no serialization, no
+   handlers); FILE (JVM) / IndexedDB (cljs) serialize it via those handlers. The node's
+   content address is `(hasch/uuid (pss-fress/node->map node))`.
 
-   - JVM: implements the Java `IStorage` interface (synchronous restore(addr),
-     reconstructed via the Java Branch./Leaf. constructors). Konserve via
-     {:sync? true}.
-   - cljs: implements PSS's cljs `IStorage` protocol (store/restore [_ _ opts] →
-     a partial-cps `async` value via `async+sync` + the konserve→partial-cps
-     bridge), reconstructed via `branch/from-map` / `Leaf.`.
+   - JVM: the Java `IStorage` interface (synchronous), konserve `{:sync? true}`.
+   - cljs: PSS's cljs `IStorage` protocol (store/restore `[_ _ opts]` → a partial-cps
+     `async` value).
 
-   Registry entries are RegistryEntry records on JVM (converted to/from maps at
-   the storage boundary) and plain maps on cljs; the stored representation is a
-   map either way."
+   Registry entries are RegistryEntry records on JVM (serialized via a RegistryEntry
+   fressian element handler the registry attaches alongside the node handlers) and plain
+   maps on cljs (fressian-native)."
   (:require [konserve.store :as kstore]
+            [konserve.core :as kc]
+            [konserve.serializers :as kser]
             [hasch.core :as hasch]
+            [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [yggdrasil.kbridge :as kb]
             [yggdrasil.types :as t]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]])
-            #?@(:cljs [[org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]
-                       [org.replikativ.persistent-sorted-set.impl.node :as node]
-                       [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
-                       [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]]))
+            #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set
-                    ANode Branch IStorage Leaf Settings])))
+  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage Settings])))
 
 ;; ============================================================
 ;; Store lifecycle
@@ -117,36 +116,25 @@
                      (update :key->gen dissoc k)))
                c)))))
 
-(defrecord KonserveStorage [kv-store settings cache freed-atom key-encode key-decode content-addressed?]
+;; Nodes are stored as PSS Leaf/Branch OBJECTS, (de)serialized by the canonical
+;; `org.replikativ.persistent-sorted-set.fressian` handlers attached to the konserve
+;; store (see `attach-pss-serializer!`). A konserve MEMORY store holds the object as-is
+;; (no serialization); FILE/IndexedDB serialize it via those handlers. The address is
+;; content-derived from `pss-fress/node->map` (the node's canonical projection — a
+;; Merkle hash over level/keys/addresses, so identical subtrees share an address and
+;; sync incrementally), or a random UUID when `content-addressed?` is false.
+(defrecord KonserveStorage [kv-store settings cache freed-atom content-addressed?]
   IStorage
   #?@(:clj
       [(store [_ node]
-              (let [^ANode node node
-                    node-data {:level     (.level node)
-                               :keys      (mapv key-encode (.keys node))
-                               :addresses (when (instance? Branch node)
-                                            (vec (.addresses ^Branch node)))}
-               ;; content-addressed: the address IS the hasch UUID of the node
-               ;; content. Branch content includes child addresses (themselves
-               ;; content hashes) ⇒ a Merkle tree: identical subtrees share an
-               ;; address, so successive versions ship incrementally and peers
-               ;; dedup. Else a random UUID (registry default — unchanged).
-                    address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
-                (kb/k-assoc kv-store address node-data {:sync? true})
+              (let [address (if content-addressed? (hasch/uuid (pss-fress/node->map node)) (random-uuid))]
+                (kb/k-assoc kv-store address node {:sync? true})
                 (cache-put! cache address node)
                 address))
 
        (restore [_ address]
                 (or (cache-lookup cache address)
-                    (let [node-data (kb/k-get kv-store address {:sync? true})
-                          keys (mapv key-decode (:keys node-data))
-                          addresses (:addresses node-data)
-                          node (if addresses
-                                 (Branch. (int (:level node-data))
-                                          ^java.util.List keys
-                                          ^java.util.List (vec addresses)
-                                          settings)
-                                 (Leaf. ^java.util.List keys settings))]
+                    (let [node (kb/k-get kv-store address {:sync? true})]
                       (cache-put! cache address node)
                       node)))
 
@@ -159,12 +147,8 @@
       [(store [_ node opts]
               (async+sync (:sync? opts)
                           (async
-                           (let [node-data {:level     (node/level node)
-                                            :keys      (mapv key-encode (.-keys node))
-                                            :addresses (when (instance? Branch node)
-                                                         (vec (.-addresses node)))}
-                                 address (if content-addressed? (hasch/uuid node-data) (random-uuid))]
-                             (await (kb/k-assoc kv-store address node-data opts))
+                           (let [address (if content-addressed? (hasch/uuid (pss-fress/node->map node)) (random-uuid))]
+                             (await (kb/k-assoc kv-store address node opts))
                              (cache-put! cache address node)
                              address))))
 
@@ -172,22 +156,7 @@
                 (async+sync (:sync? opts)
                             (async
                              (or (cache-lookup cache address)
-                          ;; PSS cljs nodes hold their `keys`/`addresses` as JS
-                          ;; ARRAYS (`.slice`/`aget`/`aconcat` are used on them).
-                          ;; konserve round-trips them as Clojure vectors, so the
-                          ;; cache-MISS rebuild MUST `to-array` them — else the
-                          ;; reconstructed Leaf/Branch iterates a cljs vector via
-                          ;; JS-array ops and silently reads as empty. (The
-                          ;; cache-HIT path returns the original PSS node, so this
-                          ;; only bites a true cache miss: ship-to-fresh-store or
-                          ;; reopen — caught by the cross-peer/merge-peer! tests.)
-                                 (let [node-data (await (kb/k-get kv-store address opts))
-                                       node (if (:addresses node-data)
-                                              (branch/from-map (assoc node-data
-                                                                      :keys (to-array (mapv key-decode (:keys node-data)))
-                                                                      :addresses (to-array (:addresses node-data))
-                                                                      :settings settings))
-                                              (Leaf. (to-array (mapv key-decode (:keys node-data))) settings (:measure node-data)))]
+                                 (let [node (await (kb/k-get kv-store address opts))]
                                    (cache-put! cache address node)
                                    node)))))
 
@@ -197,29 +166,50 @@
        (isFreed [_ address] (contains? @freed-atom address))
        (freedInfo [_ address] (get @freed-atom address))]))
 
+(defn default-settings
+  "Platform-default PSS settings — the same value the storage and its serializer must
+   share so reconstructed nodes match. JVM: a `Settings`; cljs: a settings map."
+  []
+  #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
+
 (defn create-storage
   "Create a KonserveStorage backed by a konserve store.
 
    opts:
-     :key-encode / :key-decode  transcode element values at the node-key
-       boundary (default identity — for konserve-native values like
-       keywords/strings/vectors, e.g. a durable G-Set). The registry opts into
-       `entry->map`/`map->entry`.
      :content-addressed?  when true (DEFAULT), a node's address is the hasch
        UUID of its content (a Merkle tree) — required for clean cross-peer
        merge + dedup + incremental sync. Set false for stores of heavy values
        where hashing the content outweighs the dedup win (then addresses are
        random UUIDs and only same-store structural sharing applies).
-     :settings  PSS settings (default = platform default)."
+     :settings  PSS settings (default = platform default).
+
+   Element handling: node elements (G-Set values, OR-Map triples, registry
+   entries, …) are serialized by the konserve store's serializer — for durable
+   backends, the canonical PSS node handlers + any consumer ELEMENT handler the
+   caller attaches (e.g. a RegistryEntry handler). Memory stores hold the node
+   object as-is, so no handlers are needed there."
   ([kv-store] (create-storage kv-store {}))
-  ([kv-store {:keys [settings key-encode key-decode content-addressed?]
+  ([kv-store {:keys [settings content-addressed?]
               :or {content-addressed? true}}]
-   ;; coerce in the body (not via :or) so an explicit nil — e.g. from
-   ;; durable/open threading {:key-encode nil} — still defaults to identity.
-   (->KonserveStorage kv-store
-                      (or settings #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
-                      (atom empty-cache) (atom {})
-                      (or key-encode identity) (or key-decode identity) content-addressed?)))
+   (->KonserveStorage kv-store (or settings (default-settings))
+                      (atom empty-cache) (atom {}) content-addressed?)))
+
+(defn attach-pss-serializer!
+  "Return `kv-store` with a FressianSerializer carrying the canonical PSS node handlers
+   (`org.replikativ.persistent-sorted-set.fressian`, parameterized by `settings`) plus
+   any consumer ELEMENT handlers, so durable backends (file / IndexedDB) (de)serialize
+   the stored node OBJECTS. A memory store ignores serializers (holds objects as-is), so
+   this is a harmless no-op there. `element-read-handlers` is `{tag rh}`; on the JVM
+   `element-write-handlers` is `{Class {tag wh}}`, on cljs `{Type fn}` (the shapes the
+   konserve FressianSerializer expects, same as the PSS node handlers)."
+  ([kv-store settings] (attach-pss-serializer! kv-store settings nil nil))
+  ([kv-store settings element-read-handlers element-write-handlers]
+   (kc/assoc-serializers
+    kv-store
+    {:FressianSerializer
+     (kser/fressian-serializer
+      (merge (pss-fress/read-handlers settings) element-read-handlers)
+      (merge pss-fress/write-handlers element-write-handlers))})))
 
 ;; ============================================================
 ;; Index root + freed persistence — async+sync (sync on JVM, async on cljs)
