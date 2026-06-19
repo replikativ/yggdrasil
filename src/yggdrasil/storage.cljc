@@ -213,22 +213,27 @@
    store); comparator defaults to nil (re-stamped lazily on descent, like every read here)."
   ([kv-store settings] (attach-pss-serializer! kv-store settings nil nil))
   ([kv-store settings element-read-handlers element-write-handlers]
-   ;; delayed: create-storage wraps the very kv-store we're attaching the serializer to.
-   ;; ONE local store ⇒ a fixed reconstruction SCOPE (storage over this kv-store; comparator
-   ;; nil — re-stamped on descent). When yggdrasil ships CRDT VALUES over a shared wire, it
-   ;; additionally register-scope!s under its store-id and stamps :store-id into the set meta
-   ;; (so a remote peer resolves it from the registry); that wire plumbing lives with the
-   ;; cross-system path, not this local serializer.
+   ;; This serializer is attached PER kv-store, so its node handlers close over THIS store's
+   ;; `settings` (nodes carry no id ⇒ one settings per physical store; different-settings stores
+   ;; ⇒ different serializers — not a global singleton). The ROOT, however, is NOT assumed
+   ;; single-store: `resolve-scope` first consults `pss-fress/scope-registry` by the root's
+   ;; `:store-id` — so a root from ANY registered store (a shared wire, or a composite value
+   ;; spanning several stores) resolves to its OWN storage/settings/cmp — and only falls back to
+   ;; THIS store's fixed scope for a local, id-less root. (delayed: create-storage wraps the very
+   ;; kv-store we're attaching to.)
    (let [root-storage (delay (create-storage kv-store {:settings settings}))]
      (kc/assoc-serializers
       kv-store
       {:FressianSerializer
        (kser/fressian-serializer
         (merge (pss-fress/read-handlers settings)
-               {pss-fress/set-tag (pss-fress/root-read-handler
-                                   {:resolve-scope (fn [_] {:storage     @root-storage
-                                                            :settings    settings
-                                                            :resolve-cmp (constantly nil)})})}
+               {pss-fress/set-tag
+                (pss-fress/root-read-handler
+                 {:resolve-scope (fn [meta]
+                                   (or (pss-fress/registered-scope (get meta pss-fress/store-id-key))
+                                       {:storage     @root-storage
+                                        :settings    settings
+                                        :resolve-cmp (constantly nil)}))})}
                element-read-handlers)
         (merge pss-fress/write-handlers
                pss-fress/root-write-handlers
