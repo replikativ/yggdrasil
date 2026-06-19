@@ -195,21 +195,38 @@
                       (atom empty-cache) (atom {}) content-addressed?)))
 
 (defn attach-pss-serializer!
-  "Return `kv-store` with a FressianSerializer carrying the canonical PSS node handlers
-   (`org.replikativ.persistent-sorted-set.fressian`, parameterized by `settings`) plus
-   any consumer ELEMENT handlers, so durable backends (file / IndexedDB) (de)serialize
+  "Return `kv-store` with a FressianSerializer carrying the canonical PSS node AND root
+   handlers (`org.replikativ.persistent-sorted-set.fressian`, parameterized by `settings`)
+   plus any consumer ELEMENT handlers, so durable backends (file / IndexedDB) (de)serialize
    the stored node OBJECTS. A memory store ignores serializers (holds objects as-is), so
    this is a harmless no-op there. `element-read-handlers` is `{tag rh}`; on the JVM
    `element-write-handlers` is `{Class {tag wh}}`, on cljs `{Type fn}` (the shapes the
-   konserve FressianSerializer expects, same as the PSS node handlers)."
+   konserve FressianSerializer expects, same as the PSS node handlers).
+
+   The root (`pss/set`) handler is included for codec COMPLETENESS/uniformity: yggdrasil
+   persists a set's root as a bare content-addressed UUID (see `save-roots!`), so it never
+   emits a `pss/set` itself — but registering the canonical root handler means this store
+   covers EVERY PSS type exactly once (Leaf/Branch/root), so it can share a serializer/socket
+   with a consumer that DOES serialize roots (datahike's fused root) without a type clash, and
+   can read a `pss/set` pointer should one land here. A root read resolves storage to a
+   KonserveStorage over THIS kv-store (a node address in this store resolves against this
+   store); comparator defaults to nil (re-stamped lazily on descent, like every read here)."
   ([kv-store settings] (attach-pss-serializer! kv-store settings nil nil))
   ([kv-store settings element-read-handlers element-write-handlers]
-   (kc/assoc-serializers
-    kv-store
-    {:FressianSerializer
-     (kser/fressian-serializer
-      (merge (pss-fress/read-handlers settings) element-read-handlers)
-      (merge pss-fress/write-handlers element-write-handlers))})))
+   ;; delayed: create-storage wraps the very kv-store we're attaching the serializer to.
+   (let [root-storage (delay (create-storage kv-store {:settings settings}))]
+     (kc/assoc-serializers
+      kv-store
+      {:FressianSerializer
+       (kser/fressian-serializer
+        (merge (pss-fress/read-handlers settings)
+               {pss-fress/set-tag (pss-fress/root-read-handler
+                                   {:settings settings
+                                    :resolve-storage (fn [_] @root-storage)})}
+               element-read-handlers)
+        (merge pss-fress/write-handlers
+               pss-fress/root-write-handlers
+               element-write-handlers))}))))
 
 ;; ============================================================
 ;; Index root + freed persistence — async+sync (sync on JVM, async on cljs)
