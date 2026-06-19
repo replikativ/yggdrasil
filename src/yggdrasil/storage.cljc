@@ -214,6 +214,11 @@
   ([kv-store settings] (attach-pss-serializer! kv-store settings nil nil))
   ([kv-store settings element-read-handlers element-write-handlers]
    ;; delayed: create-storage wraps the very kv-store we're attaching the serializer to.
+   ;; ONE local store ⇒ a fixed reconstruction SCOPE (storage over this kv-store; comparator
+   ;; nil — re-stamped on descent). When yggdrasil ships CRDT VALUES over a shared wire, it
+   ;; additionally register-scope!s under its store-id and stamps :store-id into the set meta
+   ;; (so a remote peer resolves it from the registry); that wire plumbing lives with the
+   ;; cross-system path, not this local serializer.
    (let [root-storage (delay (create-storage kv-store {:settings settings}))]
      (kc/assoc-serializers
       kv-store
@@ -221,8 +226,9 @@
        (kser/fressian-serializer
         (merge (pss-fress/read-handlers settings)
                {pss-fress/set-tag (pss-fress/root-read-handler
-                                   {:settings settings
-                                    :resolve-storage (fn [_] @root-storage)})}
+                                   {:resolve-scope (fn [_] {:storage     @root-storage
+                                                            :settings    settings
+                                                            :resolve-cmp (constantly nil)})})}
                element-read-handlers)
         (merge pss-fress/write-handlers
                pss-fress/root-write-handlers
