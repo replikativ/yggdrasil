@@ -7,6 +7,9 @@
             [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
             [yggdrasil.registry :as registry]
+            [yggdrasil.convergent.gset :as g]
+            [yggdrasil.convergent.durable :as d]
+            [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [yggdrasil.migrate :as migrate]))
 
 (def ^:private sync {:sync? true})
@@ -40,3 +43,42 @@
     (let [sc  (file-cfg)
           reg (migrate/migrate-registry-0.2->0.3! sc)]
       (is (= 0 (registry/entry-count reg)) "nothing to migrate → empty registry"))))
+
+(defn- downgrade-nodes!
+  "Rewrite every reachable node in `sc` from the canonical tagged OBJECT form back
+   to the pre-canonical untagged plain-map form ({:level :keys :addresses}) — to
+   synthesize a pre-canonical store from a real one. Returns the address set."
+  [sc]
+  (let [{:keys [kv-store]} (d/open sc sync)
+        roots (d/load-roots kv-store sync)
+        addrs (into #{} (mapcat #(d/reachable-addresses kv-store % sync) (vals roots)))]
+    (doseq [addr addrs]
+      (let [obj (kb/k-get kv-store addr sync)]
+        (kb/k-assoc kv-store addr
+                    (select-keys (pss-fress/node->map obj) [:level :keys :addresses])
+                    sync)))
+    addrs))
+
+(deftest pre-canonical-node-format-migration
+  (testing "a store of untagged plain-map nodes migrates to the canonical tagged
+            codec in place, and the CRDT reads back identically"
+    (let [sc    (file-cfg)
+          elems (set (map #(keyword (str "e" %)) (range 600)))  ; > branching-factor → a real branch
+          g     (-> (reduce g/conj (g/gset "t" {:store-config sc :sync? true}) elems)
+                    (g/flush!))]
+      (is (= elems (g/elements g)) "canonical G-Set built")
+      ;; synthesize a pre-canonical store: every node back to an untagged plain map
+      (let [addrs (downgrade-nodes! sc)]
+        (is (pos? (count addrs)) "tree has multiple nodes")
+        (testing "a downgraded store has at least one branch (multi-node tree)"
+          (let [{:keys [kv-store]} (d/open sc sync)]
+            (is (some #(:addresses (kb/k-get kv-store % sync)) addrs)
+                "at least one branch node (plain map with :addresses)")))
+        ;; migrate the plain-map nodes back to canonical tagged objects, in place
+        (let [n (migrate/migrate-store-nodes! sc)]
+          (is (= (count addrs) n) "every node rewritten to canonical form"))
+        (testing "the G-Set reopens + reads back every element after migration"
+          (let [g2 (g/gset "t" {:store-config sc :sync? true})]
+            (is (= elems (g/elements g2)))))
+        (testing "migrate-store-nodes! is idempotent (canonical store → 0 rewrites)"
+          (is (= 0 (migrate/migrate-store-nodes! sc))))))))
