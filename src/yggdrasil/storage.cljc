@@ -221,17 +221,18 @@
    ;; resolves by `:store-id` via `pss-fress/scope-registry`, assembled separately at the wire
    ;; layer, not here. (yggdrasil's durable roots are content-addressed UUIDs, not `pss/set`
    ;; konserve values, so this root handler is for codec completeness — it doesn't fire locally.)
-   ;; delayed: create-storage wraps the very kv-store we're attaching to.
-   (let [root-storage (delay (create-storage kv-store {:settings settings}))]
+   ;; delayed: create-storage wraps the very kv-store we're attaching to. LEXICAL resolvers
+   ;; (storage = a storage over this kv-store; no comparator/measure). bf now self-describes per
+   ;; node from the blob; `default-bf` only backstops pre-bf blobs.
+   (let [root-storage (delay (create-storage kv-store {:settings settings}))
+         default-bf   #?(:clj (.branchingFactor ^Settings settings) :cljs (:branching-factor settings))]
      (kc/assoc-serializers
       kv-store
       {:FressianSerializer
        (kser/fressian-serializer
-        (merge (pss-fress/read-handlers settings)
-               {pss-fress/set-tag (pss-fress/root-read-handler
-                                   {:resolve-scope (fn [_] {:storage     @root-storage
-                                                            :settings    settings
-                                                            :resolve-cmp (constantly nil)})})}
+        (merge (pss-fress/read-handlers {:default-bf default-bf})
+               {pss-fress/set-tag (pss-fress/root-read-handler {:resolve-storage (fn [_] @root-storage)
+                                                                :default-bf      default-bf})}
                element-read-handlers)
         (merge pss-fress/write-handlers
                pss-fress/root-write-handlers
