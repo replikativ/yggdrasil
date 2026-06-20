@@ -7,9 +7,6 @@
             [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
             [yggdrasil.registry :as registry]
-            [yggdrasil.convergent.gset :as g]
-            [yggdrasil.convergent.durable :as d]
-            [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [yggdrasil.migrate :as migrate]))
 
 (def ^:private sync {:sync? true})
@@ -44,41 +41,25 @@
           reg (migrate/migrate-registry-0.2->0.3! sc)]
       (is (= 0 (registry/entry-count reg)) "nothing to migrate → empty registry"))))
 
-(defn- downgrade-nodes!
-  "Rewrite every reachable node in `sc` from the canonical tagged OBJECT form back
-   to the pre-canonical untagged plain-map form ({:level :keys :addresses}) — to
-   synthesize a pre-canonical store from a real one. Returns the address set."
-  [sc]
-  (let [{:keys [kv-store]} (d/open sc sync)
-        roots (d/load-roots kv-store sync)
-        addrs (into #{} (mapcat #(d/reachable-addresses kv-store % sync) (vals roots)))]
-    (doseq [addr addrs]
-      (let [obj (kb/k-get kv-store addr sync)]
-        (kb/k-assoc kv-store addr
-                    (select-keys (pss-fress/node->map obj) [:level :keys :addresses])
-                    sync)))
-    addrs))
-
-(deftest pre-canonical-node-format-migration
-  (testing "a store of untagged plain-map nodes migrates to the canonical tagged
-            codec in place, and the CRDT reads back identically"
-    (let [sc    (file-cfg)
-          elems (set (map #(keyword (str "e" %)) (range 600)))  ; > branching-factor → a real branch
-          g     (-> (reduce g/conj (g/gset "t" {:store-config sc :sync? true}) elems)
-                    (g/flush!))]
-      (is (= elems (g/elements g)) "canonical G-Set built")
-      ;; synthesize a pre-canonical store: every node back to an untagged plain map
-      (let [addrs (downgrade-nodes! sc)]
-        (is (pos? (count addrs)) "tree has multiple nodes")
-        (testing "a downgraded store has at least one branch (multi-node tree)"
-          (let [{:keys [kv-store]} (d/open sc sync)]
-            (is (some #(:addresses (kb/k-get kv-store % sync)) addrs)
-                "at least one branch node (plain map with :addresses)")))
-        ;; migrate the plain-map nodes back to canonical tagged objects, in place
-        (let [n (migrate/migrate-store-nodes! sc)]
-          (is (= (count addrs) n) "every node rewritten to canonical form"))
-        (testing "the G-Set reopens + reads back every element after migration"
-          (let [g2 (g/gset "t" {:store-config sc :sync? true})]
-            (is (= elems (g/elements g2)))))
-        (testing "migrate-store-nodes! is idempotent (canonical store → 0 rewrites)"
-          (is (= 0 (migrate/migrate-store-nodes! sc))))))))
+(deftest registry-0.2->0.3-multi-node-tree
+  (testing "a released (origin/main) registry whose :tsbs index is a BRANCH over
+            multiple leaves migrates — proves branch traversal + the untagged
+            plain-map nodes read straight through the canonical serializer"
+    (let [sc        (file-cfg)
+          kv        (store/open-store sc sync)
+          ;; origin/main node format: untagged plain maps; leaf :keys are entry->map maps,
+          ;; a branch carries :addresses. Build a 1-branch / 2-leaf tree by hand.
+          leaf-a    {:level 0 :keys [(entry-map "s1" "sysA") (entry-map "s2" "sysB")] :addresses nil}
+          leaf-b    {:level 0 :keys [(entry-map "s3" "sysC") (entry-map "s4" "sysD")] :addresses nil}
+          a-addr    (random-uuid)
+          b-addr    (random-uuid)
+          branch    {:level 1 :keys [(entry-map "s3" "sysC")] :addresses [a-addr b-addr]}
+          br-addr   (random-uuid)]
+      (kb/k-assoc kv a-addr leaf-a sync)
+      (kb/k-assoc kv b-addr leaf-b sync)
+      (kb/k-assoc kv br-addr branch sync)
+      (kb/k-assoc kv :registry/roots {:tsbs br-addr} sync)
+      (let [reg     (migrate/migrate-registry-0.2->0.3! sc)
+            systems (set (map :system-id (registry/all-entries reg)))]
+        (is (= #{"sysA" "sysB" "sysC" "sysD"} systems) "all leaves' entries migrated through the branch")
+        (is (some? (kb/k-get (:kv-store reg) :crdt/roots sync)) "0.3 :crdt/roots written")))))
