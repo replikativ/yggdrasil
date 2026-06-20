@@ -32,7 +32,7 @@
 
 (deftest test-conflict-free-system
   (testing "advertises conflict-free + is a valid yggdrasil system"
-    (let [l (lwwr/lwwr "x" :init :seed)]
+    (let [l (lwwr/lwwr "x" {:init :seed})]
       (is (true? (c/-conflict-free? l)))
       (is (= [] (p/conflicts l "a" "b")))
       (is (= :lwwr (p/system-type l)))

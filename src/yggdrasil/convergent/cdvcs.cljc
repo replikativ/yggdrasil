@@ -265,15 +265,16 @@
 
    opts: :store-config (konserve cfg) | :kv-store (pre-opened, for a shared store),
          :author, :sync? (default true), :state-key (cell key, default :cdvcs/state)."
-  [id & {:keys [author sync?] :or {sync? true} :as opts}]
-  (let [opts (clojure.core/merge {:sync? sync?} (dissoc opts :author))]
-    (async+sync sync?
-                (async
-                 (let [{:keys [kv-store store-config]} (await (d/open (:store-config opts) opts))
-                       existing (await (kb/k-get kv-store (sk opts) opts))]
-                   (if existing
-                     (->CDVCS id kv-store store-config existing false opts)
-                     (let [{:keys [state commits]} (core/new-cdvcs author)]
-                       (await (persist-commits! kv-store commits opts))
-                       (await (save-state! kv-store state opts))
-                       (->CDVCS id kv-store store-config state false opts))))))))
+  ([id] (cdvcs id {}))
+  ([id {:keys [author sync?] :or {sync? true} :as opts}]
+   (let [opts (clojure.core/merge {:sync? sync?} (dissoc opts :author))]
+     (async+sync sync?
+                 (async
+                  (let [{:keys [kv-store store-config]} (await (d/open (:store-config opts) opts))
+                        existing (await (kb/k-get kv-store (sk opts) opts))]
+                    (if existing
+                      (->CDVCS id kv-store store-config existing false opts)
+                      (let [{:keys [state commits]} (core/new-cdvcs author)]
+                        (await (persist-commits! kv-store commits opts))
+                        (await (save-state! kv-store state opts))
+                        (->CDVCS id kv-store store-config state false opts)))))))))

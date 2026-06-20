@@ -220,10 +220,10 @@
                                            "{:store-config …} | {:ephemeral true}")
                                       {:opts opts})))
          tpset (d2p/twopset "registry"
-                            :store-config store-config
-                            :comparator tsbs-comparator
-                            :element-read-handlers  #?(:clj element-read-handlers  :cljs nil)
-                            :element-write-handlers #?(:clj element-write-handlers :cljs nil))]
+                            {:store-config store-config
+                             :comparator tsbs-comparator
+                             :element-read-handlers  #?(:clj element-read-handlers  :cljs nil)
+                             :element-write-handlers #?(:clj element-write-handlers :cljs nil)})]
      (->Registry (atom tpset) (:kv-store tpset) store-config))))
 
 (defn gc!

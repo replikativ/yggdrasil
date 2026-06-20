@@ -658,10 +658,11 @@
                      (nil = ephemeral, in-memory index)
      :store-path   — (legacy) directory for a file store
      :sync?        — sync mode (default true)"
-  [subs & {:keys [name branch store-config store-path sync?] :or {branch :main sync? true}}]
-  (build-composite subs branch name "composite:" "+"
-                   (or store-config (when store-path {:backend :file :id (random-uuid) :path store-path}))
-                   sync?))
+  ([subs] (composite subs {}))
+  ([subs {:keys [name branch store-config store-path sync?] :or {branch :main sync? true}}]
+   (build-composite subs branch name "composite:" "+"
+                    (or store-config (when store-path {:backend :file :id (random-uuid) :path store-path}))
+                    sync?)))
 
 (defn pullback
   "Fiber-product variant of `composite`: requires every sub-system on the SAME
@@ -669,19 +670,20 @@
    pullback(pullback(A,B), C) ≅ pullback(A,B,C). Pass `:branch` to name the
    shared logical branch when native names differ. Same sub-provider interface +
    `async+sync` as `composite`."
-  [subs & {:keys [name branch store-config store-path sync?] :or {sync? true}}]
-  (let [store-config (or store-config (when store-path {:backend :file :id (random-uuid) :path store-path}))]
-    (async+sync sync?
-                (async
-                 (let [c (await (build-composite subs (or branch :main) name "pullback:" "×" store-config sync?))
-                       sys-map (:systems c)]
-                   (if branch
-                     c
-                     (let [branches-list (map p/current-branch (vals sys-map))]
-                       (when-not (apply = branches-list)
-                         (throw (ex-info "Pullback requires all sub-systems on the same branch (fiber condition violated). Use :branch to name the logical branch when native names differ."
-                                         {:branches (into {} (map (fn [[sid s]] [sid (p/current-branch s)])) sys-map)})))
-                       (assoc c :current-branch-name (first branches-list)))))))))
+  ([subs] (pullback subs {}))
+  ([subs {:keys [name branch store-config store-path sync?] :or {sync? true}}]
+   (let [store-config (or store-config (when store-path {:backend :file :id (random-uuid) :path store-path}))]
+     (async+sync sync?
+                 (async
+                  (let [c (await (build-composite subs (or branch :main) name "pullback:" "×" store-config sync?))
+                        sys-map (:systems c)]
+                    (if branch
+                      c
+                      (let [branches-list (map p/current-branch (vals sys-map))]
+                        (when-not (apply = branches-list)
+                          (throw (ex-info "Pullback requires all sub-systems on the same branch (fiber condition violated). Use :branch to name the logical branch when native names differ."
+                                          {:branches (into {} (map (fn [[sid s]] [sid (p/current-branch s)])) sys-map)})))
+                        (assoc c :current-branch-name (first branches-list))))))))))
 
 ;; ============================================================
 ;; Accessors

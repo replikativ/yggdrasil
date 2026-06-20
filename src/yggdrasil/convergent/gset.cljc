@@ -279,10 +279,11 @@
    pass `:sync? false` on cljs and `await`; the returned record then carries that
    mode, so all its ops are async too.)
 
-     (gset \"kb\" :store-config {:backend :memory :id (random-uuid)})"
-  [id & {:keys [store-config comparator branch sync? kv-store roots-key freed-key]
-         :or {comparator compare branch :main sync? true}}]
-  (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))
+     (gset \"kb\" {:store-config {:backend :memory :id (random-uuid)}})"
+  ([id] (gset id {}))
+  ([id {:keys [store-config comparator branch sync? kv-store roots-key freed-key]
+        :or {comparator compare branch :main sync? true}}]
+   (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))
         freed-key (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
         opts (cond-> {:sync? sync?}
                kv-store  (assoc :kv-store kv-store)
@@ -302,4 +303,4 @@
                                     (or (some #{branch} (keys loaded)) (first (keys loaded)))
                                     branch)]
                    (->GSet id kv-store store-config storage comparator
-                           roots cur-branch #{} opts))))))
+                           roots cur-branch #{} opts)))))))

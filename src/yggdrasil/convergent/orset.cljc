@@ -221,17 +221,18 @@
 (defn orset
   "Open (or create) a durable OR-Set on a per-system konserve store.
 
-     (orset \"reg\" :store-config {:backend :memory :id (random-uuid)})
+     (orset \"reg\" {:store-config {:backend :memory :id (random-uuid)}})
 
    :tag-fn  element -> tag (default: ignore element, fresh random-uuid → true
             OR-Set). Pass a content-hash fn for idempotent add (registry shape).
    Restores both halves from the store's :crdt/roots cell when present."
-  [id & {:keys [comparator tag-fn sync? store-config kv-store roots-key freed-key]
-         :or {comparator compare tag-fn (fn [_] (random-uuid)) sync? true}}]
-  (async+sync sync?
-              (async
-               (let [{:keys [kv-store storage store-config opts adds removals]}
-                     (await (d/two-half-open store-config
-                                             {:comparator comparator :sync? sync? :kv-store kv-store
-                                              :roots-key roots-key :freed-key freed-key}))]
-                 (->ORSet id kv-store store-config storage comparator tag-fn adds removals false opts)))))
+  ([id] (orset id {}))
+  ([id {:keys [comparator tag-fn sync? store-config kv-store roots-key freed-key]
+        :or {comparator compare tag-fn (fn [_] (random-uuid)) sync? true}}]
+   (async+sync sync?
+               (async
+                (let [{:keys [kv-store storage store-config opts adds removals]}
+                      (await (d/two-half-open store-config
+                                              {:comparator comparator :sync? sync? :kv-store kv-store
+                                               :roots-key roots-key :freed-key freed-key}))]
+                  (->ORSet id kv-store store-config storage comparator tag-fn adds removals false opts))))))

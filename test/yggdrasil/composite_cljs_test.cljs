@@ -26,7 +26,7 @@
    own [:crdt/roots id] cell."
   [id]
   (fn [kv o]
-    (g/gset id :kv-store kv :roots-key [:crdt/roots id] :sync? (:sync? o))))
+    (g/gset id {:kv-store kv :roots-key [:crdt/roots id] :sync? (:sync? o)})))
 
 (deftest composite-async-transactional-end-to-end
   (async done
@@ -34,7 +34,7 @@
            (let [sc           {:backend :memory :id (random-uuid)}
             ;; the composite opened :sync? false → its sub-touching methods are async
                  [tc comp]    (<! (realize (cmp/composite [(gset-opener "a") (gset-opener "b")]
-                                                          :store-config sc :sync? false)))
+                                                          {:store-config sc :sync? false})))
             ;; value-semantic: evolve subs via update-subsystem (re-seats the new
             ;; sub value into the composite), threading the composite each step.
                  [ta comp]    (<! (realize (cmp/update-subsystem comp "a" #(g/conj % :a1))))

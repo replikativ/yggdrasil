@@ -79,9 +79,10 @@
 (defn conflict-free-system
   "Construct a conflict-free system. `vjoin`/`bottom` define the CRDT; optional
    `config` is a per-CRDT config map carried with the instance (survives -join)."
-  [id stype & {:keys [branch init vjoin bottom config] :or {branch :main}}]
-  (->ConflictFreeSystem id stype {branch (if (nil? init) bottom init)}
-                        branch vjoin bottom config))
+  ([id stype] (conflict-free-system id stype {}))
+  ([id stype {:keys [branch init vjoin bottom config] :or {branch :main}}]
+   (->ConflictFreeSystem id stype {branch (if (nil? init) bottom init)}
+                         branch vjoin bottom config)))
 
 ;; value-level accessors (operate on the current branch's value)
 (defn cur "Current branch's value." [s] (get (:store s) (:current s) (:bottom s)))

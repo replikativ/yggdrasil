@@ -53,11 +53,12 @@
 (defn lwwr
   "An LWW-Register conflict-free system. Optional `:init` seeds the register
    (stamped now); `:branch` defaults to :main."
-  [id & {:keys [branch init] :or {branch :main}}]
-  (sys/conflict-free-system id :lwwr
-                            :branch branch
-                            :init (when (some? init) {:register init :hlc [(t/now-ms) 0]})
-                            :vjoin lwwr-join :bottom nil))
+  ([id] (lwwr id {}))
+  ([id {:keys [branch init] :or {branch :main}}]
+   (sys/conflict-free-system id :lwwr
+                             {:branch branch
+                              :init (when (some? init) {:register init :hlc [(t/now-ms) 0]})
+                              :vjoin lwwr-join :bottom nil})))
 
 (defn set-register
   "Write `v`, stamped with a monotonic HLC ticked from the register's CURRENT hlc

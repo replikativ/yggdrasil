@@ -19,19 +19,19 @@
 (deftest-async durable-commit-chain-reopen
   (testing "commits chain durably; flush + reopen restores the convergent value"
     (let [sc (file-cfg)
-          a  (<? (cd/cdvcs "doc" :author "alice" :store-config sc :sync? sync?))
+          a  (<? (cd/cdvcs "doc" {:author "alice" :store-config sc :sync? sync?}))
           a  (<? (cd/commit a "alice" [[:assoc :x 1]]))
           a  (<? (cd/commit a "alice" [[:assoc :y 2]]))
           _  (<? (p/commit! a))]                       ; flush the state cell
       (is (= 1 (count (cd/heads a))) "stays single-head under sequential commits")
       (is (= 3 (count (cd/commit-graph a))) "base + 2 commits")
-      (let [re (<? (cd/cdvcs "doc" :author "alice" :store-config sc :sync? sync?))]
+      (let [re (<? (cd/cdvcs "doc" {:author "alice" :store-config sc :sync? sync?}))]
         (is (= (:state a) (:state re)) "reopen restores the exact convergent state")
         (is (= 3 (count (cd/history re))) "linear history survives the round-trip")))))
 
 (deftest-async snapshot-and-as-of
   (testing "content-addressed snapshot-id freezes the value; as-of restores it"
-    (let [a   (<? (cd/cdvcs "doc" :author "alice" :store-config (file-cfg) :sync? sync?))
+    (let [a   (<? (cd/cdvcs "doc" {:author "alice" :store-config (file-cfg) :sync? sync?}))
           a   (<? (cd/commit a "alice" [[:assoc :x 1]]))
           sid (<? (p/snapshot-id a))
           a   (<? (cd/commit a "alice" [[:assoc :y 2]]))]
@@ -43,10 +43,10 @@
 (deftest-async divergence-lifts-conflict-then-merge-resolves
   (testing "two lineages in ONE store: -join lifts a 2-head conflict; merge resolves it"
     ;; share one kv-store (distinct state cells); both seed the SAME base commit
-    (let [a (<? (cd/cdvcs "a" :author "root" :store-config (file-cfg) :sync? sync?
-                          :state-key [:cdvcs/state "a"]))
-          b (<? (cd/cdvcs "b" :author "root" :kv-store (:kv-store a) :sync? sync?
-                          :state-key [:cdvcs/state "b"]))
+    (let [a (<? (cd/cdvcs "a" {:author "root" :store-config (file-cfg) :sync? sync?
+                          :state-key [:cdvcs/state "a"]}))
+          b (<? (cd/cdvcs "b" {:author "root" :kv-store (:kv-store a) :sync? sync?
+                          :state-key [:cdvcs/state "b"]}))
           a (<? (cd/commit a "alice" [[:assoc :a 1]]))
           b (<? (cd/commit b "bob"   [[:assoc :b 2]]))
           joined (<? (c/-join a b))]
@@ -64,8 +64,8 @@
 (deftest-async cross-store-ship-and-converge
   (testing "TWO separate stores converge: -join the metadata (SEC), ship the
             content-addressed blobs to make every commit readable on both"
-    (let [a (<? (cd/cdvcs "x" :author "al" :store-config (file-cfg) :sync? sync?))
-          b (<? (cd/cdvcs "x" :author "bo" :store-config (file-cfg) :sync? sync?))
+    (let [a (<? (cd/cdvcs "x" {:author "al" :store-config (file-cfg) :sync? sync?}))
+          b (<? (cd/cdvcs "x" {:author "bo" :store-config (file-cfg) :sync? sync?}))
           a (<? (cd/commit a "al" [[:assoc :x 1]]))
           b (<? (cd/commit b "bo" [[:assoc :y 2]]))]
       (testing "-join converges on metadata ALONE (no blobs needed yet)"
