@@ -461,16 +461,21 @@
                         (await (save-state! kv-store state cell-config opts))
                         (->CDVCS id kv-store store-config storage graph' state false cell-config opts)))))))))
 
-;; Register CDVCS with the system Fressian codec (JVM). Serialized form = its snapshot
-;; reference; reopen = open live on the resolved store, then restore the graph PSS at
-;; the snapshot's `:graph` root and set the cached `{:heads :version}` frontier.
+;; Register CDVCS with the system value codec (JVM). The record IS a value: the
+;; commit-graph rides as its content-addressed root (dedup via the store's nodes);
+;; `state` ({:heads :version}) + config ride verbatim; storage/kv-store re-derived.
 #?(:clj
    (yf/register-system!
     :cdvcs CDVCS
-    (fn [id config snapshot store opts]
-      (let [cd    (cdvcs id (assoc config :kv-store store :author (:author config "_restore")) opts)
-            blob  (d/read-commit store (parse-uuid (str snapshot)) opts)   ; {:graph :heads :version}
-            graph (d/restore-set graph-cmp (:graph blob) (:storage cd) opts)]
-        (assoc cd :graph graph
-               :state {:heads (:heads blob) :version (:version blob)}
-               :dirty false)))))
+    ;; project: flush the graph → its root address; value fields verbatim.
+    (fn [{:keys [id store-config storage graph state dirty config opts]}]
+      {:id id :store-config store-config
+       :graph (str (d/store-set! graph storage opts))
+       :state state :dirty dirty :config config})
+    ;; reconstruct: restore the graph with `graph-cmp` — `slice` (parents-of) reads
+    ;; the set's OWN comparator, so it MUST be graph-cmp, not a default; derive
+    ;; storage/kv-store from the read context.
+    (fn [blob storage opts]
+      (->CDVCS (:id blob) (:kv-store storage) (:store-config blob) storage
+               (d/restore-set graph-cmp (parse-uuid (str (:graph blob))) storage opts)
+               (:state blob) (or (:dirty blob) false) (:config blob) opts))))

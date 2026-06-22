@@ -1,77 +1,83 @@
 (ns yggdrasil.fressian
-  "Optional Fressian handlers that serialize a yggdrasil SYSTEM as a thin, content-
-   addressed SNAPSHOT REFERENCE — the system-level analog of persistent-sorted-set's
-   `pss/set` root handler.
+  "Optional Fressian handlers that serialize a yggdrasil SYSTEM **as a value**, the
+   way persistent-sorted-set serializes a set: the plain-data fields are written
+   verbatim and every PSS-backed field is written as its content-addressed ROOT
+   ADDRESS — a reference, not the inlined elements — so structurally-shared systems
+   still dedup through the store's nodes.
 
-   A yggdrasil system is `Snapshotable`, so its serialized form is just its snapshot
-   handle + the metadata to reopen it: `{:stype :id :snapshot :config}`. The actual
-   nodes/blobs stay in storage (content-addressed, shared) — exactly like `pss/set`
-   serializes a root reference, not the elements. On read the non-serializable context
-   (the konserve store) is supplied by the consumer's `:resolve-store` (lexical: close
-   over one store; wire: resolve by an id stamped in the blob), and the per-stype
-   `reopen` fn — registered by each system at ns-load, the analog of pss-fress's
-   comparator-registry — restores a LIVE system positioned at that snapshot.
+   A system record is almost entirely a value; only three fields are runtime, none
+   of them part of the value:
+     - `storage`/`kv-store` — re-DERIVED from the read context (the store you read
+       from), via the SAME `:resolve-storage` PSS uses (a `KonserveStorage` carries
+       its `:kv-store`, so kv-store is `(:kv-store storage)` — one resolution);
+     - `comparator` — known to the SYSTEM (a G-Set's roots use `compare`; a CDVCS's
+       graph uses its own `graph-cmp`, which `slice` reads off the set), so each
+       system's `reconstruct` restores its PSS fields with the right comparator
+       rather than relying on a global comparator registry.
 
-   Mirrors pss-fress: ONE tag (`ygg/system`), a runtime registry for the non-
-   serializable bits, parameterized read-handlers. JVM prototype; cljs is the same
-   shape as the pss-fress node handlers (a `{Type fn}` map).
+   So this ns reuses PSS's storage resolver wholesale and owns only a static
+   `stype -> {:project :reconstruct}` dispatch table (the analog of a multimethod),
+   which each system populates at ns-load. Lexical (one store: close over its
+   resolver, threaded by `attach-pss-serializer!`) vs wire (stamp a store-id, resolve
+   by registry) is inherited from PSS verbatim.
 
-   CONSTRAINT: the write handler is synchronous and `snapshot-id` realizes the handle
-   synchronously only for a `:sync? true` system (JVM / in-mem). A `:sync? false`
-   durable system must carry an already-realized handle (flush first) — same flavour as
-   pss-fress's \"root MUST be flushed before serialization\"."
+   CONSTRAINT: `project` realizes the PSS root addresses synchronously (it must flush
+   the sets), so the write handler serializes a `:sync? true` system; flush a durable
+   `:sync? false` one first — same as pss-fress's \"root must be flushed before
+   serialization\"."
   (:require [yggdrasil.protocols :as p])
   (:import [org.fressian.handlers WriteHandler ReadHandler]))
 
 (def ^:const system-tag "ygg/system")
 
-;; stype -> {:class <record class, keys the write handler> :reopen <fn>}
-;; reopen = (fn [id config snapshot store opts] -> a LIVE system positioned at snapshot)
+;; stype -> {:class       <record class, keys the write handler>
+;;           :project     (fn [system]                 -> plain-data blob; PSS fields
+;;                                                         as content-addressed root
+;;                                                         addresses; must flush)
+;;           :reconstruct (fn [blob storage opts]       -> a live system record; PSS
+;;                                                         fields restored with the
+;;                                                         system's own comparator,
+;;                                                         storage/kv-store re-derived)}
 (defonce system-registry (atom {}))
 
 (defn register-system!
-  "Register a system type for serialization. `class` keys the JVM write handler;
-   `reopen` reconstructs a live system at a snapshot. Each system calls this at
-   ns-load (like pss-fress consumers register their comparator)."
-  [stype class reopen]
-  (swap! system-registry assoc stype {:class class :reopen reopen})
+  "Register a system type with the value codec. Each system calls this at ns-load
+   (the analog of a defmethod). `class` keys the JVM write handler."
+  [stype class project reconstruct]
+  (swap! system-registry assoc stype {:class class :project project :reconstruct reconstruct})
   stype)
-
-(defn- system->blob
-  "Project a system to its serializable snapshot reference. `snapshot-id` realizes the
-   content handle (sync for `:sync? true`); nodes are NOT inlined."
-  [sys]
-  {:stype    (p/system-type sys)
-   :id       (p/system-id sys)
-   :snapshot (p/snapshot-id sys)
-   :config   (:config sys)})
 
 (def ^:private system-write-handler
   (reify WriteHandler
     (write [_ w sys]
-      (.writeTag w system-tag 1)
-      (.writeObject w (system->blob sys)))))
+      (let [stype (p/system-type sys)
+            {:keys [project]} (get @system-registry stype)]
+        (when (nil? project)
+          (throw (ex-info "No project fn registered for system type" {:stype stype})))
+        (.writeTag w system-tag 1)
+        (.writeObject w (assoc (project sys) :ygg/stype stype))))))
 
 (defn write-handlers
-  "`{Class {tag WriteHandler}}` covering every registered system type — pass as
-   `element-write-handlers` to `yggdrasil.storage/attach-pss-serializer!`, or merge
-   into a fressian writer's handler lookup."
+  "`{Class {tag WriteHandler}}` for every registered system — pass as
+   `element-write-handlers` to `yggdrasil.storage/attach-pss-serializer!`."
   []
   (into {} (map (fn [[_ {:keys [class]}]] [class {system-tag system-write-handler}]))
         @system-registry))
 
 (defn read-handlers
   "`{tag ReadHandler}` for `ygg/system`. `ctx`:
-     :resolve-store  (fn [blob] -> konserve kv-store) — the store the system's nodes
-                     live in (lexical: `(constantly store)`; wire: resolve by an id in
-                     the blob/`:config`).
-     :sync?          runtime mode passed to the reopen fn (default true)."
-  [{:keys [resolve-store sync?] :or {sync? true}}]
+     :resolve-storage  (fn [blob] -> IStorage) — the SAME resolver PSS uses; lexical
+                       (close over one store, threaded by attach-pss-serializer!) or
+                       a registry resolver keyed by a stamped store-id. kv-store is
+                       derived as `(:kv-store storage)`.
+     :sync?            the runtime mode the reconstructed record operates in (default true)."
+  [{:keys [resolve-storage sync?] :or {sync? true}}]
   {system-tag
    (reify ReadHandler
      (read [_ rdr _tag _n]
-       (let [{:keys [stype id snapshot config] :as blob} (.readObject rdr)
-             {:keys [reopen]} (get @system-registry stype)]
-         (when (nil? reopen)
-           (throw (ex-info "No reopen fn registered for system type" {:stype stype})))
-         (reopen id config snapshot (resolve-store blob) {:sync? sync?}))))})
+       (let [blob  (.readObject rdr)
+             stype (:ygg/stype blob)
+             {:keys [reconstruct]} (get @system-registry stype)]
+         (when (nil? reconstruct)
+           (throw (ex-info "No reconstruct fn registered for system type" {:stype stype})))
+         (reconstruct blob (resolve-storage blob) {:sync? sync?}))))})

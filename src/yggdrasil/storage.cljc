@@ -234,16 +234,24 @@
    ;; delayed: create-storage wraps the very kv-store we're attaching to. LEXICAL resolvers
    ;; (storage = a storage over this kv-store; no comparator/measure). bf now self-describes per
    ;; node from the blob; `default-bf` only backstops pre-bf blobs.
-   (let [root-storage (delay (create-storage kv-store {:settings settings}))
-         default-bf   #?(:clj (.branchingFactor ^Settings settings) :cljs (:branching-factor settings))]
+   (let [root-storage    (delay (create-storage kv-store {:settings settings}))
+         resolve-storage (fn [_] @root-storage)
+         default-bf      #?(:clj (.branchingFactor ^Settings settings) :cljs (:branching-factor settings))
+         ;; element-read-handlers may be a plain `{tag rh}` map OR a FUNCTION of the
+         ;; lexical `resolve-storage` — so a consumer handler (e.g. yggdrasil.fressian's
+         ;; system codec) is handed the very SAME resolver the PSS root handler uses,
+         ;; instead of building a redundant one. Both reconstruct against this store.
+         el-read         (if (fn? element-read-handlers)
+                           (element-read-handlers resolve-storage)
+                           element-read-handlers)]
      (kc/assoc-serializers
       kv-store
       {:FressianSerializer
        (kser/fressian-serializer
         (merge (pss-fress/read-handlers {:default-bf default-bf})
-               {pss-fress/set-tag (pss-fress/root-read-handler {:resolve-storage (fn [_] @root-storage)
+               {pss-fress/set-tag (pss-fress/root-read-handler {:resolve-storage resolve-storage
                                                                 :default-bf      default-bf})}
-               element-read-handlers)
+               el-read)
         (merge pss-fress/write-handlers
                pss-fress/root-write-handlers
                element-write-handlers))}))))

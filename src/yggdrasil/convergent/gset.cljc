@@ -316,13 +316,23 @@
                     (->GSet id kv-store store-config storage comparator
                             roots cur-branch #{} cell-config opts)))))))
 
-;; Register the G-Set with the system Fressian codec (JVM). Serialized form = its
-;; snapshot reference; reopen = open live on the resolved store, then position the
-;; current branch AT the snapshot root (faithful to the exact frozen value).
+;; Register the G-Set with the system value codec (JVM). The record IS a value: the
+;; plain-data fields ride verbatim and each branch root rides as its content address
+;; (a reference — dedup via the store's nodes). storage/kv-store/comparator/opts are
+;; runtime/derived and re-injected on read.
 #?(:clj
    (yf/register-system!
     :gset GSet
-    (fn [id config snapshot store opts]
-      (-> (gset id (assoc config :kv-store store) opts)
-          (p/branch! :_snapshot snapshot)
-          (p/checkout :_snapshot)))))
+    ;; project: flush each branch → its root address (sync; the system must be sync)
+    (fn [{:keys [id store-config storage roots current dirty config opts]}]
+      {:id id :store-config store-config
+       :roots (reduce-kv (fn [m b s] (assoc m b (str (d/store-set! s storage opts)))) {} roots)
+       :current current :dirty dirty :config config})
+    ;; reconstruct: restore each branch from its address with `compare` (the G-Set's
+    ;; ops thread `compare`, so the roots' internal comparator is irrelevant); derive
+    ;; storage/kv-store from the read context.
+    (fn [blob storage opts]
+      (->GSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
+              (reduce-kv (fn [m b addr] (assoc m b (d/restore-set compare (parse-uuid (str addr)) storage opts)))
+                         {} (:roots blob))
+              (:current blob) (or (:dirty blob) #{}) (:config blob) opts))))
