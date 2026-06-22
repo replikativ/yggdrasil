@@ -23,6 +23,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
+            #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -314,3 +315,14 @@
                                      branch)]
                     (->GSet id kv-store store-config storage comparator
                             roots cur-branch #{} cell-config opts)))))))
+
+;; Register the G-Set with the system Fressian codec (JVM). Serialized form = its
+;; snapshot reference; reopen = open live on the resolved store, then position the
+;; current branch AT the snapshot root (faithful to the exact frozen value).
+#?(:clj
+   (yf/register-system!
+    :gset GSet
+    (fn [id config snapshot store opts]
+      (-> (gset id (assoc config :kv-store store) opts)
+          (p/branch! :_snapshot snapshot)
+          (p/checkout :_snapshot)))))

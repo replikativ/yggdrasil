@@ -30,6 +30,7 @@
             [yggdrasil.convergent.cdvcs.graph-store :as gs]
             [yggdrasil.kbridge :as kb]
             [clojure.set :as set]
+            #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -459,3 +460,17 @@
                         (await (save-graph! kv-store graph' storage cell-config opts))
                         (await (save-state! kv-store state cell-config opts))
                         (->CDVCS id kv-store store-config storage graph' state false cell-config opts)))))))))
+
+;; Register CDVCS with the system Fressian codec (JVM). Serialized form = its snapshot
+;; reference; reopen = open live on the resolved store, then restore the graph PSS at
+;; the snapshot's `:graph` root and set the cached `{:heads :version}` frontier.
+#?(:clj
+   (yf/register-system!
+    :cdvcs CDVCS
+    (fn [id config snapshot store opts]
+      (let [cd    (cdvcs id (assoc config :kv-store store :author (:author config "_restore")) opts)
+            blob  (d/read-commit store (parse-uuid (str snapshot)) opts)   ; {:graph :heads :version}
+            graph (d/restore-set graph-cmp (:graph blob) (:storage cd) opts)]
+        (assoc cd :graph graph
+               :state {:heads (:heads blob) :version (:version blob)}
+               :dirty false)))))
