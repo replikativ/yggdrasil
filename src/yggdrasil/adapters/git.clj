@@ -7,6 +7,7 @@
   observer mode (external git operations detected via polling watcher)."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
+            [yggdrasil.fressian :as yf]
             [yggdrasil.watcher :as w]
             [clojure.java.shell :refer [sh]]
             [clojure.string :as str]
@@ -452,3 +453,20 @@
                    (if (try (p/delete-branch! git-sys b) true (catch Throwable _ false))
                      (conj acc b) acc))
                  []))))
+
+;; Register Git with the system value codec — the EXTERNAL-system flavor. There is no
+;; konserve store and no PSS: the data lives in the git repo. So the serialized form is
+;; the external IDENTITY (repo-path + branch), and reconstruct RECONNECTS via `create`
+;; (fresh watcher-state + branch-locks). resolve-storage is unused (the ref is self-
+;; contained); a RELOCATABLE repo-path would resolve through the fn-registry, the
+;; external analog of PSS's storage-id. The same shape fits iceberg/zfs/btrfs/ipfs/…:
+;; project the external snapshot ref + identity, reconstruct reconnects.
+(yf/register-system!
+ :git GitSystem
+ (fn [{:keys [repo-path worktrees-dir current-branch system-name]}]
+   {:repo-path repo-path :worktrees-dir worktrees-dir
+    :current-branch current-branch :system-name system-name})
+ (fn [blob _storage _opts]
+   (create (:repo-path blob) {:worktrees-dir  (:worktrees-dir blob)
+                              :initial-branch (:current-branch blob)
+                              :system-name    (:system-name blob)})))

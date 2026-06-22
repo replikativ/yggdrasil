@@ -18,7 +18,8 @@
             [yggdrasil.convergent.ormap :as orm]
             [yggdrasil.convergent.lwwr :as lwwr]
             [yggdrasil.composite :as cmp]
-            [yggdrasil.fn-registry :as fr]))
+            [yggdrasil.fn-registry :as fr]
+            [yggdrasil.adapters.git :as git]))
 
 (defn- file-cfg []
   {:backend :file
@@ -144,3 +145,28 @@
       (is (= :merging-ormap (p/system-type reopened)) "stype preserved (merge-fn present)")
       (is (= 10 (orm/get reopened :k))
           "get folds to a SCALAR — the registered (+) fold was recovered from its id, not defaulted to #{10}"))))
+
+(deftest git-roundtrips-as-external-ref
+  (testing "a git system serializes its EXTERNAL identity (repo-path + branch); the
+            data stays in the repo; reconstruct RECONNECTS via `create` — the external
+            flavor (no konserve store, no PSS, no inlined data)"
+    (let [path  (str (System/getProperty "java.io.tmpdir") "/ygg-git-"
+                     (System/currentTimeMillis) "-" (rand-int 1000000))
+          sys   (git/init! path {:system-name "g"})
+          rp    (:repo-path sys)
+          _     (clojure.java.shell/sh "git" "-C" rp "config" "user.email" "t@t")
+          _     (clojure.java.shell/sh "git" "-C" rp "config" "user.name" "t")
+          _     (spit (str rp "/f.txt") "hi")
+          sys   (p/commit! sys "init")
+          ;; git has NO store of its own → serialize into a HOST store
+          host  (g/gset "host" {:store-config (file-cfg)} {:sync? true})
+          store (storage/attach-pss-serializer!
+                 (:kv-store host) (:settings (:storage host))
+                 (fn [rs] (yf/read-handlers {:resolve-storage rs :sync? true}))
+                 (yf/write-handlers))
+          _        (kb/k-assoc store :saved/git sys {:sync? true})
+          reopened (kb/k-get store :saved/git {:sync? true})]
+      (is (= :git (p/system-type reopened)) "reopened as a git system")
+      (is (= rp (:repo-path reopened)) "external identity (repo-path) preserved")
+      (is (= (p/snapshot-id sys) (p/snapshot-id reopened))
+          "same head SHA — reconstruct reconnected to the LIVE repo"))))
