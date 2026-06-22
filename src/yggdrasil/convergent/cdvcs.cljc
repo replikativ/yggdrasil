@@ -237,6 +237,25 @@
                  (into {} (map (fn [e] [(first e) (second e)]))
                        (await (d/set->clj (:graph cd) opts)))))))
 
+(defn full-delta
+  "The ENTIRE commit set as a δ — a set of self-contained `{:id :value}` commits
+   (each blob carries `:parents`). The SERIALIZABLE full-state projection (plain
+   data) for a connect handshake / catch-up: pass as signal-sync's `state-fn` so a
+   joiner reconstructs the whole lineage via `-apply-delta`, instead of shipping the
+   non-serializable CDVCS record. (async+sync) (sync mode only when used as a
+   handshake state-fn — the handshake hashes the result synchronously.)"
+  [cd]
+  (let [opts (:opts cd)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [ids (map first (await (d/set->clj (:graph cd) opts)))]
+                   (loop [is (seq ids) acc #{}]
+                     (if is
+                       (let [id (first is)
+                             v  (await (d/read-commit (:kv-store cd) id opts))]
+                         (recur (next is) (conj acc {:id id :value v})))
+                       acc)))))))
+
 (defn history
   "Linear commit history (ids) of the single head — DFS over the graph PSS. Throws on
    multiple heads. (async+sync) Delegates DIRECTLY to the (already async+sync)
