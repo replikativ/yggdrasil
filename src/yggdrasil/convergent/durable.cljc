@@ -33,6 +33,7 @@
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]])
             [org.replikativ.persistent-sorted-set :as pss]
+            [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             #?(:cljs [is.simm.partial-cps.sequence :as aseq]))
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
@@ -291,7 +292,14 @@
                     (if (contains? seen addr)
                       (recur (rest to-visit) seen)
                       (let [node (await (kb/k-get kv-store addr opts))]
-                        (recur (into (vec (rest to-visit)) (:addresses node))
+                        ;; a stored node is a PSS Leaf/Branch OBJECT, not a map —
+                        ;; `(:addresses obj)` is nil; the portable child-address read
+                        ;; is `node->map` (Branch → {… :addresses …}, Leaf → no
+                        ;; :addresses). Without this the walk stops at the root and
+                        ;; ship!/gc! see only ONE node (silently broken for any
+                        ;; multi-node tree; single-leaf sets masked it).
+                        (recur (into (vec (rest to-visit))
+                                     (when node (:addresses (pss-fress/node->map node))))
                                (conj seen addr))))
                     seen))))))
 

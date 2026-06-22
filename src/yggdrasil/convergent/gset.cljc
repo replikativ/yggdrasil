@@ -141,13 +141,15 @@
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
-                 ;; retain held snapshots: a G-Set snapshot-id IS a PSS root address,
-                 ;; so keep its reachable nodes (else as-of/frozen on it breaks post-GC).
-                 ;; The cutoff (`:remove-before`/`:grace-period-ms`) rides in `gc-opts`
-                 ;; → d/gc!'s `t/gc-cutoff` (default epoch ⇒ reclaim nothing).
+                 ;; retain held snapshots: a G-Set snapshot-id is a PSS root address
+                 ;; STRINGIFIED (`(str <uuid>)`); the store keys them by UUID, so
+                 ;; parse them back for the reachability walk (else their nodes aren't
+                 ;; retained and as-of/frozen on them breaks post-GC). Cutoff rides in
+                 ;; `gc-opts` → d/gc!'s `t/gc-cutoff` (default epoch ⇒ reclaim nothing).
                  (await (d/gc! kv-store (vals (await (d/load-roots kv-store config opts)))
                                config
-                               (merge gc-opts opts {:retain-roots (seq snapshot-ids)}))))))
+                               (merge gc-opts opts
+                                      {:retain-roots (map #(parse-uuid (str %)) snapshot-ids)}))))))
 
   p/Overlayable
   ;; :frozen → carry the current roots (immutable PSS values; isolated by value).

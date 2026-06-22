@@ -211,3 +211,16 @@
           _  (<? (g/flush! g))
           reopened (<? (g/gset "kb" {:store-config sc} {:sync? sync?}))]
       (is (= #{:p :q :r} (<? (g/elements reopened))) "restored from disk"))))
+
+;; REGRESSION: reachable-addresses must walk a MULTI-node tree (branch children via
+;; node->map, not nil keyword access) — else ship!/merge-peer! copy only the root and
+;; the peer can't restore the leaves. Single-leaf sets masked this for a long time.
+(deftest-async merge-peer-ships-a-multinode-tree
+  (testing "merge-peer! over a 200-element (multi-node) set ships EVERY reachable node"
+    (let [elems (set (range 200))
+          a (loop [g (<? (g/gset "a" {:store-config (file-cfg)} {:sync? sync?})) es (seq elems)]
+              (if es (recur (<? (g/conj g (first es))) (next es)) g))
+          a (<? (g/flush! a))
+          b (<? (g/gset "b" {:store-config (file-cfg)} {:sync? sync?}))
+          b (<? (g/merge-peer! b a))]
+      (is (= elems (<? (g/elements b))) "peer received every element (all tree nodes shipped)"))))
