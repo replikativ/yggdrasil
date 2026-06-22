@@ -111,3 +111,38 @@
             j2 (<? (c/-join j1 b))]
         (is (not (identical? a j1)) "joining a peer with new commits changes the value")
         (is (identical? j1 j2) "re-joining the SAME peer is an identical no-op")))))
+
+(deftest-async durable-pull-fast-forwards
+  (testing "pull fast-forwards a behind-peer to the remote tip (durable store-backed LCA)"
+    (let [a     (<? (cd/cdvcs "a" {:author "root" :store-config (file-cfg)} {:sync? sync?}))
+          b     (<? (cd/cdvcs "b" {:author "root" :kv-store (:kv-store a)
+                                   :state-key [:cdvcs/state "b"]} {:sync? sync?}))
+          b     (<? (cd/commit b "bo" [[:assoc :y 1]]))     ; b advances ahead of a (shared base)
+          b     (<? (cd/commit b "bo" [[:assoc :y 2]]))
+          b-tip (first (cd/heads b))
+          a'    (<? (cd/pull a b b-tip))]
+      (is (= #{b-tip} (cd/heads a')) "a fast-forwarded to b's tip")
+      (is (= 3 (count (<? (cd/history a')))) "a now linearises base + b's 2 commits"))))
+
+(deftest-async merge-carries-resolution
+  (testing "merge accepts correcting transactions, recorded in the merge commit"
+    (let [a      (<? (cd/cdvcs "a" {:author "root" :store-config (file-cfg)} {:sync? sync?}))
+          b      (<? (cd/cdvcs "b" {:author "root" :kv-store (:kv-store a)
+                                    :state-key [:cdvcs/state "b"]} {:sync? sync?}))
+          a      (<? (cd/commit a "al" [[:assoc :k 1]]))
+          b      (<? (cd/commit b "bo" [[:assoc :k 2]]))
+          joined (<? (c/-join a b))
+          merged (<? (cd/merge joined "al" joined [[:assoc :k 3]]))]   ; value-level resolution
+      (is (not (cd/multiple-heads? merged)) "merge collapses to one head")
+      (let [blob (<? (cd/read-commit merged (first (cd/heads merged))))]
+        (is (= [[:assoc :k 3]] (:transactions blob)) "the merge commit carries the resolution txs")))))
+
+(deftest-async gc-retains-named-snapshot
+  (testing "gc-sweep! with a retained snapshot-id keeps that frozen version restorable"
+    (let [a   (<? (cd/cdvcs "a" {:author "al" :store-config (file-cfg)} {:sync? sync?}))
+          a   (<? (cd/commit a "al" [[:assoc :x 1]]))
+          sid (<? (p/snapshot-id a))                         ; freeze here
+          a   (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 2]]))))]
+      (<? (p/gc-sweep! a [sid] {:grace-period-ms 0 :sync? sync?}))   ; retain the named snapshot
+      (is (some? (<? (p/as-of a sid))) "the retained snapshot survives gc")
+      (is (= 3 (count (<? (cd/history a)))) "live history intact"))))
