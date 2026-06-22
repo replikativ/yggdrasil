@@ -35,6 +35,7 @@
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
             [hasch.core :as hasch]
+            [yggdrasil.fn-registry :as fr]
             #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
@@ -249,18 +250,24 @@
 ;; ============================================================
 
 (defn- open-ormap
+  ;; `merge-fn` is a FUNCTION (not serializable) OR a registered ID (keyword,
+  ;; `fn-registry/register-fn!`) → the fold survives a round-trip (stored as
+  ;; `:merge-fn-id` in config; resolved on read). nil = plain multi-value OR-Map.
   [id merge-fn {:keys [store-config comparator kv-store roots-key freed-key]
                 :or {comparator compare}}
    {:keys [sync?] :or {sync? true}}]
-  (let [opts {:sync? sync?}]
+  (let [opts        {:sync? sync?}
+        merge-fn-id (when (keyword? merge-fn) merge-fn)
+        mfn         (if (keyword? merge-fn) (fr/resolve-fn merge-fn) merge-fn)]
     (async+sync sync?
                 (async
                  (let [{:keys [kv-store storage store-config config adds removals]}
                        (await (d/two-half-open store-config
                                                {:comparator comparator :kv-store kv-store
                                                 :roots-key roots-key :freed-key freed-key}
-                                               opts))]
-                   (->ORMap id kv-store store-config storage comparator (wrap merge-fn)
+                                               opts))
+                       config (cond-> config merge-fn-id (clojure.core/assoc :merge-fn-id merge-fn-id))]
+                   (->ORMap id kv-store store-config storage comparator (wrap mfn)
                             adds removals false config opts))))))
 
 (defn ormap
@@ -279,19 +286,21 @@
 ;; Register the (plain) OR-Map with the system value codec (JVM). Both [hk uid k v]
 ;; halves ride as content addresses. merge-fn = nil → the multi-value (value-set)
 ;; OR-Map (system-type :ormap). A custom merging-ormap fold-fn is NOT serializable
-;; here (its system-type :merging-ormap isn't registered → a clear throw); it needs a
-;; fn-registry, deferred like a custom comparator.
+;; here: the fold rides as `:merge-fn-id` in config (a registered id), resolved on
+;; read. ONE project/reconstruct serves BOTH stypes — `:ormap` (no id → merge-fn nil
+;; → multi-value) and `:merging-ormap` (id → the resolved fold). The entries
+;; (adds/removals) are preserved regardless; only the read-time fold is recovered.
 #?(:clj
-   (yf/register-system!
-    :ormap ORMap
-    (fn [{:keys [id store-config storage adds removals dirty config opts]}]
-      {:id id :store-config store-config
-       :adds     (str (d/store-set! adds storage opts))
-       :removals (str (d/store-set! removals storage opts))
-       :dirty dirty :config config})
-    (fn [blob storage opts]
-      (->ORMap (:id blob) (:kv-store storage) (:store-config blob) storage compare
-               (wrap nil)
-               (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
-               (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
-               (or (:dirty blob) false) (:config blob) opts))))
+   (let [project     (fn [{:keys [id store-config storage adds removals dirty config opts]}]
+                       {:id id :store-config store-config
+                        :adds     (str (d/store-set! adds storage opts))
+                        :removals (str (d/store-set! removals storage opts))
+                        :dirty dirty :config config})
+         reconstruct (fn [blob storage opts]
+                       (->ORMap (:id blob) (:kv-store storage) (:store-config blob) storage compare
+                                (wrap (fr/resolve-fn (:merge-fn-id (:config blob))))   ; nil id → plain
+                                (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
+                                (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
+                                (or (:dirty blob) false) (:config blob) opts))]
+     (yf/register-system! :ormap ORMap project reconstruct)
+     (yf/register-system! :merging-ormap ORMap project reconstruct)))

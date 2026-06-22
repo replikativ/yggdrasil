@@ -17,7 +17,8 @@
             [yggdrasil.convergent.orset :as ors]
             [yggdrasil.convergent.ormap :as orm]
             [yggdrasil.convergent.lwwr :as lwwr]
-            [yggdrasil.composite :as cmp]))
+            [yggdrasil.composite :as cmp]
+            [yggdrasil.fn-registry :as fr]))
 
 (defn- file-cfg []
   {:backend :file
@@ -130,3 +131,16 @@
         (is (= #{:a1 :a2} (g/elements (clojure.core/get subs "a")))
             "child a reconstructed via its own handler (recursion)")
         (is (= #{:b1} (g/elements (clojure.core/get subs "b"))) "child b reconstructed")))))
+
+(deftest merging-ormap-roundtrips-with-registered-fold
+  (testing "a merging-OR-Map's fold rides as a REGISTERED id (the single source of
+            truth — runtime fn and serialized id both derive from it). After a
+            round-trip get still FOLDS to a scalar (not a value-set), proving the fn
+            was resolved from :merge-fn-id, not defaulted to the plain multi-value map"
+    (fr/register-fn! :fr-test/sum +)
+    (let [m (-> (orm/merging-ormap "mm" :fr-test/sum {:store-config (file-cfg)} {:sync? true})
+                (orm/assoc :k 10))
+          reopened (roundtrip m)]
+      (is (= :merging-ormap (p/system-type reopened)) "stype preserved (merge-fn present)")
+      (is (= 10 (orm/get reopened :k))
+          "get folds to a SCALAR — the registered (+) fold was recovered from its id, not defaulted to #{10}"))))

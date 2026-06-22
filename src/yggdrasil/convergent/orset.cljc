@@ -35,6 +35,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
+            [yggdrasil.fn-registry :as fr]
             #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
@@ -225,15 +226,21 @@
 
      (orset \"reg\" {:store-config {:backend :memory :id (random-uuid)}})
 
-   :tag-fn  element -> tag (default: ignore element, fresh random-uuid → true
-            OR-Set). Pass a content-hash fn for idempotent add (registry shape).
+   :tag-fn  element -> tag. A FUNCTION (default: ignore element, fresh random-uuid →
+            true OR-Set; pass a content-hash fn for idempotent add) — NOT serializable.
+            Or a registered ID (keyword, `fn-registry/register-fn!`) → the custom tagger
+            survives a round-trip (stored as `:tag-fn-id` in config; resolved on read).
    Restores both halves from the store's :crdt/roots cell when present."
   ([id] (orset id {} {:sync? true}))
   ([id config] (orset id config {:sync? true}))
   ([id {:keys [comparator tag-fn store-config kv-store roots-key freed-key]
-        :or {comparator compare tag-fn (fn [_] (random-uuid))}}
+        :or {comparator compare}}
     {:keys [sync?] :or {sync? true}}]
-   (let [opts {:sync? sync?}]
+   (let [opts      {:sync? sync?}
+         tag-fn-id (when (keyword? tag-fn) tag-fn)             ; a registered id → serializable
+         tagger    (cond (keyword? tag-fn) (fr/resolve-fn tag-fn)
+                         (fn? tag-fn)      tag-fn
+                         :else             (fn [_] (random-uuid)))]
      (async+sync sync?
                  (async
                   (let [{:keys [kv-store storage store-config config adds removals]}
@@ -241,12 +248,13 @@
                                                 {:comparator comparator :kv-store kv-store
                                                  :roots-key roots-key :freed-key freed-key}
                                                 opts))]
-                    (->ORSet id kv-store store-config storage comparator tag-fn adds removals false config opts)))))))
+                    (->ORSet id kv-store store-config storage comparator tagger adds removals false
+                             (cond-> config tag-fn-id (assoc :tag-fn-id tag-fn-id)) opts)))))))
 
 ;; Register the OR-Set with the system value codec (JVM). Both [element tag] halves
-;; ride as content addresses; `tag-fn` is the DEFAULT true-OR-Set tagger — it only
-;; affects FUTURE adds, the stored value is preserved (a custom content-hash tagger
-;; would need a fn-registry, like a custom comparator).
+;; ride as content addresses. The tagger is recovered from `:tag-fn-id` (a registered
+;; id) when present, else the default true-OR-Set tagger — the tag-fn only affects
+;; FUTURE adds, so the stored value is preserved either way.
 #?(:clj
    (yf/register-system!
     :orset ORSet
@@ -257,7 +265,7 @@
        :dirty dirty :config config})
     (fn [blob storage opts]
       (->ORSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
-               (fn [_] (random-uuid))
+               (or (fr/resolve-fn (:tag-fn-id (:config blob))) (fn [_] (random-uuid)))
                (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
                (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
                (or (:dirty blob) false) (:config blob) opts))))
