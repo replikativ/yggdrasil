@@ -16,7 +16,8 @@
             [yggdrasil.convergent.twopset :as tps]
             [yggdrasil.convergent.orset :as ors]
             [yggdrasil.convergent.ormap :as orm]
-            [yggdrasil.convergent.lwwr :as lwwr]))
+            [yggdrasil.convergent.lwwr :as lwwr]
+            [yggdrasil.composite :as cmp]))
 
 (defn- file-cfg []
   {:backend :file
@@ -111,3 +112,21 @@
           reopened (kb/k-get store :saved/lwwr {:sync? true})]
       (is (= :lwwr (p/system-type reopened)))
       (is (= :hello (lwwr/value reopened)) "register value survives; convergent join still works"))))
+
+(deftest composite-roundtrips-compositionally
+  (testing "a composite serializes its WRAPPER only; each co-located child rides its
+            OWN ygg/system handler (fressian recurses), so children reconstruct with
+            their values automatically — no per-composite child logic"
+    (let [sc (file-cfg)
+          a  (-> (g/gset "a" {:store-config sc :roots-key [:crdt/roots "a"]} {:sync? true})
+                 (g/conj :a1) (g/conj :a2) (g/flush!))
+          b  (-> (g/gset "b" {:kv-store (:kv-store a) :roots-key [:crdt/roots "b"]} {:sync? true})
+                 (g/conj :b1) (g/flush!))
+          comp     (cmp/composite [a b] {:store-config sc} {:sync? true})
+          reopened (roundtrip comp)]
+      (is (= :composite (p/system-type reopened)) "reopened as a composite")
+      (let [subs (:systems reopened)]
+        (is (= #{"a" "b"} (set (keys subs))) "both child system-ids survive")
+        (is (= #{:a1 :a2} (g/elements (clojure.core/get subs "a")))
+            "child a reconstructed via its own handler (recursion)")
+        (is (= #{:b1} (g/elements (clojure.core/get subs "b"))) "child b reconstructed")))))

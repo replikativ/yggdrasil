@@ -48,6 +48,7 @@
             [yggdrasil.kbridge :as kb]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
+            #?(:clj [yggdrasil.fressian :as yf])
             [clojure.set :as set]
             [clojure.string :as str]
             [hasch.core :as hasch]
@@ -708,3 +709,20 @@
               (async
                (assoc-in composite [:systems id]
                          (await (f (get (:systems composite) id)))))))
+
+;; Register the composite with the system value codec (JVM). COMPOSITIONAL: project
+;; only the WRAPPER — the `:systems` map's child records ride the SAME `ygg/system`
+;; handler (fressian recurses on writeObject), so each child is serialized + reopened
+;; by its own project/reconstruct automatically; we just place the map and rebuild
+;; the wrapper. Children are co-located on the composite's store, so they reconstruct
+;; against the same `resolve-storage`. (index-atom = fresh in-memory history.)
+#?(:clj
+   (yf/register-system!
+    :composite CompositeSystem
+    (fn [{:keys [systems current-branch-name composite-name store-config]}]
+      {:composite-name composite-name :current-branch-name current-branch-name
+       :store-config store-config :systems systems})
+    (fn [blob storage opts]
+      (->CompositeSystem (:systems blob) (:current-branch-name blob) (:composite-name blob)
+                         (atom {}) (when storage (:kv-store storage)) (:store-config blob)
+                         storage opts))))
