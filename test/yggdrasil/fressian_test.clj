@@ -15,7 +15,8 @@
             [yggdrasil.convergent.cdvcs :as cd]
             [yggdrasil.convergent.twopset :as tps]
             [yggdrasil.convergent.orset :as ors]
-            [yggdrasil.convergent.ormap :as orm]))
+            [yggdrasil.convergent.ormap :as orm]
+            [yggdrasil.convergent.lwwr :as lwwr]))
 
 (defn- file-cfg []
   {:backend :file
@@ -96,3 +97,17 @@
       (is (= :ormap (p/system-type reopened)))
       (is (= #{:k1 :k2} (orm/keys reopened)) "keys survive")
       (is (= #{:v1} (orm/get reopened :k1)) "get slices the restored graph correctly"))))
+
+(deftest lwwr-roundtrips-as-value
+  (testing "LWW-Register: an IN-MEMORY system (no store of its own) — projects its
+            whole value verbatim; vjoin re-injected. Serialized into a HOST store."
+    (let [host  (g/gset "host" {:store-config (file-cfg)} {:sync? true})  ; just for a store + settings
+          l     (-> (lwwr/lwwr "r") (lwwr/set-register :hello))
+          store (storage/attach-pss-serializer!
+                 (:kv-store host) (:settings (:storage host))
+                 (fn [rs] (yf/read-handlers {:resolve-storage rs :sync? true}))
+                 (yf/write-handlers))
+          _     (kb/k-assoc store :saved/lwwr l {:sync? true})
+          reopened (kb/k-get store :saved/lwwr {:sync? true})]
+      (is (= :lwwr (p/system-type reopened)))
+      (is (= :hello (lwwr/value reopened)) "register value survives; convergent join still works"))))

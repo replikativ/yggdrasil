@@ -23,7 +23,8 @@
    cross-platform hash tiebreak."
   (:require [yggdrasil.convergent.system :as sys]
             [yggdrasil.types :as t]
-            [hasch.core :as hasch]))
+            [hasch.core :as hasch]
+            #?(:clj [yggdrasil.fressian :as yf])))
 
 (defn bump-hlc
   "Monotonic HLC tick from `[physical logical]` (or nil → epoch): advance physical
@@ -78,3 +79,16 @@
    or nil if unset."
   [l]
   (first (:hlc (sys/cur l))))
+
+;; Register the LWW-Register with the system value codec (JVM). An IN-MEMORY
+;; ConflictFreeSystem: the whole {branch -> {:register :hlc}} store is plain data, so
+;; it projects verbatim — no PSS roots, no storage. Only the join fn isn't a value;
+;; it's re-injected (lwwr-join) on read.
+#?(:clj
+   (yf/register-system!
+    :lwwr (class (lwwr "_probe"))
+    (fn [{:keys [id store current config]}]
+      {:id id :store store :current current :config config})
+    (fn [blob _storage _opts]
+      (sys/->ConflictFreeSystem (:id blob) :lwwr (:store blob) (:current blob)
+                                lwwr-join nil (:config blob)))))
