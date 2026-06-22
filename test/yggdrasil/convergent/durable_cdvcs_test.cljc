@@ -137,6 +137,42 @@
       (let [blob (<? (cd/read-commit merged (first (cd/heads merged))))]
         (is (= [[:assoc :k 3]] (:transactions blob)) "the merge commit carries the resolution txs")))))
 
+(deftest-async delta-op-perspective
+  (testing "commit accrues a δ of FULL commits; -apply-delta integrates a peer's δ to
+            the SAME value as a full -join (op-path ≡ state-path) — the hook signal-sync
+            ships for bidirectional CDVCS over the wire"
+    (let [a (<? (cd/cdvcs "a" {:author "root" :store-config (file-cfg)
+                               :state-key [:cdvcs/state "a"]} {:sync? sync?}))
+          b (<? (cd/cdvcs "b" {:author "root" :kv-store (:kv-store a)
+                               :state-key [:cdvcs/state "b"]} {:sync? sync?}))   ; shares a's base
+          a (<? (cd/commit a "al" [[:assoc :x 1]]))
+          a (<? (cd/commit a "al" [[:assoc :x 2]]))]
+      (is (= 2 (count (c/delta-of a))) "δ accrued exactly the two new commits")
+      (let [via-op   (<? (c/-apply-delta b (c/delta-of a)))
+            via-join (<? (c/-join b a))]
+        (is (nil? (c/delta-of via-op)) "apply-delta yields a δ-FREE value (no echo)")
+        (is (= (cd/heads via-op) (cd/heads via-join)) "op-path ≡ state-path: identical heads")
+        (is (= (cd/heads via-op) (cd/heads a)) "b fast-forwarded to a's head from the δ alone")
+        (is (= (count (<? (cd/history via-op))) (count (<? (cd/history a))))
+            "b's linear history matches a's after applying the δ")
+        ;; idempotent: re-applying the SAME δ adds nothing
+        (is (= (cd/heads via-op) (cd/heads (<? (c/-apply-delta via-op (c/delta-of a)))))
+            "re-applying the δ is a no-op (idempotent)")))))
+
+(deftest-async delta-concurrent-divergence
+  (testing "two peers commit concurrently; each applies the OTHER's δ → both lift the
+            same 2-head conflict (δ-path convergence ≡ the -join divergence test)"
+    (let [a (<? (cd/cdvcs "a" {:author "root" :store-config (file-cfg)
+                               :state-key [:cdvcs/state "a"]} {:sync? sync?}))
+          b (<? (cd/cdvcs "b" {:author "root" :kv-store (:kv-store a)
+                               :state-key [:cdvcs/state "b"]} {:sync? sync?}))
+          a  (<? (cd/commit a "al" [[:assoc :a 1]]))
+          b  (<? (cd/commit b "bo" [[:assoc :b 2]]))
+          a* (<? (c/-apply-delta a (c/delta-of b)))      ; a integrates b's commit
+          b* (<? (c/-apply-delta b (c/delta-of a)))]     ; b integrates a's commit
+      (is (= (cd/heads a*) (cd/heads b*)) "both converge on the same 2-head frontier (SEC)")
+      (is (= 2 (count (cd/heads a*))) "concurrent lineages ⇒ a lifted 2-head conflict"))))
+
 (deftest-async gc-retains-named-snapshot
   (testing "gc-sweep! with a retained snapshot-id keeps that frozen version restorable"
     (let [a   (<? (cd/cdvcs "a" {:author "al" :store-config (file-cfg)} {:sync? sync?}))

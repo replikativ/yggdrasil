@@ -36,7 +36,7 @@
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-(declare ->CDVCS flush! cdvcs parents-of)
+(declare ->CDVCS flush! cdvcs parents-of apply-delta)
 
 ;; cells (DOMAIN — overridable via `config`)
 (def ^:private graph-cell :cdvcs/graph)
@@ -125,9 +125,13 @@
                    (let [{:keys [id value]} (core/make-commit author (vec heads) transactions)
                          graph' (await (d/set-conj (:graph cd) [id (vec heads)] graph-cmp opts))]
                      (await (persist-commits! (:kv-store cd) {id value} opts))
-                     (assoc cd :graph graph'
-                            :state {:heads #{id} :version (inc (:version (:state cd)))}
-                            :dirty true)))))))
+                     ;; accrue the OP δ — the FULL self-contained commit {:id :value}
+                     ;; (the blob carries :parents), so a peer applies it with no blob
+                     ;; fetch (content-addressing dedups a re-stored blob).
+                     (c/with-delta (assoc cd :graph graph'
+                                          :state {:heads #{id} :version (inc (:version (:state cd)))}
+                                          :dirty true)
+                       set/union #{{:id id :value value}})))))))
 
 (defn merge
   "Reconcile this CDVCS with `remote` (a CDVCS record), or its OWN multiple heads
@@ -144,10 +148,15 @@
                         {:keys [id value]} (core/make-commit author all-heads correcting-transactions)
                         graph'    (await (d/set-conj merged [id all-heads] graph-cmp opts))]
                     (await (persist-commits! (:kv-store cd) {id value} opts))
-                    (assoc cd :graph graph'
-                           :state {:heads #{id}
-                                   :version (inc (max (:version (:state cd)) (:version (:state remote))))}
-                           :dirty true)))))))
+                    ;; the δ carries BOTH the merge commit AND the remote's commits we
+                    ;; just unioned in (so a peer that has neither converges from the δ
+                    ;; alone); the remote's δ — if any — is folded in too.
+                    (let [remote-delta (or (c/delta-of remote) #{})]
+                      (c/with-delta (assoc cd :graph graph'
+                                           :state {:heads #{id}
+                                                   :version (inc (max (:version (:state cd)) (:version (:state remote))))}
+                                           :dirty true)
+                        set/union (set/union remote-delta #{{:id id :value value}})))))))))
 
 (defn pull
   "Fast-forward to `remote-tip` from `remote`'s graph. Throws if the remote is not a
@@ -177,6 +186,43 @@
                    (let [state' {:heads new-heads :version (inc (:version (:state cd)))}]
                      (await (save-state! (:kv-store cd) state' (:config cd) opts))
                      (assoc cd :graph merged :state state' :dirty false)))))))
+
+(defn apply-delta
+  "OP-path: integrate a peer's δ (a set of self-contained commits `{:id :value}`,
+   the blob carrying `:parents`) into this CDVCS — persist each blob (content-
+   addressed ⇒ idempotent), set-conj `[id parents]` into the graph, then recompute
+   the frontier via `remove-ancestors` (≡ the STATE-path `-join`, but O(δ) not
+   O(graph)). Returns a δ-FREE record (remote ops do not re-propagate). (async+sync)"
+  [cd delta]
+  (let [opts (:opts cd)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [entries (vec delta)]
+                   (if (empty? entries)
+                     (c/clear-delta cd)
+                     (let [_      (await (persist-commits! (:kv-store cd)
+                                                           (into {} (map (juxt :id :value)) entries) opts))
+                           graph' (loop [es (seq entries) g (:graph cd)]
+                                    (if es
+                                      (let [{:keys [id value]} (first es)]
+                                        (recur (next es)
+                                               (await (d/set-conj g [id (vec (:parents value))] graph-cmp opts))))
+                                      g))]
+                       (if (= graph' (:graph cd))
+                         (c/clear-delta cd)                      ; nothing new — idempotent
+                         (let [all-parents (set (mapcat #(:parents (:value %)) entries))
+                               ;; the δ's OWN frontier: incoming ids that are not a parent
+                               ;; of another incoming commit — a valid head set, so the
+                               ;; recompute matches `-join`'s (heads-a ∪ heads-b − LCAs).
+                               incoming    (into #{} (comp (map :id) (remove all-parents)) entries)
+                               new-heads   (await (gs/remove-ancestors
+                                                   (parents-of graph' (:storage cd) opts)
+                                                   (parents-of (:graph cd) (:storage cd) opts)
+                                                   (:heads (:state cd)) incoming opts))]
+                           (await (save-graph! (:kv-store cd) graph' (:storage cd) (:config cd) opts))
+                           (let [state' {:heads new-heads :version (inc (:version (:state cd)))}]
+                             (await (save-state! (:kv-store cd) state' (:config cd) opts))
+                             (c/clear-delta (assoc cd :graph graph' :state state' :dirty false))))))))))))
 
 (defn heads          [cd] (:heads (:state cd)))
 (defn multiple-heads? [cd] (> (count (:heads (:state cd))) 1))
@@ -307,6 +353,12 @@
                          (await (save-state! kv-store state' config opts))
                          (assoc this :graph merged :state state' :dirty false))))))))
   (-conflict-free? [_] false)   ; CDVCS LIFTS conflict into the head set
+
+  c/PDeltaApply
+  ;; OP-path counterpart to -join: consume a peer's δ of full commits. Lets signal-
+  ;; sync carry CDVCS over the wire (δ self-contained ⇒ no blob fetch) — the SAME
+  ;; ygg-delta-fn / ygg-apply-delta-fn / ygg-clear-delta-fn hooks the G-Set uses.
+  (-apply-delta [this delta] (apply-delta this delta))
 
   p/GarbageCollectable
   (gc-roots [this]
