@@ -24,6 +24,21 @@
 (defn- commit-id [commit-value]
   (hasch/uuid (select-keys commit-value #{:transactions :parents})))
 
+(defn make-commit
+  "Build a single commit value + its content-addressed id (`hash {:transactions
+   :parents}`). Pure — the durable layer persists the blob and appends `[id parents]`
+   to the commit-graph. Used by the PSS-backed (Option B) durable wrapper."
+  [author parents transactions]
+  (let [cval {:transactions transactions :parents (vec parents) :crdt :cdvcs
+              :version 1 :ts (t/now-ms) :author author}]
+    {:id (commit-id cval) :value cval}))
+
+(defn new-base
+  "The base commit (no transactions, no parents). Its id is author/ts-independent,
+   so ALL fresh CDVCS share ONE base ⇒ a common ancestor ⇒ always joinable."
+  [author]
+  (make-commit author [] []))
+
 (defn new-cdvcs
   "A fresh CDVCS with a single empty base commit. Returns {:state :commits}."
   [author]

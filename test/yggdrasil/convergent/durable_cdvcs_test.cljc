@@ -24,10 +24,10 @@
           a  (<? (cd/commit a "alice" [[:assoc :y 2]]))
           _  (<? (p/commit! a))]                       ; flush the state cell
       (is (= 1 (count (cd/heads a))) "stays single-head under sequential commits")
-      (is (= 3 (count (cd/commit-graph a))) "base + 2 commits")
+      (is (= 3 (count (<? (cd/commit-graph a)))) "base + 2 commits")
       (let [re (<? (cd/cdvcs "doc" {:author "alice" :store-config sc} {:sync? sync?}))]
         (is (= (:state a) (:state re)) "reopen restores the exact convergent state")
-        (is (= 3 (count (cd/history re))) "linear history survives the round-trip")))))
+        (is (= 3 (count (<? (cd/history re)))) "linear history survives the round-trip")))))
 
 (deftest-async snapshot-and-as-of
   (testing "content-addressed snapshot-id freezes the value; as-of restores it"
@@ -37,8 +37,11 @@
           a   (<? (cd/commit a "alice" [[:assoc :y 2]]))]
       (is (some? sid))
       (let [frozen (<? (p/as-of a sid))]
-        (is (= 2 (count (:commit-graph frozen))) "as-of restores the FROZEN state (base + 1)")
-        (is (= 3 (count (cd/commit-graph a))) "the live CDVCS has moved on")))))
+        ;; as-of yields the FROZEN handle {:graph <root> :heads :version} taken after
+        ;; commit 1 (base + 1 = version 2, single head); the live CDVCS has moved on.
+        (is (= 2 (:version frozen)) "as-of restores the frozen version (base + 1)")
+        (is (= 1 (count (:heads frozen))) "frozen single head")
+        (is (= 3 (count (<? (cd/commit-graph a)))) "the live CDVCS has moved on")))))
 
 (deftest-async divergence-lifts-conflict-then-merge-resolves
   (testing "two lineages in ONE store: -join lifts a 2-head conflict; merge resolves it"
@@ -56,10 +59,10 @@
       (let [merged (<? (cd/merge joined "alice" joined))]
         (is (not (cd/multiple-heads? merged)) "merge collapses to a single head")
         (let [merge-id (first (cd/heads merged))]
-          (is (= 2 (count (get (cd/commit-graph merged) merge-id)))
+          (is (= 2 (count (get (<? (cd/commit-graph merged)) merge-id)))
               "the merge commit has BOTH heads as parents"))
         ;; every prior commit is reachable from the merged head (blobs co-located)
-        (is (= 4 (count (cd/history merged))) "base + a + b + merge")))))
+        (is (= 4 (count (<? (cd/history merged)))) "base + a + b + merge")))))
 
 (deftest-async cross-store-ship-and-converge
   (testing "TWO separate stores converge: -join the metadata (SEC), ship the
@@ -78,8 +81,19 @@
             (<? (cd/ship! b (:kv-store a)))          ; b's commit → a's store
             ;; pick one head and linearise it on each side — same commit set
             (let [head (first (cd/heads a*))
-                  ha   (graph/commit-history (cd/commit-graph a*) head)
-                  hb   (graph/commit-history (cd/commit-graph b*) head)]
+                  ha   (graph/commit-history (<? (cd/commit-graph a*)) head)
+                  hb   (graph/commit-history (<? (cd/commit-graph b*)) head)]
               (is (= ha hb) "the linearisation agrees across peers")
               (is (some? (<? (cd/read-commit a* (first (cd/heads b*))))) "a can now read b's commit")
               (is (some? (<? (cd/read-commit b* (first (cd/heads a*))))) "b can now read a's commit"))))))))
+
+(deftest-async gc-sweep-keeps-live-commits
+  (testing "gc-sweep! reclaims superseded graph nodes (prior flushes) yet keeps the
+            live commits + linear history readable"
+    (let [a (<? (cd/cdvcs "doc" {:author "al" :store-config (file-cfg)} {:sync? sync?}))
+          a (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 1]]))))   ; commit + flush (graph v2)
+          a (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 2]]))))   ; commit + flush (graph v3, supersedes v2)
+          a (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 3]]))))]
+      (<? (p/gc-sweep! a nil {:grace-period-ms 0 :sync? sync?}))       ; reclaim everything orphaned before now
+      (is (= 4 (count (<? (cd/history a)))) "base + 3 commits survive gc")
+      (is (some? (<? (cd/read-commit a (first (cd/heads a))))) "head commit still readable after gc"))))
