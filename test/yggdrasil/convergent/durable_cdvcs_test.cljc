@@ -97,3 +97,17 @@
       (<? (p/gc-sweep! a nil {:grace-period-ms 0 :sync? sync?}))       ; reclaim everything orphaned before now
       (is (= 4 (count (<? (cd/history a)))) "base + 3 commits survive gc")
       (is (some? (<? (cd/read-commit a (first (cd/heads a))))) "head commit still readable after gc"))))
+
+(deftest-async join-idempotence
+  (testing "-join that adds nothing returns the receiver IDENTICAL (no signal re-publish)"
+    (let [a (<? (cd/cdvcs "a" {:author "root" :store-config (file-cfg)} {:sync? sync?}))
+          a (<? (cd/commit a "al" [[:assoc :x 1]]))
+          a (<? (cd/commit a "al" [[:assoc :x 2]]))]
+      (is (identical? a (<? (c/-join a a))) "self-join adds nothing ⇒ identical no-op")
+      (let [b  (<? (cd/cdvcs "b" {:author "root" :kv-store (:kv-store a)
+                                  :state-key [:cdvcs/state "b"]} {:sync? sync?}))
+            b  (<? (cd/commit b "bo" [[:assoc :y 1]]))
+            j1 (<? (c/-join a b))
+            j2 (<? (c/-join j1 b))]
+        (is (not (identical? a j1)) "joining a peer with new commits changes the value")
+        (is (identical? j1 j2) "re-joining the SAME peer is an identical no-op")))))

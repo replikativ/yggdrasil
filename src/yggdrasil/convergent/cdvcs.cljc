@@ -287,20 +287,25 @@
   ;; -join ≡ downstream: UNION the graph PSSs + recompute heads via remove-ancestors
   ;; over the merged graph. Always converges; may leave >1 head (the lifted conflict).
   ;; `other`'s graph nodes must be restorable here (same store, or ship!ed first).
-  ;; (async+sync) [TODO idempotence short-circuit — currently always re-saves.]
+  ;; IDEMPOTENCE: the graph union is grow-only, so `(= merged graph)` ⟺ `other` added
+  ;; nothing ⟺ no-op — return `this` IDENTICAL (else a mutually-synced signal would
+  ;; re-publish forever); equal graph also implies unchanged heads, so the head
+  ;; recompute is skipped too. (Matches gset's `(= joined roots)`.) (async+sync)
   (-join [this other]
     (async+sync (:sync? opts)
                 (async
-                 (let [os        (:state other)
-                       merged    (await (d/set-union graph (:graph other) graph-cmp opts))
-                       new-heads (await (gs/remove-ancestors
-                                         (parents-of merged storage opts)
-                                         (parents-of graph storage opts)
-                                         (:heads state) (:heads os) opts))]
-                   (await (save-graph! kv-store merged storage config opts))
-                   (let [state' {:heads new-heads :version (max (:version state) (:version os))}]
-                     (await (save-state! kv-store state' config opts))
-                     (assoc this :graph merged :state state' :dirty false))))))
+                 (let [merged (await (d/set-union graph (:graph other) graph-cmp opts))]
+                   (if (= merged graph)
+                     this
+                     (let [os        (:state other)
+                           new-heads (await (gs/remove-ancestors
+                                             (parents-of merged storage opts)
+                                             (parents-of graph storage opts)
+                                             (:heads state) (:heads os) opts))]
+                       (await (save-graph! kv-store merged storage config opts))
+                       (let [state' {:heads new-heads :version (max (:version state) (:version os))}]
+                         (await (save-state! kv-store state' config opts))
+                         (assoc this :graph merged :state state' :dirty false))))))))
   (-conflict-free? [_] false)   ; CDVCS LIFTS conflict into the head set
 
   p/GarbageCollectable
