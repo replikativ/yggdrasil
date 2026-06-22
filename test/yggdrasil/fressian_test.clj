@@ -12,7 +12,10 @@
             [yggdrasil.kbridge :as kb]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent.gset :as g]
-            [yggdrasil.convergent.cdvcs :as cd]))
+            [yggdrasil.convergent.cdvcs :as cd]
+            [yggdrasil.convergent.twopset :as tps]
+            [yggdrasil.convergent.orset :as ors]
+            [yggdrasil.convergent.ormap :as orm]))
 
 (defn- file-cfg []
   {:backend :file
@@ -64,3 +67,32 @@
       (is (= (cd/heads a) (cd/heads reopened)) "same single head")
       (is (= 3 (count (cd/history reopened)))
           "base + 2 commits — history slices the graph with the correct comparator"))))
+
+;; The three flat CRDTs — two-half (adds/removals) PSS records, projected the same
+;; way (roots → addresses, restored with `compare`). Generalization proof.
+
+(deftest twopset-roundtrips-as-value
+  (testing "2P-Set: add :a :b, remove :b → reopens as {:a}"
+    (let [s (-> (tps/twopset "s" {:store-config (file-cfg)} {:sync? true})
+                (tps/conj :a) (tps/conj :b) (tps/disj :b))
+          reopened (roundtrip s)]
+      (is (= :2p-set (p/system-type reopened)))
+      (is (= #{:a} (tps/elements reopened)) "tombstone survived the round-trip"))))
+
+(deftest orset-roundtrips-as-value
+  (testing "OR-Set: reopens with the live elements (default tag-fn re-injected)"
+    (let [o (-> (ors/orset "o" {:store-config (file-cfg)} {:sync? true})
+                (ors/conj :x) (ors/conj :y))
+          reopened (roundtrip o)]
+      (is (= :orset (p/system-type reopened)))
+      (is (= #{:x :y} (ors/elements reopened))))))
+
+(deftest ormap-roundtrips-as-value
+  (testing "OR-Map: reopens with keys + values; get SLICES the restored graph, so
+            the comparator must round-trip correctly"
+    (let [m (-> (orm/ormap "m" {:store-config (file-cfg)} {:sync? true})
+                (orm/assoc :k1 :v1) (orm/assoc :k2 :v2))
+          reopened (roundtrip m)]
+      (is (= :ormap (p/system-type reopened)))
+      (is (= #{:k1 :k2} (orm/keys reopened)) "keys survive")
+      (is (= #{:v1} (orm/get reopened :k1)) "get slices the restored graph correctly"))))

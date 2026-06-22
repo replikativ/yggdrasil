@@ -35,6 +35,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
+            #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -241,3 +242,22 @@
                                                  :roots-key roots-key :freed-key freed-key}
                                                 opts))]
                     (->ORSet id kv-store store-config storage comparator tag-fn adds removals false config opts)))))))
+
+;; Register the OR-Set with the system value codec (JVM). Both [element tag] halves
+;; ride as content addresses; `tag-fn` is the DEFAULT true-OR-Set tagger — it only
+;; affects FUTURE adds, the stored value is preserved (a custom content-hash tagger
+;; would need a fn-registry, like a custom comparator).
+#?(:clj
+   (yf/register-system!
+    :orset ORSet
+    (fn [{:keys [id store-config storage adds removals dirty config opts]}]
+      {:id id :store-config store-config
+       :adds     (str (d/store-set! adds storage opts))
+       :removals (str (d/store-set! removals storage opts))
+       :dirty dirty :config config})
+    (fn [blob storage opts]
+      (->ORSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
+               (fn [_] (random-uuid))
+               (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
+               (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
+               (or (:dirty blob) false) (:config blob) opts))))

@@ -30,6 +30,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
+            #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -235,3 +236,20 @@
                                                  :element-write-handlers element-write-handlers}
                                                 opts))]
                     (->TwoPSet id kv-store store-config storage comparator adds removals false config opts)))))))
+
+;; Register the 2P-Set with the system value codec (JVM). Both halves ride as their
+;; content-addressed root addresses; `compare` is the right comparator (and what
+;; slice would read). storage/kv-store re-derived on read.
+#?(:clj
+   (yf/register-system!
+    :2p-set TwoPSet
+    (fn [{:keys [id store-config storage adds removals dirty config opts]}]
+      {:id id :store-config store-config
+       :adds     (str (d/store-set! adds storage opts))
+       :removals (str (d/store-set! removals storage opts))
+       :dirty dirty :config config})
+    (fn [blob storage opts]
+      (->TwoPSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
+                 (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
+                 (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
+                 (or (:dirty blob) false) (:config blob) opts))))

@@ -35,6 +35,7 @@
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
             [hasch.core :as hasch]
+            #?(:clj [yggdrasil.fressian :as yf])
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -274,3 +275,23 @@
   ([id merge-fn] (open-ormap id merge-fn {} {:sync? true}))
   ([id merge-fn config] (open-ormap id merge-fn config {:sync? true}))
   ([id merge-fn config opts] (open-ormap id merge-fn config opts)))
+
+;; Register the (plain) OR-Map with the system value codec (JVM). Both [hk uid k v]
+;; halves ride as content addresses. merge-fn = nil → the multi-value (value-set)
+;; OR-Map (system-type :ormap). A custom merging-ormap fold-fn is NOT serializable
+;; here (its system-type :merging-ormap isn't registered → a clear throw); it needs a
+;; fn-registry, deferred like a custom comparator.
+#?(:clj
+   (yf/register-system!
+    :ormap ORMap
+    (fn [{:keys [id store-config storage adds removals dirty config opts]}]
+      {:id id :store-config store-config
+       :adds     (str (d/store-set! adds storage opts))
+       :removals (str (d/store-set! removals storage opts))
+       :dirty dirty :config config})
+    (fn [blob storage opts]
+      (->ORMap (:id blob) (:kv-store storage) (:store-config blob) storage compare
+               (wrap nil)
+               (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
+               (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
+               (or (:dirty blob) false) (:config blob) opts))))
