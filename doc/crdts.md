@@ -127,6 +127,14 @@ head, structural 3-way merge): a grow-only commit DAG whose `-join` (≡ replika
 conflict. `merge` resolves heads into one via a merge commit. `-conflict-free?` is
 `false`. Git-like verbs. See [cdvcs-convergent-system.md](cdvcs-convergent-system.md).
 
+Like the other CRDTs it is **bounded-resident**: the commit-graph is a grow-only PSS
+of `[id parents]` (read on the fly — a parent lookup is an O(log n) slice), and only
+the derived `:heads` (frontier) + `:version` stay in the record. The graph's roots
+cell is the convergent source of truth (grow-map merge ⇒ peers converge on one
+content-hash root); `:heads` is a cache that `-join` recomputes. `commit`/`merge`
+append an entry; `-join`/`pull` recompute heads via the store-backed LCA;
+`history`/`commit-graph` drain the PSS (inherently O(graph)).
+
 ### Composite — the product
 
 `yggdrasil.composite` bundles N sub-systems into one. It is the **categorical product**

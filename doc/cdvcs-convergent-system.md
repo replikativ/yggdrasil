@@ -77,8 +77,13 @@ replikativ's stack — because yggdrasil distributes differently.
   straight onto yggdrasil's existing durable content-addressed konserve
   substrate (the same `KonserveStorage`/PSS world the durable CRDTs use). A
   commit id IS its content hash.
-- **The commit-graph + heads** (small convergent metadata) live in the system's
-  root cell, exactly like the durable sets keep `:crdt/roots`.
+- **The commit-graph is a grow-only PSS** of `[id parents]` (`:cdvcs/graph` roots
+  cell), read on the fly like the durable sets — so the full graph is never resident
+  (`parents-of` is an O(log n) slice; the store-backed LCA/history live in
+  `cdvcs.graph-store`). Its grow-map roots cell is the convergent source of truth.
+  Only the **derived `:heads` + `:version`** sit in a small `:cdvcs/state` CACHE cell
+  (heads can't be convergent — a commit removes its parents from heads — so `-join`
+  recomputes them; a peer's heads reflect its last `-join`).
 - **Distribution is konserve-sync + signal-sync**, not kabel: because every
   commit is content-addressed, konserve-sync's reachability node-fetch ships the
   missing commit blobs for free; the metadata graph rides the same signal-sync
