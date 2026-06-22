@@ -44,11 +44,18 @@
 ;; When several CRDTs share ONE konserve store (the single-causal-root composite,
 ;; option a — `:composite/root` as the lone gate, like datahike's `:db`), each
 ;; needs its OWN roots/freed cells so they don't clobber each other. Pass
-;; `:roots-key`/`:freed-key` in opts (e.g. `[:crdt/roots sub-id]`); content-
-;; addressed nodes (uuid keys) are still safely shared (dedup across subs).
+;; `:roots-key`/`:freed-key` in the CONFIG map (e.g. `[:crdt/roots sub-id]`);
+;; content-addressed nodes (uuid keys) are still safely shared (dedup across subs).
 ;; Default = the single-store cells, so every existing CRDT is unchanged.
-(defn- rk [opts] (:roots-key opts roots-key))
-(defn- fk [opts] (:freed-key opts freed-key))
+;;
+;; SEPARATION OF CONCERNS: throughout this layer `config` carries the DOMAIN of a
+;; durable store (its cell-keys + open-time `:kv-store`/`:settings`/element handlers),
+;; while `opts` carries ONLY the runtime mode `:sync?` (+, for `gc!`, the operation's
+;; own params). The cell-keys (`config`) are constant for a store instance and are
+;; persisted on the CRDT record's `:config` field; `:sync?` (`opts`) is the per-call
+;; execution mode. So `opts` never carries store/domain arguments.
+(defn- rk [config] (:roots-key config roots-key))
+(defn- fk [config] (:freed-key config freed-key))
 
 ;; ============================================================
 ;; Store lifecycle
@@ -67,14 +74,15 @@
    fresh content-addressed KonserveStorage. Returns (async+sync)
    {:kv-store :store-config :storage}.
 
-   opts may carry `:element-read-handlers`/`:element-write-handlers` — fressian
-   handlers for the CRDT's element type, attached alongside the canonical PSS node
-   handlers so durable backends round-trip non-fressian-native elements (e.g. the
-   registry's RegistryEntry). Bare-element CRDTs need none."
-  ([store-config] (open store-config {:sync? true}))
-  ([store-config opts]
-   (let [opts     (merge {:sync? true} opts)
-         settings (or (:settings opts) (store/default-settings))]
+   `config` (DOMAIN) may carry `:kv-store` (reuse a pre-opened store), `:settings`,
+   `:roots-key`/`:freed-key` (cell-keys), and `:element-read-handlers`/
+   `:element-write-handlers` — fressian handlers for the CRDT's element type,
+   attached alongside the canonical PSS node handlers so durable backends round-trip
+   non-fressian-native elements (e.g. the registry's RegistryEntry). Bare-element
+   CRDTs need none. `opts` (RUNTIME) carries only `:sync?`."
+  ([store-config] (open store-config {} {:sync? true}))
+  ([store-config config opts]
+   (let [settings (or (:settings config) (store/default-settings))]
      (async+sync (:sync? opts)
                  (async
                   (let [;; reuse a pre-opened store (the single-store composite passes
@@ -84,14 +92,14 @@
                         ;; `:element-read-handlers`/`:element-write-handlers` let a caller add an
                         ;; element handler (e.g. the registry's RegistryEntry); the bare catalog
                         ;; needs none (its elements are fressian-native).
-                        kv-store (if-let [pre (:kv-store opts)]
+                        kv-store (if-let [pre (:kv-store config)]
                                    pre
                                    (store/attach-pss-serializer!
                                     (await (store/open-store store-config opts)) settings
-                                    (:element-read-handlers opts) (:element-write-handlers opts)))
+                                    (:element-read-handlers config) (:element-write-handlers config)))
                         storage  (store/create-storage kv-store {:content-addressed? true
                                                                  :settings settings})
-                        freed    (or (await (kb/k-get kv-store (fk opts) opts)) {})]
+                        freed    (or (await (kb/k-get kv-store (fk config) opts)) {})]
                     (reset! (:freed-atom storage) freed)
                     {:kv-store kv-store :store-config store-config :storage storage}))))))
 
@@ -132,36 +140,35 @@
 ;; ---- cross-platform PSS element ops (shared by the catalog) ----------------
 
 (defn set->clj
-  "Materialize a (possibly lazy) PSS set into a Clojure set. (async+sync). On
-   cljs a storage-backed set is drained one node at a time via its AsyncSeq (the
-   partial-cps sequence protocol PSS itself uses)."
+  "Materialize a (possibly lazy) PSS set into a Clojure set. (async+sync). cljs
+   `pss/seq` returns a plain `Iter` (an `ISeq`) under `:sync? true` — drained by
+   `clojure.core/into` — and a continuation yielding an `AsyncSeq` under
+   `:sync? false`, drained by the partial-cps transducer `aseq/into`."
   [s opts]
   (async+sync (:sync? opts)
               (async
                (if (nil? s) #{}
                    #?(:clj  (into #{} s)
-                      :cljs (loop [items (await (pss/seq s opts)) acc (transient #{})]
-                              (if-some [x (await (aseq/first items))]
-                                (recur (await (aseq/rest items)) (conj! acc x))
-                                (persistent! acc))))))))
+                      :cljs (if (:sync? opts)
+                              (into #{} (pss/seq s opts))
+                              (await (aseq/into #{} (await (pss/seq s opts))))))))))
 
 (defn slice->clj
   "Materialize the INCLUSIVE PSS range `[from to]` into a Clojure vector — reads
    ONLY the nodes the range spans (lazy traversal + the storage node-cache), NOT a
    full drain. This is the datahike-style read-on-the-fly primitive: a key-scoped
    read touches O(log n + matches) nodes, not the whole set. (async+sync). On cljs
-   the slice yields an AsyncSeq drained one node at a time (the same partial-cps
-   sequence protocol `set->clj` uses); the 4-arity `pss/slice` passes the set's own
-   comparator and threads `opts` (`:sync? false` ⇒ CPS)."
+   the slice is a plain `Iter` under `:sync? true` (drained by `clojure.core/into`)
+   and an `AsyncSeq` under `:sync? false` (drained by `aseq/into`); the 4-arity
+   `pss/slice` passes the set's own comparator and threads `opts`."
   [s from to opts]
   (async+sync (:sync? opts)
               (async
                (if (nil? s) []
                    #?(:clj  (into [] (pss/slice s from to))
-                      :cljs (loop [items (await (pss/slice s from to opts)) acc (transient [])]
-                              (if-some [x (await (aseq/first items))]
-                                (recur (await (aseq/rest items)) (conj! acc x))
-                                (persistent! acc))))))))
+                      :cljs (if (:sync? opts)
+                              (into [] (pss/slice s from to opts))
+                              (await (aseq/into [] (await (pss/slice s from to opts))))))))))
 
 (defn set-conj
   "conj `x` onto PSS set `s` under comparator `cmp`. (async+sync)"
@@ -187,10 +194,15 @@
   (async+sync (:sync? opts)
               (async
                #?(:clj  (into a (seq b))
-                  :cljs (loop [items (await (pss/seq b opts)) acc a]
-                          (if-some [x (await (aseq/first items))]
-                            (recur (await (aseq/rest items)) (await (pss/conj acc x cmp opts)))
-                            acc))))))
+                  ;; conj each elem of `b` into `a` via the async-or-sync `pss/conj`,
+                  ;; threading the result — so a plain `reduce` over the sync `Iter`,
+                  ;; or a single-`anext` drain over the `AsyncSeq` (no double-pull).
+                  :cljs (if (:sync? opts)
+                          (reduce (fn [acc x] (pss/conj acc x cmp opts)) a (pss/seq b opts))
+                          (loop [aseq (await (pss/seq b opts)) acc a]
+                            (if-let [[x rst] (await (aseq/anext aseq))]
+                              (recur rst (await (pss/conj acc x cmp opts)))
+                              acc)))))))
 
 ;; ============================================================
 ;; Root cell + freed persistence
@@ -198,10 +210,10 @@
 
 (defn load-roots
   "Read the {branch -> root-address} cell, or nil when none yet (async+sync)."
-  ([kv-store] (load-roots kv-store {:sync? true}))
-  ([kv-store opts]
+  ([kv-store] (load-roots kv-store {} {:sync? true}))
+  ([kv-store config opts]
    (async+sync (:sync? opts)
-               (async (await (kb/k-get kv-store (rk opts) opts))))))
+               (async (await (kb/k-get kv-store (rk config) opts))))))
 
 (defn save-roots!
   "MERGE `roots` into the {branch -> root-address} cell — a convergent (grow-map)
@@ -215,11 +227,11 @@
    get-then-assoc — so two concurrent flushes, or a synced peer adding a branch
    between the read and the write, cannot lose an interleaved branch (TOCTOU).
    (async+sync)"
-  ([kv-store roots] (save-roots! kv-store roots {:sync? true}))
-  ([kv-store roots opts]
+  ([kv-store roots] (save-roots! kv-store roots {} {:sync? true}))
+  ([kv-store roots config opts]
    (async+sync (:sync? opts)
                (async
-                (await (kb/k-update kv-store (rk opts)
+                (await (kb/k-update kv-store (rk config)
                                     (fn [existing] (merge (or existing {}) roots))
                                     opts))))))
 
@@ -227,10 +239,10 @@
   "Persist a KonserveStorage's freed-set under the CRDT freed cell, MERGED
    ATOMICALLY (konserve `update`) so a concurrent writer's freed entries are not
    lost to a blind overwrite. (async+sync)"
-  ([kv-store storage] (save-freed! kv-store storage {:sync? true}))
-  ([kv-store storage opts]
+  ([kv-store storage] (save-freed! kv-store storage {} {:sync? true}))
+  ([kv-store storage config opts]
    (async+sync (:sync? opts)
-               (async (await (kb/k-update kv-store (fk opts)
+               (async (await (kb/k-update kv-store (fk config)
                                           (fn [existing] (merge (or existing {}) @(:freed-atom storage)))
                                           opts))))))
 
@@ -340,8 +352,8 @@
    (`-join`/flush orphan the old root each time), so pass a window in production
    (≥ your longest lazy-read drain; ~60 s tight, hours/a day looser). Returns the
    set of deleted keys. (async+sync)"
-  ([kv-store roots] (gc! kv-store roots {:sync? true}))
-  ([kv-store roots opts]
+  ([kv-store roots] (gc! kv-store roots {} {:sync? true}))
+  ([kv-store roots config opts]
    (async+sync (:sync? opts)
                (async
                 (let [before (t/gc-cutoff opts)
@@ -350,8 +362,10 @@
                       ;; from one sub's roots) and passes `:spare-keys` = all the extra
                       ;; pointer cells to keep (each sub's [:crdt/roots id]/[:crdt/freed
                       ;; id] + the composite manifest). Standalone CRDTs leave it nil.
+                      ;; `config` carries the cell-keys to spare; `opts` carries the gc
+                      ;; operation params (cutoff / retain / spare) + `:sync?`.
                       reachable (loop [rs (seq (concat roots (:retain-roots opts)))
-                                       acc (into #{(rk opts) (fk opts)}
+                                       acc (into #{(rk config) (fk config)}
                                                  (concat (:spare-keys opts) (:retain-keys opts)))]
                                   (if rs
                                     (recur (next rs)
@@ -406,14 +420,14 @@
 (defn two-half-flush!
   "Persist both halves, update `:crdt/roots {:adds :removals}` + freed; clear
    `:dirty`. Returns the clean record (a no-op when not dirty). (async+sync)"
-  [{:keys [adds removals storage kv-store dirty] :as this} opts]
+  [{:keys [adds removals storage kv-store dirty config] :as this} opts]
   (async+sync (:sync? opts)
               (async
                (if dirty
                  (let [a (await (store-set! adds storage opts))
                        r (await (store-set! removals storage opts))]
-                   (await (save-roots! kv-store {:adds a :removals r} opts))
-                   (await (save-freed! kv-store storage opts))
+                   (await (save-roots! kv-store {:adds a :removals r} config opts))
+                   (await (save-freed! kv-store storage config opts))
                    (assoc this :dirty false))
                  this))))
 
@@ -437,7 +451,7 @@
   "Flush, then mark-and-sweep nodes unreachable from the live roots — retaining the
    commit objects (and both halves' nodes) named by `snapshot-ids` so a frozen
    `as-of` survives. (async+sync)"
-  [{:keys [kv-store] :as this} snapshot-ids gc-opts opts]
+  [{:keys [kv-store config] :as this} snapshot-ids gc-opts opts]
   (async+sync (:sync? opts)
               (async
                (await (two-half-flush! this opts))
@@ -447,35 +461,44 @@
                                       (let [c (await (read-commit kv-store (first cs) opts))]
                                         (recur (next cs) (conj acc (:adds c) (:removals c))))
                                       acc))]
-                 (await (gc! kv-store (vals (await (load-roots kv-store opts)))
+                 (await (gc! kv-store (vals (await (load-roots kv-store config opts)))
+                             config
                              (merge gc-opts opts {:retain-roots retain-roots
                                                   :retain-keys commit-addrs})))))))
 
 (defn two-half-open
   "Open a two-half CRDT's store and restore both halves from `:crdt/roots`. Returns
-   `{:kv-store :storage :store-config :opts :adds :removals}`. `:store-config`
-   defaults to a fresh in-memory store. `factory-opts` may carry
-   `:comparator`/`:sync?`/`:kv-store`/`:roots-key`/`:freed-key` and
-   `:element-read-handlers`/`:element-write-handlers` (a fressian handler for the
-   CRDT's element type — e.g. the registry's RegistryEntry; bare-element CRDTs need
-   none). (async+sync)"
-  [store-config {:keys [comparator sync? kv-store roots-key freed-key
+   `{:kv-store :storage :store-config :config :comparator :adds :removals}` — where
+   `:config` is the persistent DOMAIN map (cell-keys) the record carries. `store-config`
+   defaults to a fresh in-memory store. `config` (DOMAIN) may carry `:comparator`,
+   `:kv-store`, `:roots-key`/`:freed-key`, and `:element-read-handlers`/
+   `:element-write-handlers` (a fressian handler for the CRDT's element type — e.g.
+   the registry's RegistryEntry; bare-element CRDTs need none). `opts` (RUNTIME)
+   carries only `:sync?`. (async+sync)"
+  [store-config {:keys [comparator kv-store roots-key freed-key
                         element-read-handlers element-write-handlers]
-                 :or {comparator compare sync? true}}]
+                 :or {comparator compare}}
+   opts]
   (let [store-config (or store-config (when-not kv-store (mem-store-config)))
         freed-key    (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
-        opts (cond-> {:sync? sync?}
-               kv-store               (assoc :kv-store kv-store)
-               roots-key              (assoc :roots-key roots-key)
-               freed-key              (assoc :freed-key freed-key)
-               element-read-handlers  (assoc :element-read-handlers element-read-handlers)
-               element-write-handlers (assoc :element-write-handlers element-write-handlers))]
-    (async+sync sync?
+        ;; the PERSISTENT domain the record carries: just the cell-keys (constant
+        ;; per instance; the mutation fns read them). Default = the single-store cells.
+        cell-config (cond-> {}
+                      roots-key (assoc :roots-key roots-key)
+                      freed-key (assoc :freed-key freed-key))
+        ;; the OPEN-TIME domain: cell-keys + the store-opening params (consumed by
+        ;; `open`, not persisted on the record).
+        open-config (cond-> cell-config
+                      kv-store               (assoc :kv-store kv-store)
+                      element-read-handlers  (assoc :element-read-handlers element-read-handlers)
+                      element-write-handlers (assoc :element-write-handlers element-write-handlers))]
+    (async+sync (:sync? opts)
                 (async
-                 (let [{:keys [kv-store storage]} (await (open store-config opts))
-                       roots   (await (load-roots kv-store opts))
+                 (let [{:keys [kv-store storage]} (await (open store-config open-config opts))
+                       roots   (await (load-roots kv-store cell-config opts))
                        restore (fn [b] (if-let [root (get roots b)]
                                          (restore-set comparator root storage opts)
                                          (empty-set storage comparator)))]
-                   {:kv-store kv-store :storage storage :store-config store-config :opts opts
+                   {:kv-store kv-store :storage storage :store-config store-config
+                    :config cell-config :comparator comparator
                     :adds (restore :adds) :removals (restore :removals)})))))

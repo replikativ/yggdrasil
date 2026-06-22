@@ -36,7 +36,8 @@
             roots       ; {branch → immutable PSS set}
             current     ; current branch keyword
             dirty       ; #{branch} changed since last flush
-            opts]
+            config      ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            opts]       ; RUNTIME: {:sync?} — the record's execution mode
 
   p/SystemIdentity
   (system-id [_] id)
@@ -126,7 +127,7 @@
                              joined current
                              (into #{} (remove #(= (get joined %) (get roots %)))
                                    (keys joined))
-                             opts))))))
+                             config opts))))))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
@@ -144,7 +145,8 @@
                  ;; so keep its reachable nodes (else as-of/frozen on it breaks post-GC).
                  ;; The cutoff (`:remove-before`/`:grace-period-ms`) rides in `gc-opts`
                  ;; → d/gc!'s `t/gc-cutoff` (default epoch ⇒ reclaim nothing).
-                 (await (d/gc! kv-store (vals (await (d/load-roots kv-store opts)))
+                 (await (d/gc! kv-store (vals (await (d/load-roots kv-store config opts)))
+                               config
                                (merge gc-opts opts {:retain-roots (seq snapshot-ids)}))))))
 
   p/Overlayable
@@ -233,8 +235,8 @@
                                      (recur (next bs)
                                             (assoc acc branch (await (d/store-set! s (:storage g) opts)))))
                                    acc))]
-                     (await (d/save-roots! (:kv-store g) roots opts))
-                     (await (d/save-freed! (:kv-store g) (:storage g) opts))
+                     (await (d/save-roots! (:kv-store g) roots (:config g) opts))
+                     (await (d/save-freed! (:kv-store g) (:storage g) (:config g) opts))
                      (assoc g :dirty #{}))
                    g)))))
 
@@ -280,27 +282,33 @@
    mode, so all its ops are async too.)
 
      (gset \"kb\" {:store-config {:backend :memory :id (random-uuid)}})"
-  ([id] (gset id {}))
-  ([id {:keys [store-config comparator branch sync? kv-store roots-key freed-key]
-        :or {comparator compare branch :main sync? true}}]
+  ([id] (gset id {} {:sync? true}))
+  ([id config] (gset id config {:sync? true}))
+  ([id {:keys [store-config comparator branch kv-store roots-key freed-key]
+        :or {comparator compare branch :main}}
+    {:keys [sync?] :or {sync? true}}]
    (let [store-config (or store-config (when-not kv-store (d/mem-store-config)))
-        freed-key (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
-        opts (cond-> {:sync? sync?}
-               kv-store  (assoc :kv-store kv-store)
-               roots-key (assoc :roots-key roots-key)
-               freed-key (assoc :freed-key freed-key))]
-    (async+sync sync?
-                (async
-                 (let [{:keys [kv-store storage]} (await (d/open store-config opts))
-                       loaded (await (d/load-roots kv-store opts))
-                       roots  (if (seq loaded)
-                                (reduce-kv
-                                 (fn [m b addr]
-                                   (assoc m b (d/restore-set comparator addr storage opts)))
-                                 {} loaded)
-                                {branch (d/empty-set storage comparator)})
-                       cur-branch (if (seq loaded)
-                                    (or (some #{branch} (keys loaded)) (first (keys loaded)))
-                                    branch)]
-                   (->GSet id kv-store store-config storage comparator
-                           roots cur-branch #{} opts)))))))
+         freed-key (or freed-key (when (vector? roots-key) (assoc roots-key 0 :crdt/freed)))
+         opts {:sync? sync?}
+         ;; the PERSISTENT domain the record carries: the cell-keys (constant; the
+         ;; mutation fns read them). Default = the single-store cells.
+         cell-config (cond-> {}
+                       roots-key (assoc :roots-key roots-key)
+                       freed-key (assoc :freed-key freed-key))
+         ;; open-time domain: cell-keys + a pre-opened store (not persisted).
+         open-config (cond-> cell-config kv-store (assoc :kv-store kv-store))]
+     (async+sync sync?
+                 (async
+                  (let [{:keys [kv-store storage]} (await (d/open store-config open-config opts))
+                        loaded (await (d/load-roots kv-store cell-config opts))
+                        roots  (if (seq loaded)
+                                 (reduce-kv
+                                  (fn [m b addr]
+                                    (assoc m b (d/restore-set comparator addr storage opts)))
+                                  {} loaded)
+                                 {branch (d/empty-set storage comparator)})
+                        cur-branch (if (seq loaded)
+                                     (or (some #{branch} (keys loaded)) (first (keys loaded)))
+                                     branch)]
+                    (->GSet id kv-store store-config storage comparator
+                            roots cur-branch #{} cell-config opts)))))))

@@ -53,7 +53,8 @@
             adds        ; immutable PSS set of [element tag]
             removals    ; immutable PSS set of [element tag]
             dirty       ; boolean — content changed since last flush
-            opts]       ; the record's sync-mode
+            config      ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            opts]       ; RUNTIME: {:sync?} — the record's execution mode
 
   p/SystemIdentity
   (system-id [_] id)
@@ -226,13 +227,17 @@
    :tag-fn  element -> tag (default: ignore element, fresh random-uuid → true
             OR-Set). Pass a content-hash fn for idempotent add (registry shape).
    Restores both halves from the store's :crdt/roots cell when present."
-  ([id] (orset id {}))
-  ([id {:keys [comparator tag-fn sync? store-config kv-store roots-key freed-key]
-        :or {comparator compare tag-fn (fn [_] (random-uuid)) sync? true}}]
-   (async+sync sync?
-               (async
-                (let [{:keys [kv-store storage store-config opts adds removals]}
-                      (await (d/two-half-open store-config
-                                              {:comparator comparator :sync? sync? :kv-store kv-store
-                                               :roots-key roots-key :freed-key freed-key}))]
-                  (->ORSet id kv-store store-config storage comparator tag-fn adds removals false opts))))))
+  ([id] (orset id {} {:sync? true}))
+  ([id config] (orset id config {:sync? true}))
+  ([id {:keys [comparator tag-fn store-config kv-store roots-key freed-key]
+        :or {comparator compare tag-fn (fn [_] (random-uuid))}}
+    {:keys [sync?] :or {sync? true}}]
+   (let [opts {:sync? sync?}]
+     (async+sync sync?
+                 (async
+                  (let [{:keys [kv-store storage store-config config adds removals]}
+                        (await (d/two-half-open store-config
+                                                {:comparator comparator :kv-store kv-store
+                                                 :roots-key roots-key :freed-key freed-key}
+                                                opts))]
+                    (->ORSet id kv-store store-config storage comparator tag-fn adds removals false config opts)))))))

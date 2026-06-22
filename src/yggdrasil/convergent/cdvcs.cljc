@@ -38,7 +38,9 @@
 (declare ->CDVCS flush! cdvcs)
 
 (def ^:private state-cell :cdvcs/state)
-(defn- sk [opts] (:state-key opts state-cell))
+;; the state-cell key is DOMAIN (like the two-half cell-keys): it lives on the
+;; record's `:config`, NOT in the runtime `opts` ({:sync?}).
+(defn- sk [config] (:state-key config state-cell))
 
 (defn- state-of
   "The convergent state map of `x` — `x` itself if it is a bare state map (has
@@ -68,10 +70,10 @@
   "Write the convergent state map into its cell, JOINED with whatever is already
    there via `graph/downstream` — so a concurrent shared-store peer's state never
    gets clobbered (TOCTOU-safe: a single atomic konserve `update`). (async+sync)"
-  [kv-store state opts]
+  [kv-store state config opts]
   (async+sync (:sync? opts)
               (async
-               (await (kb/k-update kv-store (sk opts)
+               (await (kb/k-update kv-store (sk config)
                                    (fn [existing]
                                      (if existing (graph/downstream existing state) state))
                                    opts)))))
@@ -89,7 +91,7 @@
               (async
                (await (persist-commits! (:kv-store cd) commits (:opts cd)))
                (->CDVCS (:id cd) (:kv-store cd) (:store-config cd)
-                        state true (:opts cd)))))
+                        state true (:config cd) (:opts cd)))))
 
 (defn commit
   "Commit `transactions` onto a single-head CDVCS (throws on multiple heads).
@@ -159,7 +161,8 @@
            [id kv-store store-config
             state     ; {:commit-graph :heads :version} — the convergent value
             dirty     ; unsaved state cell?
-            opts]     ; the record's sync-mode
+            config    ; DOMAIN: {:state-key} (the convergent cell key); {} ⇒ default
+            opts]     ; RUNTIME: {:sync?} — the record's execution mode
 
   p/SystemIdentity
   (system-id [_] id)
@@ -213,8 +216,8 @@
                        joined      (graph/downstream state other-state)]
                    (if (= joined state)
                      this   ; idempotent no-op
-                     (do (await (save-state! kv-store joined opts))
-                         (->CDVCS id kv-store store-config joined false opts)))))))
+                     (do (await (save-state! kv-store joined config opts))
+                         (->CDVCS id kv-store store-config joined false config opts)))))))
   (-conflict-free? [_] false)   ; CDVCS LIFTS conflict into the head set
 
   p/GarbageCollectable
@@ -239,10 +242,9 @@
                                                (into (conj acc (first as))
                                                      (keys (:commit-graph snap)))))
                                       acc))]
-                   (await (d/gc! kv-store []
+                   (await (d/gc! kv-store [] config
                                  (clojure.core/merge gc-opts opts
-                                                     {:state-key (sk opts)
-                                                      :spare-keys [(sk opts)]
+                                                     {:spare-keys [(sk config)]
                                                       :retain-keys (vec retain)}))))))))
 
 (defn flush!
@@ -251,7 +253,7 @@
   [cd]
   (async+sync (:sync? (:opts cd))
               (async
-               (await (save-state! (:kv-store cd) (:state cd) (:opts cd)))
+               (await (save-state! (:kv-store cd) (:state cd) (:config cd) (:opts cd)))
                (assoc cd :dirty false))))
 
 ;; ============================================================
@@ -263,18 +265,24 @@
    seeds a fresh single-base-commit CDVCS for `:author` and persists it. Returns
    (async+sync) a CDVCS.
 
-   opts: :store-config (konserve cfg) | :kv-store (pre-opened, for a shared store),
-         :author, :sync? (default true), :state-key (cell key, default :cdvcs/state)."
-  ([id] (cdvcs id {}))
-  ([id {:keys [author sync?] :or {sync? true} :as opts}]
-   (let [opts (clojure.core/merge {:sync? sync?} (dissoc opts :author))]
+   config (DOMAIN): :store-config (konserve cfg) | :kv-store (pre-opened, for a shared
+           store), :author, :state-key (cell key, default :cdvcs/state).
+   opts (RUNTIME): :sync? (default true)."
+  ([id] (cdvcs id {} {:sync? true}))
+  ([id config] (cdvcs id config {:sync? true}))
+  ([id {:keys [author store-config kv-store state-key]}
+    {:keys [sync?] :or {sync? true}}]
+   (let [opts {:sync? sync?}
+         ;; persistent DOMAIN the record carries: just the state-cell key.
+         cell-config (cond-> {} state-key (assoc :state-key state-key))
+         open-config (cond-> {} kv-store (assoc :kv-store kv-store))]
      (async+sync sync?
                  (async
-                  (let [{:keys [kv-store store-config]} (await (d/open (:store-config opts) opts))
-                        existing (await (kb/k-get kv-store (sk opts) opts))]
+                  (let [{:keys [kv-store store-config]} (await (d/open store-config open-config opts))
+                        existing (await (kb/k-get kv-store (sk cell-config) opts))]
                     (if existing
-                      (->CDVCS id kv-store store-config existing false opts)
+                      (->CDVCS id kv-store store-config existing false cell-config opts)
                       (let [{:keys [state commits]} (core/new-cdvcs author)]
                         (await (persist-commits! kv-store commits opts))
-                        (await (save-state! kv-store state opts))
-                        (->CDVCS id kv-store store-config state false opts)))))))))
+                        (await (save-state! kv-store state cell-config opts))
+                        (->CDVCS id kv-store store-config state false cell-config opts)))))))))

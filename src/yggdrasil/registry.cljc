@@ -223,7 +223,8 @@
                             {:store-config store-config
                              :comparator tsbs-comparator
                              :element-read-handlers  #?(:clj element-read-handlers  :cljs nil)
-                             :element-write-handlers #?(:clj element-write-handlers :cljs nil)})]
+                             :element-write-handlers #?(:clj element-write-handlers :cljs nil)}
+                            {:sync? true})]
      (->Registry (atom tpset) (:kv-store tpset) store-config))))
 
 (defn gc!

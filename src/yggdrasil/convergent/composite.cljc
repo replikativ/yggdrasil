@@ -56,7 +56,7 @@
       (if (= joined (:systems this))
         this
         (comp/composite (vec (vals joined))
-                        :name (:composite-name this)
-                        :branch (:current-branch-name this)))))
+                        {:name (:composite-name this)
+                         :branch (:current-branch-name this)}))))
   (-conflict-free? [this]
     (every? c/convergent? (vals (:systems this)))))

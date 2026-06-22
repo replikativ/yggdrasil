@@ -38,6 +38,16 @@ on-disk format, for which an in-place migration is provided.
 
 ### Changed (breaking)
 
+- **Convergent CRDT + composite constructors are now `(ctor id config opts)`** (was a
+  single merged map). The DOMAIN map (`config`, 2nd arg) carries the construction
+  arguments — `:store-config`, `:comparator`, `:branch`, `:kv-store`, `:roots-key`/
+  `:freed-key`, element handlers, `:author`/`:state-key` (cdvcs); the RUNTIME map
+  (`opts`, 3rd arg) carries ONLY the execution mode `:sync?`, matching konserve's
+  `(op … {:sync?})` convention. So `opts` no longer holds store/domain arguments.
+  Applies to `gset`/`orset`/`twopset`/`ormap`/`merging-ormap`/`cdvcs` and
+  `composite`/`pullback`; `lwwr` is unchanged (in-memory, no runtime mode). Migrate by
+  moving `:sync?` out of the construction map into a trailing `{:sync?}`:
+  `(gset "k" {:store-config sc :sync? false})` → `(gset "k" {:store-config sc} {:sync? false})`.
 - **The snapshot registry's on-disk format changed.** It is now a durable **2P-Set**
   (adds + removals halves) — giving it convergent removal — instead of a single index.
   The PSS *node* format is unchanged, but the root cell moved from

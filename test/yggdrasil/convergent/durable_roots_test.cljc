@@ -16,22 +16,22 @@
 
 (deftest-async save-roots-is-a-grow-map
   (testing "save-roots! merges, never clobbers a branch it doesn't know"
-    (let [gs (<? (g/gset "t" {:store-config (file-cfg) :sync? sync?}))
+    (let [gs (<? (g/gset "t" {:store-config (file-cfg)} {:sync? sync?}))
           kv (:kv-store gs)]
-      (<? (d/save-roots! kv {:main :ra} {:sync? sync?}))
-      (<? (d/save-roots! kv {:feature :rf} {:sync? sync?}))        ; a writer that only knows :feature
-      (is (= {:main :ra :feature :rf} (<? (d/load-roots kv {:sync? sync?}))) ":main survived")
-      (<? (d/save-roots! kv {:main :ra2} {:sync? sync?}))          ; shared branch: incoming wins
-      (is (= {:main :ra2 :feature :rf} (<? (d/load-roots kv {:sync? sync?})))))))
+      (<? (d/save-roots! kv {:main :ra} {} {:sync? sync?}))
+      (<? (d/save-roots! kv {:feature :rf} {} {:sync? sync?}))        ; a writer that only knows :feature
+      (is (= {:main :ra :feature :rf} (<? (d/load-roots kv {} {:sync? sync?}))) ":main survived")
+      (<? (d/save-roots! kv {:main :ra2} {} {:sync? sync?}))          ; shared branch: incoming wins
+      (is (= {:main :ra2 :feature :rf} (<? (d/load-roots kv {} {:sync? sync?})))))))
 
 (deftest-async multi-branch-peers-converge
   (testing "two peers each add a distinct branch → merge keeps BOTH branches"
-    (let [a (<? (g/gset "kb" {:store-config (file-cfg) :sync? sync?}))
+    (let [a (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           a (<? (g/conj a :shared))
           a (-> a (p/branch! :fa) (p/checkout :fa))
           a (<? (g/conj a :a-only))
           a (<? (g/flush! a))
-          b (<? (g/gset "kb" {:store-config (file-cfg) :sync? sync?}))
+          b (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           b (<? (g/conj b :shared))
           b (-> b (p/branch! :fb) (p/checkout :fb))
           b (<? (g/conj b :b-only))
@@ -47,4 +47,4 @@
       (is (= #{:shared :a-only} (<? (g/elements (p/checkout a :fa)))))
       (is (= #{:shared :b-only} (<? (g/elements (p/checkout b :fb)))))
       ;; and the roots cell on disk reflects all three branches
-      (is (= #{:main :fa :fb} (set (keys (<? (d/load-roots (:kv-store a) {:sync? sync?})))))))))
+      (is (= #{:main :fa :fb} (set (keys (<? (d/load-roots (:kv-store a) {} {:sync? sync?})))))))))

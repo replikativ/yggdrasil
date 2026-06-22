@@ -43,7 +43,7 @@
   [systems]
   (comp/composite (for [[id elems] systems]
                     (reduce g/conj (g/gset id) elems))
-                  :name "ws"))
+                  {:name "ws"}))
 
 (defn- kb [composite id]
   (g/elements (comp/get-subsystem composite id)))
@@ -82,9 +82,9 @@
             the composite). Versioned subs share a store (resolvable ancestor)."
     (let [cell-store (atom {:a "val-a" :b "val-b"})
           ws-a (comp/composite [(reduce g/conj (g/gset "kb") [:a1 :shared])
-                                (->VersionedCell "cfg" cell-store :a)] :name "ws")
+                                (->VersionedCell "cfg" cell-store :a)] {:name "ws"})
           ws-b (comp/composite [(reduce g/conj (g/gset "kb") [:b1 :shared])
-                                (->VersionedCell "cfg" cell-store :b)] :name "ws")
+                                (->VersionedCell "cfg" cell-store :b)] {:name "ws"})
           merged (c/-join ws-a ws-b)]
       (testing "CRDT sub joins (union)"
         (is (= #{:a1 :b1 :shared} (kb merged "kb"))))

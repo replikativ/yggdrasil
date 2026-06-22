@@ -98,7 +98,8 @@
             adds        ; immutable PSS set of [hk uid k v]
             removals    ; immutable PSS set of [hk uid k v]
             dirty
-            opts]
+            config      ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            opts]       ; RUNTIME: {:sync?} — the record's execution mode
 
   p/SystemIdentity
   (system-id [_] id)
@@ -247,24 +248,29 @@
 ;; ============================================================
 
 (defn- open-ormap
-  [id merge-fn {:keys [store-config comparator sync? kv-store roots-key freed-key]
-                :or {comparator compare sync? true}}]
-  (async+sync sync?
-              (async
-               (let [{:keys [kv-store storage store-config opts adds removals]}
-                     (await (d/two-half-open store-config
-                                             {:comparator comparator :sync? sync? :kv-store kv-store
-                                              :roots-key roots-key :freed-key freed-key}))]
-                 (->ORMap id kv-store store-config storage comparator (wrap merge-fn)
-                          adds removals false opts)))))
+  [id merge-fn {:keys [store-config comparator kv-store roots-key freed-key]
+                :or {comparator compare}}
+   {:keys [sync?] :or {sync? true}}]
+  (let [opts {:sync? sync?}]
+    (async+sync sync?
+                (async
+                 (let [{:keys [kv-store storage store-config config adds removals]}
+                       (await (d/two-half-open store-config
+                                               {:comparator comparator :kv-store kv-store
+                                                :roots-key roots-key :freed-key freed-key}
+                                               opts))]
+                   (->ORMap id kv-store store-config storage comparator (wrap merge-fn)
+                            adds removals false config opts))))))
 
 (defn ormap
   "Open (or create) a durable OR-Map (multi-value: `get` returns the live value-set)."
-  [id & {:as opts}]
-  (open-ormap id nil opts))
+  ([id] (open-ormap id nil {} {:sync? true}))
+  ([id config] (open-ormap id nil config {:sync? true}))
+  ([id config opts] (open-ormap id nil config opts)))
 
 (defn merging-ormap
   "Open (or create) a durable Merging-OR-Map: concurrent per-key values FOLD via
    `merge-fn` (commutative/associative/idempotent) to a single value on `get`."
-  [id merge-fn & {:as opts}]
-  (open-ormap id merge-fn opts))
+  ([id merge-fn] (open-ormap id merge-fn {} {:sync? true}))
+  ([id merge-fn config] (open-ormap id merge-fn config {:sync? true}))
+  ([id merge-fn config opts] (open-ormap id merge-fn config opts)))

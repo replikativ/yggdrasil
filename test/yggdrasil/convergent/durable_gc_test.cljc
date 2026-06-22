@@ -35,20 +35,20 @@
 (deftest-async gc-safe-default-reclaims-nothing
   (testing "gc! with NO window reclaims NOTHING (never sweeps a node an in-flight
             lazy read might hold); a `:grace-period-ms 0` / `now` cutoff reclaims orphans"
-    (let [gs (<? (g/gset "t" {:store-config (file-cfg) :sync? sync?}))
+    (let [gs (<? (g/gset "t" {:store-config (file-cfg)} {:sync? sync?}))
           gs (<? (g/conj gs :a)) gs (<? (g/flush! gs))
           gs (<? (g/conj gs :b)) gs (<? (g/flush! gs))
           kv (:kv-store gs)
-          roots (vals (<? (d/load-roots kv {:sync? sync?})))]
-      (is (empty? (<? (d/gc! kv roots {:sync? sync?}))) "default (epoch cutoff) ⇒ reclaim nothing")
-      (is (empty? (<? (d/gc! kv roots {:sync? sync? :grace-period-ms 600000})))
+          roots (vals (<? (d/load-roots kv {} {:sync? sync?})))]
+      (is (empty? (<? (d/gc! kv roots {} {:sync? sync?}))) "default (epoch cutoff) ⇒ reclaim nothing")
+      (is (empty? (<? (d/gc! kv roots {} {:sync? sync? :grace-period-ms 600000})))
           "a 10-min grace still spares the just-written orphans")
-      (is (pos? (count (<? (d/gc! kv roots {:sync? sync? :grace-period-ms 0}))))
+      (is (pos? (count (<? (d/gc! kv roots {} {:sync? sync? :grace-period-ms 0}))))
           ":grace-period-ms 0 reclaims orphans older than now"))))
 
 (deftest-async gc-retains-held-snapshot
   (testing "a snapshot-id passed to gc-sweep! survives GC — as-of still resolves it"
-    (let [gs0  (<? (g/gset "t" {:store-config (file-cfg) :sync? sync?}))
+    (let [gs0  (<? (g/gset "t" {:store-config (file-cfg)} {:sync? sync?}))
           gs0  (<? (g/conj gs0 :a)) gs0 (<? (g/conj gs0 :b)) gs0 (<? (g/flush! gs0))
           snap (<? (p/snapshot-id gs0))                  ; S0 names the {:a :b} root
           ;; supersede S0's root tree twice, so S0's nodes are non-live

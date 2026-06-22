@@ -75,9 +75,9 @@
        (keep (fn [s]
                (when (and kv-store
                           (identical? kv-store (:kv-store s))
-                          (get-in s [:opts :roots-key]))
-                 {:roots-key (get-in s [:opts :roots-key])
-                  :freed-key (get-in s [:opts :freed-key])})))
+                          (get-in s [:config :roots-key]))
+                 {:roots-key (get-in s [:config :roots-key])
+                  :freed-key (get-in s [:config :freed-key])})))
        vec))
 
 ;; ============================================================
@@ -201,7 +201,7 @@
 (defn- colocated?
   "Whether `sys` co-habits `kv-store` as a durable CRDT (its own roots cell)."
   [kv-store sys]
-  (boolean (and kv-store (identical? kv-store (:kv-store sys)) (get-in sys [:opts :roots-key]))))
+  (boolean (and kv-store (identical? kv-store (:kv-store sys)) (get-in sys [:config :roots-key]))))
 
 (defn- unified-gc!
   "Shared-store composite GC: flush the index + every co-located sub, then ONE
@@ -226,18 +226,18 @@
                                  (if ss
                                    (let [s (val (first ss))]
                                      (recur (next ss)
-                                            (into acc (vals (await (d/load-roots (:kv-store s) (:opts s)))))))
+                                            (into acc (vals (await (d/load-roots (:kv-store s) (:config s) (:opts s)))))))
                                    acc))
                      roots (filterv some? (cons comp-root sub-roots))
                      spare (into #{composite-subs-key}
                                  (mapcat (fn [m] [(:roots-key m) (:freed-key m)]))
                                  manifest)
                      deleted (await (d/gc! kv-store roots
+                                           {:roots-key composite-root-key
+                                            :freed-key composite-freed-key}
                                            (-> opts
                                                (merge (select-keys gc-opts [:remove-before :grace-period-ms]))
-                                               (assoc :roots-key composite-root-key
-                                                      :freed-key composite-freed-key
-                                                      :spare-keys spare))))]
+                                               (assoc :spare-keys spare))))]
                  {:deleted deleted}))))
 
 ;; ============================================================
@@ -630,7 +630,7 @@
     (async+sync sync?
                 (async
                  (let [{:keys [kv-store storage]} (if store-config
-                                                    (await (d/open store-config (assoc opts :freed-key composite-freed-key)))
+                                                    (await (d/open store-config {:freed-key composite-freed-key} opts))
                                                     {:kv-store nil :storage nil})
                        sys-map (await (open-subs subs kv-store opts))
                        composite-name (or name (str prefix (str/join sep (sort (keys sys-map)))))
@@ -658,8 +658,10 @@
                      (nil = ephemeral, in-memory index)
      :store-path   — (legacy) directory for a file store
      :sync?        — sync mode (default true)"
-  ([subs] (composite subs {}))
-  ([subs {:keys [name branch store-config store-path sync?] :or {branch :main sync? true}}]
+  ([subs] (composite subs {} {:sync? true}))
+  ([subs config] (composite subs config {:sync? true}))
+  ([subs {:keys [name branch store-config store-path] :or {branch :main}}
+    {:keys [sync?] :or {sync? true}}]
    (build-composite subs branch name "composite:" "+"
                     (or store-config (when store-path {:backend :file :id (random-uuid) :path store-path}))
                     sync?)))
@@ -670,8 +672,10 @@
    pullback(pullback(A,B), C) ≅ pullback(A,B,C). Pass `:branch` to name the
    shared logical branch when native names differ. Same sub-provider interface +
    `async+sync` as `composite`."
-  ([subs] (pullback subs {}))
-  ([subs {:keys [name branch store-config store-path sync?] :or {sync? true}}]
+  ([subs] (pullback subs {} {:sync? true}))
+  ([subs config] (pullback subs config {:sync? true}))
+  ([subs {:keys [name branch store-config store-path]}
+    {:keys [sync?] :or {sync? true}}]
    (let [store-config (or store-config (when store-path {:backend :file :id (random-uuid) :path store-path}))]
      (async+sync sync?
                  (async

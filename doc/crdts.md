@@ -20,14 +20,22 @@ This document is the catalog. For CDVCS specifically see
   sync + dedup). The value is **never fully materialized in memory**: a read pulls
   only the B-tree nodes it touches, through an in-memory node cache (datahike-style).
   A key-scoped read is an O(log n + matches) range *slice*, not a full scan.
+- **Two-map constructor: `(ctor id config opts)`.** The DOMAIN map (`config`, 2nd arg)
+  carries what to build — `:store-config`, `:comparator`, `:branch`, `:kv-store`,
+  `:roots-key`/`:freed-key`, element handlers, `:author`/`:state-key` (cdvcs), …; the
+  RUNTIME map (`opts`, 3rd arg) carries ONLY the execution mode `:sync?`. So `opts`
+  never holds store/domain arguments. All three arities exist: `(ctor id)`,
+  `(ctor id config)`, `(ctor id config opts)`.
 - **Memory = a memory-backed store.** Constructing a CRDT without a `:store-config`
   defaults to a fresh in-memory konserve store. There is no separate "in-memory"
   implementation — the memory variant is the durable one over a memory store.
 - **Cross-platform via `async+sync`.** Every storage-touching op is written once and
-  the macro emits a synchronous body on the JVM (returns values) and an asynchronous
-  one on ClojureScript (a partial-cps continuation you `await`). The record carries
-  its sync-mode (`:sync? true|false`); pass `:sync? false` on cljs and `await` the
-  results.
+  the macro emits a synchronous body (returns values) or a partial-cps continuation you
+  `await`, per the record's sync-mode in `opts` (`{:sync? true|false}`). `:sync? true`
+  works on the JVM **and on ClojureScript over a synchronous konserve backend (memory or
+  node filestore)** — reads stay on-the-fly even synchronously (a key read is an O(log n)
+  range slice). Only a browser **IndexedDB** store has no synchronous konserve API, so
+  there you must pass `{:sync? false}` as the constructor's 3rd arg and `await` the results.
 - **Conflict-free, except where it deliberately isn't.** `-conflict-free?` is `true`
   for the join-semilattice CRDTs; CDVCS returns `false` (it *lifts* conflict into a
   multiple-head state), and a heterogeneous composite is conflict-free only if all
@@ -64,8 +72,8 @@ This document is the catalog. For CDVCS specifically see
       s (o/disj s :wip)]
   (o/elements s))            ;; => #{:urgent}   (add-wins: a concurrent re-add survives)
 
-;; cljs (async): construct with :sync? false and await
-;; (let [s (<? (o/orset "tags" :sync? false)) ...] (<? (o/elements s …)))
+;; cljs (async): runtime opts (the 3rd arg) carry :sync? — domain config is the 2nd
+;; (let [s (<? (o/orset "tags" {} {:sync? false})) ...] (<? (o/elements s …)))
 ```
 
 - **G-Set**: union only; `-join` = set union. The simplest CRDT.

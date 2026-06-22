@@ -612,8 +612,9 @@ a `:store-config` defaults to a fresh in-memory konserve store.
 ```
 
 The collection verbs are bare Clojure collection names — alias the namespace so they
-read like `(om/get m k)`. On ClojureScript the operations are asynchronous (construct
-with `:sync? false` and `await`). See **[doc/crdts.md](doc/crdts.md)** for the full
+read like `(om/get m k)`. `:sync? true` works on the JVM and on cljs over a synchronous
+konserve backend (memory or node filestore); only a browser IndexedDB store requires
+`:sync? false` + `await`. See **[doc/crdts.md](doc/crdts.md)** for the full
 catalog, storage layout, and sync, and **[doc/cdvcs-convergent-system.md](doc/cdvcs-convergent-system.md)**
 for CDVCS.
 

@@ -48,7 +48,8 @@
             adds         ; immutable PSS set of elements
             removals     ; immutable PSS set of tombstoned elements
             dirty        ; boolean — content changed since last flush
-            opts]
+            config       ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            opts]        ; RUNTIME: {:sync?} — the record's execution mode
 
   p/SystemIdentity
   (system-id [_] id)
@@ -218,15 +219,19 @@
                             elements are fressian-native; the registry passes a
                             RegistryEntry handler)
    Restores both halves from the store's :crdt/roots cell when present."
-  ([id] (twopset id {}))
-  ([id {:keys [comparator element-read-handlers element-write-handlers sync? store-config kv-store roots-key freed-key]
-        :or {comparator compare sync? true}}]
-   (async+sync sync?
-               (async
-                (let [{:keys [kv-store storage store-config opts adds removals]}
-                      (await (d/two-half-open store-config
-                                              {:comparator comparator :sync? sync? :kv-store kv-store
-                                               :roots-key roots-key :freed-key freed-key
-                                               :element-read-handlers element-read-handlers
-                                               :element-write-handlers element-write-handlers}))]
-                  (->TwoPSet id kv-store store-config storage comparator adds removals false opts))))))
+  ([id] (twopset id {} {:sync? true}))
+  ([id config] (twopset id config {:sync? true}))
+  ([id {:keys [comparator element-read-handlers element-write-handlers store-config kv-store roots-key freed-key]
+        :or {comparator compare}}
+    {:keys [sync?] :or {sync? true}}]
+   (let [opts {:sync? sync?}]
+     (async+sync sync?
+                 (async
+                  (let [{:keys [kv-store storage store-config config adds removals]}
+                        (await (d/two-half-open store-config
+                                                {:comparator comparator :kv-store kv-store
+                                                 :roots-key roots-key :freed-key freed-key
+                                                 :element-read-handlers element-read-handlers
+                                                 :element-write-handlers element-write-handlers}
+                                                opts))]
+                    (->TwoPSet id kv-store store-config storage comparator adds removals false config opts)))))))
