@@ -19,7 +19,9 @@
             [yggdrasil.convergent.lwwr :as lwwr]
             [yggdrasil.composite :as cmp]
             [yggdrasil.fn-registry :as fr]
-            [yggdrasil.adapters.git :as git]))
+            [yggdrasil.adapters.git :as git]
+            [yggdrasil.adapters.datahike :as dha]
+            [datahike.api :as d]))
 
 (defn- file-cfg []
   {:backend :file
@@ -170,3 +172,24 @@
       (is (= rp (:repo-path reopened)) "external identity (repo-path) preserved")
       (is (= (p/snapshot-id sys) (p/snapshot-id reopened))
           "same head SHA — reconstruct reconnected to the LIVE repo"))))
+
+(deftest datahike-roundtrips-by-reconnecting
+  (testing "a datahike system serializes its connection CONFIG; reconstruct RECONNECTS
+            via datahike's OWN api (it owns the DB codec) — we don't overload datahike,
+            the DB is never inlined here"
+    (let [cfg  {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true :schema-flexibility :read}
+          _    (d/create-database cfg)
+          conn (d/connect cfg)
+          _    (d/transact conn [{:db/id -1 :note "hi"}])
+          sys  (dha/create conn {:system-name "db"})
+          host (g/gset "host" {:store-config (file-cfg)} {:sync? true})
+          store (storage/attach-pss-serializer!
+                 (:kv-store host) (:settings (:storage host))
+                 (fn [rs] (yf/read-handlers {:resolve-storage rs :sync? true}))
+                 (yf/write-handlers))
+          _        (kb/k-assoc store :saved/dh sys {:sync? true})
+          reopened (kb/k-get store :saved/dh {:sync? true})]
+      (is (= :datahike (p/system-type reopened)) "reopened as a datahike system")
+      (is (= #{"hi"} (set (map first (d/q '[:find ?n :where [_ :note ?n]] @(:conn reopened)))))
+          "reconnected to the SAME datahike DB — data intact"))))

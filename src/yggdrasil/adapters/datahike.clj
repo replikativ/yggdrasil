@@ -11,6 +11,7 @@
   datahike is available as a dependency."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
+            [yggdrasil.fressian :as yf]
             [yggdrasil.hooks :as hooks]
             [konserve.core :as k]
             [datahike.api :as d]
@@ -566,3 +567,15 @@
 (defmethod hooks/remove-commit-hook! :datahike
   [_workspace system hook-id]
   (d/unlisten (:conn system) hook-id))
+
+;; Register Datahike with the system value codec — external-ref flavor, DON'T overload
+;; datahike. Datahike already owns the DB's OWN serialization (its fused root + Datom
+;; fressian handlers + store-id scope registry). So the value codec serializes only the
+;; connection CONFIG (a reference) and reconstruct RECONNECTS via `d/connect` — the DB
+;; data is never inlined here. (Same shape as git; resolve-storage unused.)
+(yf/register-system!
+ :datahike DatahikeSystem
+ (fn [{:keys [conn system-name]}]
+   {:config (:config @conn) :system-name system-name})
+ (fn [blob _storage _opts]
+   (create (d/connect (:config blob)) {:system-name (:system-name blob)})))
