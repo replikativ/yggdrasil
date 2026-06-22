@@ -116,6 +116,16 @@
                      (update :key->gen dissoc k)))
                c)))))
 
+(defn node-child-addresses
+  "Child addresses of a stored PSS node (Leaf → nil, Branch → its addresses).
+   The `:addresses-fn` to hand `konserve-sync.walkers.pss/make-pss-sync-opts` for
+   ANY store backed by `KonserveStorage`: `k/get` returns PSS Leaf/Branch OBJECTS
+   here (memory holds the object as-is; file/idb deserialize back to one), so the
+   walker must project via the canonical codec — bare keyword access yields nil on
+   an object, collapsing the reachability walk to the root alone."
+  [node]
+  (when node (:addresses (pss-fress/node->map node))))
+
 ;; Nodes are stored as PSS Leaf/Branch OBJECTS, (de)serialized by the canonical
 ;; `org.replikativ.persistent-sorted-set.fressian` handlers attached to the konserve
 ;; store (see `attach-pss-serializer!`). A konserve MEMORY store holds the object as-is
