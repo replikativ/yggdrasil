@@ -17,12 +17,27 @@
    Default is rpool/yggdrasil (requires ZFS delegation, see README)."
   (or (System/getenv "ZFS_TEST_POOL") "rpool/yggdrasil"))
 
+(defn- chmod-passwordless?
+  "The adapter chmods its (root-owned) ZFS mounts world-writable, so it needs
+   passwordless `sudo chmod 777 <mount-base>/...`. Probe at the depth the adapter
+   uses: a path-missing error means auth PASSED (fine — the dir just doesn't exist
+   yet); an auth/password error means it'd fail → skip. Without this the suite
+   ERRORs with a downstream `FileNotFoundException` (mount left non-writable) on
+   boxes where the `zfs` NOPASSWD rule exists but the `chmod` one is absent/narrow
+   (e.g. sudo-rs not matching the arg glob)."
+  []
+  (let [r (sh "sudo" "-n" "chmod" "777" (str zfs/*mount-base* "/__ygg_probe__/main"))]
+    (not (re-find #"(?i)password|authentication|not allowed|may not run|a terminal is required"
+                  (str (:err r))))))
+
 (defn- zfs-available?
-  "Check if ZFS is usable (binary exists and passwordless sudo works)."
+  "Check if ZFS is usable: the `zfs` binary works passwordless AND passwordless
+   `sudo chmod 777` works for the adapter's mount paths. Either missing → skip
+   (the adapter cannot make its root-owned mounts writable otherwise)."
   []
   (try
-    (let [result (sh "sudo" "-n" "zfs" "list" "-H" "-o" "name" zfs-pool)]
-      (zero? (:exit result)))
+    (and (zero? (:exit (sh "sudo" "-n" "zfs" "list" "-H" "-o" "name" zfs-pool)))
+         (chmod-passwordless?))
     (catch Exception _ false)))
 
 (defn- unique-prefix []

@@ -17,6 +17,8 @@
             [clojure.set :as set])
   (:import [java.util.concurrent.locks ReentrantLock]))
 
+(declare ^:dynamic *mount-base*)   ; defined below; referenced in chmod-777! error text
+
 (def ^:dynamic *use-sudo*
   "When true, prefix zfs commands with sudo. Default true on Linux
    (unprivileged mounts not supported). Set to false if using ZFS delegation
@@ -112,9 +114,19 @@
      :events events}))
 
 (defn- chmod-777!
-  "Make a directory world-writable. Uses sudo chmod for ZFS mount points."
+  "Make a directory world-writable. ZFS mounts are created root-owned, so the
+   adapter chmods them so the user can write the versioned tree. Uses sudo (needs
+   passwordless `chmod 777 <mount-base>/...`). FAILS LOUD: a swallowed failure
+   leaves a root-owned, non-writable mount, surfacing later as a confusing
+   `FileNotFoundException` on the first write — throw here instead."
   [path]
-  (sh "sudo" "chmod" "777" path))
+  (let [r (sh "sudo" "chmod" "777" path)]
+    (when-not (zero? (:exit r))
+      (throw (ex-info (str "chmod 777 failed for " path
+                           " — the ZFS mount stays root-owned and non-writable. Needs passwordless "
+                           "`sudo chmod 777 " *mount-base* "/...`. (" (str/trim (str (:err r))) ")")
+                      {:path path :exit (:exit r) :err (:err r)})))
+    r))
 
 (defn- get-lock!
   "Get or create a lock for a branch."
