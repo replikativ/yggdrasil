@@ -652,6 +652,13 @@
    sub-providers (built systems and/or openers — see the section comment).
    (async+sync — `:sync? false` on cljs and `await` the result.)
 
+   DEFAULT-BRANCH CAVEAT: adapters disagree on the default branch — datahike has NO
+   `:main` (its branch is the conn's, conventionally `:db`); git/CRDT/composite default
+   `:main`. `composite`'s `:branch` names the COMPOSITE's logical branch and fans out to
+   subs on `checkout`, but on construction each sub stays on its own native branch. Do
+   not assume a sub is on `:main`. `pullback` (the fiber-product variant) THROWS if subs
+   are on different native branches unless you pass `:branch` to name the shared one.
+
    opts:
      :name         — composite system name (default auto)
      :branch       — logical branch (default :main)

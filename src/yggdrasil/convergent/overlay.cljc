@@ -48,6 +48,17 @@
   [overlay]
   @(:local-writes overlay))
 
+(defn reseat-overlay!
+  "Replace the overlay's isolated writable system with `system` — a DIRECT re-seat
+   (no mutator). Supported API for callers that have ALREADY computed the new
+   writable value (e.g. after folding parent state into a child overlay); use
+   `overlay-swap!` when you instead have a value-semantic mutator. Isolates callers
+   from the `:local-writes` field shape — do NOT `(reset! (:local-writes ov) …)`
+   directly. Returns the overlay."
+  [overlay system]
+  (reset! (:local-writes overlay) system)
+  overlay)
+
 (defn overlay-swap!
   "Apply value-semantic mutator `f` (system → new-system, possibly async) to the
    overlay's isolated writable system and RE-SEAT the result in `:local-writes`.

@@ -159,6 +159,13 @@
             to              ; target ref
             error])         ; String - error message
 
+(defn diff-error
+  "Construct a `DiffError` for a failed `diff`/`merge` between `from` and `to`.
+   Supported constructor — use this instead of `->DiffError` so the record's field
+   shape can evolve without breaking callers (e.g. spindel's diff bridge)."
+  [from to error]
+  (->DiffError from to error))
+
 ;; ============================================================
 ;; Registry entry - cross-system snapshot tracking
 ;; ============================================================

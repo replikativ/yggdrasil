@@ -46,28 +46,44 @@
 ;; ============================================================
 
 (defprotocol Branchable
-  "Named references to snapshots. Value-semantic: operations return new system."
+  "Named references to snapshots.
+
+   BRANCH IDENTITY (pinned contract): branch names are KEYWORDS everywhere — both as
+   inputs (`branch!`/`checkout`/`delete-branch!`/`from`) and outputs
+   (`current-branch`/`branches`). Pass keywords. Adapters MAY coerce a string with
+   `keyword`, but callers should not rely on it. Default branch differs by adapter:
+   CRDT/composite/git default `:main`; DATAHIKE has NO `:main` — its branch is the
+   conn's `:config :branch`, conventionally `:db`. Do not hardcode `:main` against a
+   datahike system (see `composite`/`pullback` for the mixed-default caveat).
+
+   RETURN CONTRACT: value-semantic systems (CRDT, composite) return a NEW system value;
+   `current-branch` is unchanged by `branch!`. STATEFUL adapters (datahike, git) are an
+   exception: `branch!`/`delete-branch!` side-effect the shared conn/worktree and return
+   `this` (the same record aliasing the now-mutated backend). `checkout` returns a fresh
+   value on every adapter. Thread results functionally and do not assume `branch!` left
+   the receiver untouched on stateful adapters."
 
   (branches [this] [this opts]
-    "List all branch names. Returns set of keywords.
+    "List all branch names. Returns set of KEYWORDS.
      opts: {:sync? true} — when false, returns channel/promise.")
 
   (current-branch [this]
-    "Current branch name. Returns keyword.")
+    "Current branch name. Returns a KEYWORD.")
 
   (branch! [this name] [this name from] [this name from opts]
-    "Create branch from current state (or `from` snapshot-id/branch).
-     Returns new system with branch created. Current branch unchanged.
+    "Create branch `name` (keyword) from current state (or `from` snapshot-id/branch).
+     Value-semantic adapters return a new system with the branch created (current branch
+     unchanged); stateful adapters (datahike/git) side-effect and return `this`.
      opts: {:sync? true} — when false, returns channel/promise.")
 
   (delete-branch! [this name] [this name opts]
-    "Remove branch. Returns new system without the branch.
-     Underlying data remains until GC.
+    "Remove branch `name` (keyword). Returns new system (value-semantic) or `this`
+     (stateful) without the branch. Underlying data remains until GC.
      opts: {:sync? true} — when false, returns channel/promise.")
 
   (checkout [this name] [this name opts]
-    "Switch to branch. Returns new system at branch head.
-     opts: {:sync? true} — when false, returns channel/promise."))
+    "Switch to branch `name` (keyword). Returns a NEW system value at the branch head
+     (on every adapter). opts: {:sync? true} — when false, returns channel/promise."))
 
 ;; ============================================================
 ;; Layer 3: Graphable (history/DAG traversal)
@@ -110,15 +126,22 @@
 ;; ============================================================
 
 (defprotocol Mergeable
-  "Merge support. Value-semantic: merge! returns new system."
+  "Merge support. RETURN CONTRACT mirrors `Branchable`: value-semantic systems (CRDT,
+   composite) return a NEW system; stateful adapters (datahike/git) side-effect and
+   return `this`. `source` is a branch KEYWORD or a snapshot/commit id (string/uuid).
+
+   OPTS are ADVISORY and adapter-specific — not every adapter honors every key:
+     :strategy :ours|:theirs|:union|fn   — recognized by graph/CRDT mergers; datahike
+                                           IGNORES it (it does identity-keyed 3-way tx).
+     :message  \"…\"                       — commit message where the adapter records one.
+     :tx-data :tx-meta                    — datahike-specific passthrough.
+     :sync? true                          — when false, returns channel/promise.
+   Treat unrecognized opts as no-ops; consult the adapter for what it actually uses."
 
   (merge! [this source] [this source opts]
-    "Merge source branch/snapshot into current.
-     opts: {:strategy :ours|:theirs|:union|fn
-            :message \"merge commit message\"
-            :sync? true}
-     Returns new system with merge applied.
-     Use (snapshot-id result) to get the merge commit ID.")
+    "Merge `source` (branch keyword or snapshot/commit id) into current. Returns a new
+     system (value-semantic) or `this` (stateful). Use (snapshot-id result) for the merge
+     commit id. See the protocol docstring for the advisory, adapter-specific opts.")
 
   (conflicts [this a b] [this a b opts]
     "Detect conflicts between two snapshots without merging.
@@ -180,12 +203,14 @@
     "Delta of overlay's isolated writes since creation/last-advance.")
 
   (merge-down! [overlay] [overlay opts]
-    "Push overlay writes to parent. May fail on conflict.
-     opts: {:sync? true} — when false, returns channel/promise.")
+    "Push overlay writes to the parent. RETURNS the merged PARENT SYSTEM value (the new
+     parent at the post-merge head) — re-seat your reference to it. May throw on conflict;
+     pre-check with `Mergeable/conflicts`. opts: {:sync? true} — when false returns
+     channel/promise (yielding the parent system).")
 
   (discard! [overlay] [overlay opts]
-    "Abandon overlay and all its isolated writes.
-     opts: {:sync? true} — when false, returns channel/promise."))
+    "Abandon the overlay and all its isolated writes. RETURNS the unchanged PARENT SYSTEM
+     value. opts: {:sync? true} — when false, returns channel/promise."))
 
 ;; ============================================================
 ;; Layer 6: Watchable (state change observation)
@@ -279,3 +304,20 @@
       :graphable true
       :mergeable false
       :overlayable false}"))
+
+;; ============================================================
+;; Runtime-mode helpers (supported API; do not peek :opts directly)
+;; ============================================================
+
+(defn system-sync?
+  "Whether `sys` runs in SYNCHRONOUS mode (JVM blocking values) vs async (cljs
+   channels/promises). The ONE supported way to ask — consumers MUST NOT read
+   `(:sync? (:opts sys))` directly; this isolates them from where the runtime flag
+   lives (domain config vs runtime opts were split — task #145). Absent ⇒ async (false)."
+  [sys]
+  (boolean (:sync? (:opts sys))))
+
+(defn system-async?
+  "Complement of `system-sync?`."
+  [sys]
+  (not (system-sync? sys)))
