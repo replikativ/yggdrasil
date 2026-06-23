@@ -23,6 +23,7 @@
             [konserve.serializers :as kser]
             [hasch.core :as hasch]
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
+            [org.replikativ.persistent-sorted-set.boundary :as pss-bnd]
             [yggdrasil.kbridge :as kb]
             [yggdrasil.types :as t]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
@@ -31,7 +32,7 @@
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
   #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
                             [is.simm.partial-cps.async :refer [async]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage Settings])))
+  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage Settings IBoundary])))
 
 ;; ============================================================
 ;; Store lifecycle
@@ -138,7 +139,9 @@
   #?@(:clj
       [(store [_ node]
               (let [address (if content-addressed? (hasch/uuid (pss-fress/node->map node)) (random-uuid))]
-                (kb/k-assoc kv-store address node {:sync? true})
+                ;; a stored node is WRITE-ONCE (its address never re-binds) → mark it
+                ;; immutable so a sync peer can skip a node it already holds.
+                (kb/k-assoc kv-store address node kb/immutable-meta {:sync? true})
                 (cache-put! cache address node)
                 address))
 
@@ -158,7 +161,8 @@
               (async+sync (:sync? opts)
                           (async
                            (let [address (if content-addressed? (hasch/uuid (pss-fress/node->map node)) (random-uuid))]
-                             (await (kb/k-assoc kv-store address node opts))
+                             ;; write-once node → mark immutable (see clj branch).
+                             (await (kb/k-assoc kv-store address node kb/immutable-meta opts))
                              (cache-put! cache address node)
                              address))))
 
@@ -176,11 +180,32 @@
        (isFreed [_ address] (contains? @freed-atom address))
        (freedInfo [_ address] (get @freed-atom address))]))
 
+(def ^:dynamic *mst-lzpl*
+  "MST boundary parameter for the convergent CRDTs: leading-zeros-per-level (avg node
+   fanout ≈ 2^lzpl). When set, `default-settings` uses a content-defined **MST** boundary
+   → history-independent trees (same key set ⇒ same content-addressed root, regardless of
+   insertion order) ⇒ true cross-peer root convergence + maximal node dedup. Bind to `nil`
+   to fall back to the historical count B-tree (e.g. for A/B experiments)."
+  6)
+
 (defn default-settings
   "Platform-default PSS settings — the same value the storage and its serializer must
-   share so reconstructed nodes match. JVM: a `Settings`; cljs: a settings map."
+   share so reconstructed nodes match. JVM: a `Settings`; cljs: a settings map. Uses an MST
+   content-defined boundary when `*mst-lzpl*` is set (the default)."
   []
-  #?(:clj (Settings.) :cljs {:branching-factor 512 :diff-buf-size 0}))
+  #?(:clj  (let [s (Settings.)]
+             (if *mst-lzpl* (.withBoundary s (pss-bnd/mst-boundary *mst-lzpl*)) s))
+     :cljs (cond-> {:branching-factor 512 :diff-buf-size 0}
+             *mst-lzpl* (assoc :boundary (pss-bnd/mst-boundary *mst-lzpl*)))))
+
+(defn settings-boundary
+  "The content-defined (MST) boundary of `settings`, or nil for the count B-tree. Pass to
+   `pss/sorted-set*` `:boundary` so a FRESH set splits history-independently. PSS auto-adopts
+   the boundary only on RESTORE (from the root node's self-describing descriptor); for a NEW
+   set there is no root to read, so the consumer MUST thread it explicitly."
+  [settings]
+  #?(:clj  (let [b (.boundary ^Settings settings)] (when (.contentDefined ^IBoundary b) b))
+     :cljs (:boundary settings)))
 
 (defn create-storage
   "Create a KonserveStorage backed by a konserve store.

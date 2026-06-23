@@ -4,17 +4,24 @@
    the head set, convergent metadata) ↔ flat CRDTs (no-conflict join).
 
    STORAGE (Option B — aligned with the PSS CRDTs, BOUNDED resident heap): the
-   commit-graph is a grow-only **PSS** of `[id parents]` entries (the convergent
-   source of truth — its roots cell merges as a grow-map, so mutually-merged peers
-   converge on the same content-addressed root, exactly like a G-Set). A commit's
-   parents are read ON THE FLY (`parents-of` slices the entry) by the store-backed
-   algebra in `cdvcs.graph-store`; the full graph is never resident. `:heads` (the
-   DERIVED frontier, `#{id}`) + `:version` live in a small cache cell — heads can't
-   be convergent (a commit removes its parents from heads), so `-join` recomputes
-   them via `remove-ancestors` over the merged graph. A peer's heads reflect its
-   last `-join` (fresh under signal-sync; a cold-opened peer converges on its next
-   `-join`). The commits THEMSELVES stay content-addressed blobs (`id` = hash of
-   `{:transactions :parents}`), idempotent, shipped by konserve-sync.
+   commit-graph is a grow-only **PSS** of `[id value]` entries — the commit value
+   INLINED beside its id (`id` = hash of `{:transactions :parents}`; the value
+   carries `:parents`), the convergent source of truth. Its roots cell merges as a
+   grow-map, so mutually-merged peers converge on the same content-addressed root,
+   exactly like a G-Set. A commit's parents are read ON THE FLY (`parents-of` slices
+   the entry's value) by the store-backed algebra in `cdvcs.graph-store`; the full
+   graph is never resident. `:heads` (the DERIVED frontier, `#{id}`) + `:version`
+   live in a small cache cell — heads can't be convergent (a commit removes its
+   parents from heads), so `-join` recomputes them via `remove-ancestors` over the
+   merged graph. A peer's heads reflect its last `-join` (fresh under signal-sync; a
+   cold-opened peer converges on its next `-join`).
+
+   INLINING the value (vs a separate content-addressed blob) trades per-commit
+   structural sharing of values for ZERO round-trip — a synced graph node already
+   carries its commit, so a peer reads it without a follow-up fetch. Users who want
+   the sharing can store the value as their own blob and inline only a reference.
+   The PSS nodes are themselves content-addressed + write-once, shipped by
+   konserve-sync (no separate blob layer to push).
 
    `-join` ≡ replikativ `downstream`: union the commit-graphs + recompute heads —
    commutative/associative/idempotent. May leave >1 head: the lifted conflict.
@@ -48,26 +55,15 @@
 (defn- sk  [config] (:state-key config state-cell))
 (defn- graph-config [config] {:roots-key (gk config) :freed-key (gfk config)})
 
-;; commit-graph entries `[id parents]`, ordered by id only — so a partial `[id]`
-;; vector is a valid slice bound (the comparator ignores the rest).
+;; commit-graph entries `[id value]` (the commit value inlined beside its id),
+;; ordered by id only — so a partial `[id]` vector is a valid slice bound (the
+;; comparator ignores the rest). Same id ⟺ same content-addressed value, so the
+;; id-only order is a true set (conj of an equal entry is a no-op).
 (def ^:private graph-cmp (fn [a b] (compare (first a) (first b))))
 
 ;; ============================================================
-;; Graph PSS + commit-blob persistence
+;; Graph PSS persistence (commit values ride inline in the entries)
 ;; ============================================================
-
-(defn- persist-commits!
-  "k-assoc every {id -> commit-value} blob under its id (content-addressed,
-   idempotent). (async+sync)"
-  [kv-store commits opts]
-  (async+sync (:sync? opts)
-              (async
-               (loop [cs (seq commits)]
-                 (if cs
-                   (let [[id cval] (first cs)]
-                     (await (kb/k-assoc kv-store id cval opts))
-                     (recur (next cs)))
-                   true)))))
 
 (defn- load-graph
   "Restore the commit-graph PSS from its roots cell (empty when none). (async+sync)"
@@ -99,14 +95,14 @@
 
 (defn parents-of
   "An accessor `id -> (async parents-or-nil)` over a graph PSS `graph` (read through
-   `storage`), for the store-backed algebra: slices the `[id parents]` entry and
-   yields its parents, or nil when the commit is absent. (async+sync)"
+   `storage`), for the store-backed algebra: slices the `[id value]` entry and
+   yields the value's `:parents`, or nil when the commit is absent. (async+sync)"
   [graph storage opts]
   (fn [id]
     (async+sync (:sync? opts)
                 (async
                  (let [es (await (d/slice->clj graph [id] [id] opts))]
-                   (when (seq es) (second (first es))))))))
+                   (when (seq es) (:parents (second (first es)))))))))
 
 ;; ============================================================
 ;; Functional verbs — each returns a NEW record (value-semantic)
@@ -114,7 +110,7 @@
 
 (defn commit
   "Commit `transactions` onto a single-head CDVCS (throws on multiple heads). Appends
-   `[id parents]` to the graph PSS + the content-addressed blob. (async+sync)"
+   `[id value]` (the inlined commit) to the graph PSS. (async+sync)"
   [cd author transactions]
   (let [opts (:opts cd)]
     (async+sync (:sync? opts)
@@ -124,11 +120,10 @@
                      (throw (ex-info "CDVCS has multiple heads — merge before committing."
                                      {:type :multiple-heads :heads heads})))
                    (let [{:keys [id value]} (core/make-commit author (vec heads) transactions)
-                         graph' (await (d/set-conj (:graph cd) [id (vec heads)] graph-cmp opts))]
-                     (await (persist-commits! (:kv-store cd) {id value} opts))
+                         graph' (await (d/set-conj (:graph cd) [id value] graph-cmp opts))]
                      ;; accrue the OP δ — the FULL self-contained commit {:id :value}
-                     ;; (the blob carries :parents), so a peer applies it with no blob
-                     ;; fetch (content-addressing dedups a re-stored blob).
+                     ;; (the value carries :parents), so a peer applies it directly
+                     ;; (set-conj into its graph; content-addressing dedups).
                      (c/with-delta (assoc cd :graph graph'
                                           :state {:heads #{id} :version (inc (:version (:state cd)))}
                                           :dirty true)
@@ -147,8 +142,7 @@
                   (let [merged    (await (d/set-union (:graph cd) (:graph remote) graph-cmp opts))
                         all-heads (vec (set/union (:heads (:state cd)) (:heads (:state remote))))
                         {:keys [id value]} (core/make-commit author all-heads correcting-transactions)
-                        graph'    (await (d/set-conj merged [id all-heads] graph-cmp opts))]
-                    (await (persist-commits! (:kv-store cd) {id value} opts))
+                        graph'    (await (d/set-conj merged [id value] graph-cmp opts))]
                     ;; the δ carries BOTH the merge commit AND the remote's commits we
                     ;; just unioned in (so a peer that has neither converges from the δ
                     ;; alone); the remote's δ — if any — is folded in too.
@@ -190,10 +184,10 @@
 
 (defn apply-delta
   "OP-path: integrate a peer's δ (a set of self-contained commits `{:id :value}`,
-   the blob carrying `:parents`) into this CDVCS — persist each blob (content-
-   addressed ⇒ idempotent), set-conj `[id parents]` into the graph, then recompute
-   the frontier via `remove-ancestors` (≡ the STATE-path `-join`, but O(δ) not
-   O(graph)). Returns a δ-FREE record (remote ops do not re-propagate). (async+sync)"
+   the value carrying `:parents`) into this CDVCS — set-conj `[id value]` into the
+   graph (content-addressed ⇒ idempotent), then recompute the frontier via
+   `remove-ancestors` (≡ the STATE-path `-join`, but O(δ) not O(graph)). Returns a
+   δ-FREE record (remote ops do not re-propagate). (async+sync)"
   [cd delta]
   (let [opts (:opts cd)]
     (async+sync (:sync? opts)
@@ -201,13 +195,11 @@
                  (let [entries (vec delta)]
                    (if (empty? entries)
                      (c/clear-delta cd)
-                     (let [_      (await (persist-commits! (:kv-store cd)
-                                                           (into {} (map (juxt :id :value)) entries) opts))
-                           graph' (loop [es (seq entries) g (:graph cd)]
+                     (let [graph' (loop [es (seq entries) g (:graph cd)]
                                     (if es
                                       (let [{:keys [id value]} (first es)]
                                         (recur (next es)
-                                               (await (d/set-conj g [id (vec (:parents value))] graph-cmp opts))))
+                                               (await (d/set-conj g [id value] graph-cmp opts))))
                                       g))]
                        (if (= graph' (:graph cd))
                          (c/clear-delta cd)                      ; nothing new — idempotent
@@ -235,27 +227,22 @@
   (let [opts (:opts cd)]
     (async+sync (:sync? opts)
                 (async
-                 (into {} (map (fn [e] [(first e) (second e)]))
+                 (into {} (map (fn [e] [(first e) (:parents (second e))]))
                        (await (d/set->clj (:graph cd) opts)))))))
 
 (defn full-delta
   "The ENTIRE commit set as a δ — a set of self-contained `{:id :value}` commits
-   (each blob carries `:parents`). The SERIALIZABLE full-state projection (plain
-   data) for a connect handshake / catch-up: pass as signal-sync's `state-fn` so a
-   joiner reconstructs the whole lineage via `-apply-delta`, instead of shipping the
-   non-serializable CDVCS record. (async+sync) (sync mode only when used as a
-   handshake state-fn — the handshake hashes the result synchronously.)"
+   (each value carries `:parents`). Since the values are INLINED in the graph
+   entries, this is a plain drain (no blob reads). The SERIALIZABLE full-state
+   projection (plain data) for a connect handshake / catch-up: pass as signal-sync's
+   `state-fn` so a joiner reconstructs the whole lineage via `-apply-delta`, instead
+   of shipping the non-serializable CDVCS record. (async+sync)"
   [cd]
   (let [opts (:opts cd)]
     (async+sync (:sync? opts)
                 (async
-                 (let [ids (map first (await (d/set->clj (:graph cd) opts)))]
-                   (loop [is (seq ids) acc #{}]
-                     (if is
-                       (let [id (first is)
-                             v  (await (d/read-commit (:kv-store cd) id opts))]
-                         (recur (next is) (conj acc {:id id :value v})))
-                       acc)))))))
+                 (into #{} (map (fn [e] {:id (first e) :value (second e)}))
+                       (await (d/set->clj (:graph cd) opts)))))))
 
 (defn history
   "Linear commit history (ids) of the single head — DFS over the graph PSS. Throws on
@@ -270,30 +257,26 @@
     (gs/commit-history (parents-of (:graph cd) (:storage cd) (:opts cd)) (first heads) (:opts cd))))
 
 (defn read-commit
-  "Read a commit blob by its id. (async+sync)"
+  "Read a commit value by its id — slices the inlined graph entry (nil if absent).
+   (async+sync)"
   [cd id]
-  (d/read-commit (:kv-store cd) id (:opts cd)))
+  (let [opts (:opts cd)]
+    (async+sync (:sync? opts)
+                (async
+                 (let [es (await (d/slice->clj (:graph cd) [id] [id] opts))]
+                   (when (seq es) (second (first es))))))))
 
 (defn ship!
-  "Copy to `dst-store` every graph PSS node AND commit blob it is MISSING (content-
-   addressed ⇒ incremental + idempotent). The store-to-store transport that lets a
-   cross-store peer restore + `-join`. Returns the count copied. (async+sync)"
+  "Copy to `dst-store` every graph PSS node it is MISSING (content-addressed ⇒
+   incremental + idempotent). The commit values ride INLINE in those nodes, so this
+   single node-copy makes every commit readable on `dst-store` after a restore +
+   `-join` (no separate blob layer). Returns the count copied. (async+sync)"
   [cd dst-store]
   (let [opts (:opts cd) src (:kv-store cd) storage (:storage cd)]
     (async+sync (:sync? opts)
                 (async
-                 (let [graph-root (await (d/store-set! (:graph cd) storage opts))
-                       n1 (await (d/ship! src dst-store graph-root opts))
-                       ids (map first (await (d/set->clj (:graph cd) opts)))
-                       n2 (loop [is (seq ids) n 0]
-                            (if is
-                              (let [id (first is)]
-                                (if (some? (await (kb/k-get dst-store id opts)))
-                                  (recur (next is) n)
-                                  (do (await (kb/k-assoc dst-store id (await (kb/k-get src id opts)) opts))
-                                      (recur (next is) (inc n)))))
-                              n))]
-                   (+ n1 n2))))))
+                 (let [graph-root (await (d/store-set! (:graph cd) storage opts))]
+                   (await (d/ship! src dst-store graph-root opts)))))))
 
 ;; ============================================================
 ;; Record
@@ -388,25 +371,21 @@
     (async+sync (:sync? opts)
                 (async
                  (await (flush! this))
-                 ;; reachable = the graph PSS nodes (from its root + each retained
-                 ;; snapshot's graph root) ∪ the live commit blobs (ids drained from
-                 ;; the graph) ∪ retained snapshots' ids ∪ the snapshot blobs ∪ the
-                 ;; pointer cells. The cutoff rides in `gc-opts`.
-                 (let [live-ids   (map first (await (d/set->clj graph opts)))
-                       snap-addrs (mapv #(parse-uuid (str %)) snapshot-ids)
-                       retained   (loop [as (seq snap-addrs) roots [] ids #{}]
+                 ;; reachable = the graph PSS nodes (walked from the live root + each
+                 ;; retained snapshot's graph root — the commit values ride INSIDE
+                 ;; those nodes, no separate blobs) ∪ the snapshot blobs ∪ the pointer
+                 ;; cells. The cutoff rides in `gc-opts`.
+                 (let [snap-addrs (mapv #(parse-uuid (str %)) snapshot-ids)
+                       snap-roots (loop [as (seq snap-addrs) roots []]
                                     (if as
-                                      (let [snap (await (d/read-commit kv-store (first as) opts))
-                                            sg   (d/restore-set graph-cmp (:graph snap) storage opts)
-                                            sids (map first (await (d/set->clj sg opts)))]
-                                        (recur (next as) (conj roots (:graph snap)) (into ids sids)))
-                                      {:roots roots :ids ids}))
+                                      (let [snap (await (d/read-commit kv-store (first as) opts))]
+                                        (recur (next as) (conj roots (:graph snap))))
+                                      roots))
                        graph-root (await (d/store-set! graph storage opts))]
-                   (await (d/gc! kv-store (cons graph-root (:roots retained)) (graph-config config)
+                   (await (d/gc! kv-store (cons graph-root snap-roots) (graph-config config)
                                  (clojure.core/merge gc-opts opts
                                                      {:spare-keys [(gk config) (gfk config) (sk config)]
-                                                      :retain-keys (vec (into (set live-ids)
-                                                                              (concat (:ids retained) snap-addrs)))}))))))))
+                                                      :retain-keys (vec snap-addrs)}))))))))
 
 (defn flush!
   "Persist the graph PSS (convergent roots write) + the {:heads :version} cache cell.
@@ -454,9 +433,8 @@
                     (if st
                       (->CDVCS id kv-store store-config storage graph st false cell-config opts)
                       (let [{bid :id value :value} (core/new-base author)
-                            graph' (await (d/set-conj graph [bid []] graph-cmp opts))
+                            graph' (await (d/set-conj graph [bid value] graph-cmp opts))
                             state  {:heads #{bid} :version 1}]
-                        (await (persist-commits! kv-store {bid value} opts))
                         (await (save-graph! kv-store graph' storage cell-config opts))
                         (await (save-state! kv-store state cell-config opts))
                         (->CDVCS id kv-store store-config storage graph' state false cell-config opts)))))))))

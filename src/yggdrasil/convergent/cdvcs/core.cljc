@@ -34,10 +34,16 @@
     {:id (commit-id cval) :value cval}))
 
 (defn new-base
-  "The base commit (no transactions, no parents). Its id is author/ts-independent,
-   so ALL fresh CDVCS share ONE base ⇒ a common ancestor ⇒ always joinable."
-  [author]
-  (make-commit author [] []))
+  "The base commit (no transactions, no parents) — a CANONICAL shared sentinel:
+   author/ts-independent in BOTH id AND value (fixed `:ts 0`, `:author nil`), so ALL
+   fresh CDVCS share ONE byte-identical base ⇒ a common ancestor ⇒ always joinable.
+   The value-determinism matters once commit values are inlined in the graph PSS:
+   identical base value ⇒ identical leaf ⇒ identical content-addressed root across
+   peers (a per-author/ts base would diverge the root). `author` is ignored — the
+   base is unattributed by design (its id never depended on it)."
+  [_author]
+  (let [cval {:transactions [] :parents [] :crdt :cdvcs :version 1 :ts 0 :author nil}]
+    {:id (commit-id cval) :value cval}))
 
 (defn new-cdvcs
   "A fresh CDVCS with a single empty base commit. Returns {:state :commits}."

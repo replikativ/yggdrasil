@@ -48,10 +48,25 @@
     (k/get store key nil opts)
     (chan->cps (k/get store key nil opts))))
 
-(defn k-assoc [store key val opts]
-  (if (:sync? opts)
-    (k/assoc store key val opts)
-    (chan->cps (k/assoc store key val opts))))
+(def immutable-meta
+  "The metadata map marking a content-addressed, WRITE-ONCE value (a PSS node, a
+   commit, an addressable snapshot). Pass as `k-assoc`'s `meta` arg at such call
+   sites: a sync peer that already holds the key can then skip re-storing it (no
+   write-hook echo). Mutable cells (branch heads / roots pointers) stay UNMARKED —
+   they ride the convergent δ path, not the node push."
+  {:immutable? true})
+
+(defn k-assoc
+  "Write `val` under `key`. The 5-arity threads konserve's per-write metadata channel:
+   a `meta` MAP (e.g. `{:immutable? true}` for content-addressed write-once values) is
+   merged into the value's stored metadata + forwarded on the write-hook, so a sync
+   layer can skip re-storing an immutable value it already has. `nil` meta ≡ the
+   4-arity (konserve's own 5-arity collapses to the plain build)."
+  ([store key val opts] (k-assoc store key val nil opts))
+  ([store key val meta opts]
+   (if (:sync? opts)
+     (k/assoc store key val meta opts)
+     (chan->cps (k/assoc store key val meta opts)))))
 
 (defn k-dissoc [store key opts]
   (if (:sync? opts)

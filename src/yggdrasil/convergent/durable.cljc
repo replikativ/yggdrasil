@@ -109,11 +109,15 @@
 ;; ============================================================
 
 (defn empty-set
-  "An empty PSS sorted-set backed by `storage` (pure — no storage IO)."
+  "An empty PSS sorted-set backed by `storage` (pure — no storage IO). Threads the storage
+   settings' boundary so a FRESH set splits MST-history-independently when configured (PSS
+   only auto-derives the boundary on RESTORE, from the root node — a new set has no root)."
   [storage comparator]
-  (pss/sorted-set* {:comparator comparator
-                    :storage storage
-                    :branching-factor branching-factor}))
+  (let [boundary (store/settings-boundary (:settings storage))]
+    (pss/sorted-set* (cond-> {:comparator comparator
+                              :storage storage
+                              :branching-factor branching-factor}
+                       boundary (assoc :boundary boundary)))))
 
 (defn store-set!
   "Persist `s` to its storage and return its root address (async+sync — PSS
@@ -264,7 +268,8 @@
    (async+sync (:sync? opts)
                (async
                 (let [addr (hasch/uuid commit)]
-                  (await (kb/k-assoc kv-store addr commit opts))
+                  ;; content-addressed snapshot handle → write-once → immutable.
+                  (await (kb/k-assoc kv-store addr commit kb/immutable-meta opts))
                   addr)))))
 
 (defn read-commit
