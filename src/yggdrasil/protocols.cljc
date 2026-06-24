@@ -310,12 +310,16 @@
 ;; ============================================================
 
 (defn system-sync?
-  "Whether `sys` runs in SYNCHRONOUS mode (JVM blocking values) vs async (cljs
-   channels/promises). The ONE supported way to ask — consumers MUST NOT read
-   `(:sync? (:opts sys))` directly; this isolates them from where the runtime flag
-   lives (domain config vs runtime opts were split — task #145). Absent ⇒ async (false)."
+  "Whether `sys` runs in SYNCHRONOUS mode (JVM blocking values) vs async (cljs /
+   konserve-async, returning CPS/channels). The ONE supported way to ask — consumers
+   MUST NOT read `(:sync? (:opts sys))` directly; this isolates them from where the
+   runtime flag lives (domain config vs runtime opts were split — task #145).
+
+   Default: SYNC. A JVM in-mem / datahike / git system carries no `:opts` (or
+   `:sync? true`); only an explicitly async-opened system sets `:sync? false`. So a
+   system is sync UNLESS it opted out — matching the convention spindel dispatches on."
   [sys]
-  (boolean (:sync? (:opts sys))))
+  (not (false? (:sync? (:opts sys)))))
 
 (defn system-async?
   "Complement of `system-sync?`."
