@@ -26,9 +26,10 @@
    spindel signal-atom or the registry conn — which swaps this value.
 
    Implements `PConvergent` (-join) + `Overlayable`. **Fully cross-platform**: the
-   record carries its sync-mode (`opts`), so EVERY content-touching op — the
-   functional API AND the protocol methods (-join/snapshot-id/as-of/gc-sweep!) —
-   dispatches through `async+sync` (sync on JVM, async/CPS on cljs)."
+   record does NOT carry an execution mode — each content-touching op takes an
+   OPTIONAL trailing `opts` ({:sync?}, default `c/default-opts`: sync on JVM,
+   async/CPS on cljs). Fixed-arity protocol methods (snapshot-id/gc-roots) use the
+   platform default."
   (:refer-clojure :exclude [conj disj contains?])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
@@ -55,8 +56,7 @@
             adds        ; immutable PSS set of [element tag]
             removals    ; immutable PSS set of [element tag]
             dirty       ; boolean — content changed since last flush
-            config      ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
-            opts]       ; RUNTIME: {:sync?} — the record's execution mode
+            config]     ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
 
   p/SystemIdentity
   (system-id [_] id)
@@ -72,10 +72,10 @@
   ;; addressable snapshot = a content-addressed COMMIT {:adds :removals} over the
   ;; two halves' roots (shared two-half machinery); `as-of` projects the FROZEN
   ;; live elements (add-wins: adds − removals, by first).
-  (snapshot-id [this] (d/two-half-snapshot-id this opts))
+  (snapshot-id [this] (d/two-half-snapshot-id this c/default-opts))
   (parent-ids [_] #{})
-  (as-of [this snap-id] (p/as-of this snap-id nil))
-  (as-of [this snap-id _opts]
+  (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
+  (as-of [this snap-id opts]
     (async+sync (:sync? opts)
                 (async
                  (let [[a r] (await (d/two-half-restore-halves this snap-id opts))]
@@ -102,21 +102,23 @@
   ;; "commit" = make current state durable (flush); identity is content-addressed.
   (commit! [this] (flush! this))
   (commit! [this _message] (flush! this))
-  (commit! [this _message _opts] (flush! this))
+  (commit! [this _message opts] (flush! this opts))
 
   c/PConvergent
   ;; PURE same-store join: union both grow-only halves with the peer (shared). (async+sync)
-  (-join [this other] (d/two-half-join this other opts))
+  (-join [this other] (c/-join this other c/default-opts))
+  (-join [this other opts] (d/two-half-join this other opts))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
   (-apply-delta [this delta] (apply-delta this delta))
+  (-apply-delta [this delta opts] (apply-delta this delta opts))
 
   p/GarbageCollectable
   (gc-roots [this]
-    (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids gc-opts opts))
+    (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
+  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids (merge c/default-opts gc-opts)))
 
   p/Overlayable
   ;; :frozen → carry BOTH halves (immutable PSS values; isolated by value).
@@ -133,10 +135,12 @@
 ;; ============================================================
 ;; Value ops — each returns a NEW OR-Set value (value-semantic)
 ;; ============================================================
+;; Each op takes an OPTIONAL trailing `opts` ({:sync?}); omit it for the
+;; platform default (`c/default-opts`).
 
 (defn conj
   "Add `elem` with a fresh tag (from `tag-fn`). (async+sync) Returns a NEW o."
-  ([o elem] (conj o elem (:opts o)))
+  ([o elem] (conj o elem c/default-opts))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
@@ -156,7 +160,7 @@
   "Observed-remove `elem`: tombstone exactly the add-tags currently observed for
    it. A concurrent (unobserved) add survives — add-wins. (async+sync) Returns a
    NEW o."
-  ([o elem] (disj o elem (:opts o)))
+  ([o elem] (disj o elem c/default-opts))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async
@@ -172,27 +176,27 @@
   "Consume a peer's OR-Set δ ({:adds #{[e tag]..} :removals #{[e tag]..}}) by
    unioning each half of [elem tag] pairs into the local halves — the OP-path
    apply (O(δ); cf. -join the STATE-path). Returns a NEW o. (async+sync)"
-  [o delta]
-  (let [opts (:opts o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [adds (loop [a (:adds o) ps (seq (:adds delta))]
-                              (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
-                       rems (loop [r (:removals o) ps (seq (:removals delta))]
-                              (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
-                   ;; clear δ: a remote-integrated value re-propagates nothing.
-                   (c/clear-delta (assoc o :adds adds :removals rems :dirty true)))))))
+  ([o delta] (apply-delta o delta c/default-opts))
+  ([o delta opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [adds (loop [a (:adds o) ps (seq (:adds delta))]
+                             (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
+                      rems (loop [r (:removals o) ps (seq (:removals delta))]
+                             (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
+                  ;; clear δ: a remote-integrated value re-propagates nothing.
+                  (c/clear-delta (assoc o :adds adds :removals rems :dirty true)))))))
 
 (defn elements
   "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"
-  ([o] (elements o (:opts o)))
+  ([o] (elements o c/default-opts))
   ([o opts]
    (async+sync (:sync? opts)
                (async (into #{} (map first) (await (live-pairs o opts)))))))
 
 (defn contains?
   "Whether `elem` is live. (async+sync)"
-  ([o elem] (contains? o elem (:opts o)))
+  ([o elem] (contains? o elem c/default-opts))
   ([o elem opts]
    (async+sync (:sync? opts)
                (async (clojure.core/contains? (await (elements o opts)) elem)))))
@@ -203,18 +207,19 @@
 
 (defn flush!
   "Persist both halves + the :crdt/roots cell + freed; clear `dirty`. (async+sync)"
-  ([o] (d/two-half-flush! o (:opts o)))
+  ([o] (d/two-half-flush! o c/default-opts))
   ([o opts] (d/two-half-flush! o opts)))
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's nodes into this store and union both halves.
    Returns a NEW o. (async+sync)"
-  [o other] (d/two-half-merge-peer! o other (:opts o)))
+  ([o other] (merge-peer! o other c/default-opts))
+  ([o other opts] (d/two-half-merge-peer! o other opts)))
 
 (defn gc!
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). Returns the
    set of deleted node keys."
-  ([o] (p/gc-sweep! o nil nil))
+  ([o] (p/gc-sweep! o nil c/default-opts))
   ([o opts] (p/gc-sweep! o nil opts)))
 
 ;; ============================================================
@@ -230,13 +235,15 @@
             true OR-Set; pass a content-hash fn for idempotent add) — NOT serializable.
             Or a registered ID (keyword, `fn-registry/register-fn!`) → the custom tagger
             survives a round-trip (stored as `:tag-fn-id` in config; resolved on read).
-   Restores both halves from the store's :crdt/roots cell when present."
+   Restores both halves from the store's :crdt/roots cell when present. The runtime
+   mode is a CONSTRUCTION-time choice for opening the store; it is NOT stamped on the
+   record — each op picks its own `:sync?` (default `c/default-opts`)."
   ([id] (orset id {} {:sync? true}))
   ([id config] (orset id config {:sync? true}))
   ([id {:keys [comparator tag-fn store-config kv-store roots-key freed-key]
         :or {comparator compare}}
     {:keys [sync?] :or {sync? true}}]
-   (let [opts      {:sync? sync?}
+   (let [open-opts {:sync? sync?}
          tag-fn-id (when (keyword? tag-fn) tag-fn)             ; a registered id → serializable
          tagger    (cond (keyword? tag-fn) (fr/resolve-fn tag-fn)
                          (fn? tag-fn)      tag-fn
@@ -247,9 +254,9 @@
                         (await (d/two-half-open store-config
                                                 {:comparator comparator :kv-store kv-store
                                                  :roots-key roots-key :freed-key freed-key}
-                                                opts))]
+                                                open-opts))]
                     (->ORSet id kv-store store-config storage comparator tagger adds removals false
-                             (cond-> config tag-fn-id (assoc :tag-fn-id tag-fn-id)) opts)))))))
+                             (cond-> config tag-fn-id (assoc :tag-fn-id tag-fn-id)))))))))
 
 ;; Register the OR-Set with the system value codec (JVM). Both [element tag] halves
 ;; ride as content addresses. The tagger is recovered from `:tag-fn-id` (a registered
@@ -258,14 +265,14 @@
 #?(:clj
    (yf/register-system!
     :orset ORSet
-    (fn [{:keys [id store-config storage adds removals dirty config opts]}]
+    (fn [{:keys [id store-config storage adds removals dirty config]}]
       {:id id :store-config store-config
-       :adds     (str (d/store-set! adds storage opts))
-       :removals (str (d/store-set! removals storage opts))
+       :adds     (str (d/store-set! adds storage c/default-opts))
+       :removals (str (d/store-set! removals storage c/default-opts))
        :dirty dirty :config config})
     (fn [blob storage opts]
       (->ORSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
                (or (fr/resolve-fn (:tag-fn-id (:config blob))) (fn [_] (random-uuid)))
                (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
                (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
-               (or (:dirty blob) false) (:config blob) opts))))
+               (or (:dirty blob) false) (:config blob)))))

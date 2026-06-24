@@ -68,11 +68,11 @@
    CRDT op returns a NEW system, so the overlay (a conn over `:local-writes`) must
    adopt it."
   [ov f]
-  (let [parent (:parent ov)]
-    (async+sync (:sync? (:opts parent))
-                (async
-                 (reset! (:local-writes ov) (await (f @(:local-writes ov))))
-                 ov))))
+  ;; the parent no longer carries a runtime mode → platform default.
+  (async+sync (:sync? c/default-opts)
+              (async
+               (reset! (:local-writes ov) (await (f @(:local-writes ov))))
+               ov)))
 
 (defn convergent-overlay
   "Build an Overlay over a convergent `parent`. `local-writes-system` is the
@@ -96,7 +96,7 @@
    (async+sync — the `:following` join is async on cljs.)"
   [ov]
   (let [parent (:parent ov)]
-    (async+sync (:sync? (:opts parent))
+    (async+sync (:sync? c/default-opts)
                 (async
                  (if (= :following (:mode ov))
                    (await (c/-join parent @(:local-writes ov)))
@@ -119,22 +119,22 @@
   ;; :following/:gated — re-join the parent's CURRENT state into the overlay so it
   ;; picks up the parent's advances (thin; no gated sequence-lock yet).
   (advance!
-    ([ov] (p/advance! ov nil))
-    ([ov _opts]
+    ([ov] (p/advance! ov c/default-opts))
+    ([ov opts]
      (let [parent (:parent ov)]
-       (async+sync (:sync? (:opts parent))
+       (async+sync (:sync? opts)
                    (async
-                    (reset! (:local-writes ov) (await (c/-join @(:local-writes ov) parent)))
+                    (reset! (:local-writes ov) (await (c/-join @(:local-writes ov) parent opts)))
                     ov)))))
 
   ;; push the overlay's isolated state back into the parent (convergent join).
   ;; Returns the merged parent (value-semantic).
   (merge-down!
-    ([ov] (p/merge-down! ov nil))
-    ([ov _opts]
+    ([ov] (p/merge-down! ov c/default-opts))
+    ([ov opts]
      (let [parent (:parent ov)]
-       (async+sync (:sync? (:opts parent))
-                   (async (await (c/-join parent @(:local-writes ov))))))))
+       (async+sync (:sync? opts)
+                   (async (await (c/-join parent @(:local-writes ov) opts)))))))
 
   ;; abandon the overlay — its isolated nodes become orphans reclaimed by GC.
   (discard!

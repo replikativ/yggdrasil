@@ -29,34 +29,37 @@
 ;; so a browser peer can `-join` two composite workspaces too.
 (extend-type #?(:clj yggdrasil.composite.CompositeSystem :cljs comp/CompositeSystem)
   c/PConvergent
-  (-join [this other]
-    (let [others (:systems other)
-          joined (reduce
-                  (fn [m [id sys]]
-                    (let [o (get others id)]
-                      (assoc m id
-                             (cond
-                               (nil? o) sys                       ; system only on `this`
-                               (c/convergent? sys) (c/-join sys o) ; CRDT: symmetric 2-way join
+  (-join
+    ([this other] (c/-join this other c/default-opts))
+    ([this other opts]
+     (let [others (:systems other)
+           joined (reduce
+                   (fn [m [id sys]]
+                     (let [o (get others id)]
+                       (assoc m id
+                              (cond
+                                (nil? o) sys                          ; system only on `this`
+                                (c/convergent? sys) (c/-join sys o opts) ; CRDT: symmetric 2-way join
                                ;; versioned (datahike/git): 3-way merge — merge `other`'s
                                ;; branch into `this`'s on the shared store. This IS the
                                ;; per-system logic merge-to-parent! reimplements; conflicts
                                ;; are surfaced via the composite's `conflicts` (the
                                ;; merge-review seam), not auto-resolved here. Requires a
                                ;; resolvable common ancestor (shared store / forked peer).
-                               (satisfies? p/Mergeable sys)
-                               (-> sys
-                                   (p/checkout (p/current-branch sys))
-                                   (p/merge! (p/current-branch o)))
-                               :else sys))))
-                  {} (:systems this))]
-      ;; IDEMPOTENCE: when every sub-join changed nothing (each returns the SAME
-      ;; sub), the composite is unchanged → return `this` identical, so a
-      ;; composite-valued signal doesn't re-fire / re-publish on a no-op.
-      (if (= joined (:systems this))
-        this
-        (comp/composite (vec (vals joined))
-                        {:name (:composite-name this)
-                         :branch (:current-branch-name this)}))))
+                                (satisfies? p/Mergeable sys)
+                                (-> sys
+                                    (p/checkout (p/current-branch sys))
+                                    (p/merge! (p/current-branch o) opts))
+                                :else sys))))
+                   {} (:systems this))]
+       ;; IDEMPOTENCE: when every sub-join changed nothing (each returns the SAME
+       ;; sub), the composite is unchanged → return `this` identical, so a
+       ;; composite-valued signal doesn't re-fire / re-publish on a no-op.
+       (if (= joined (:systems this))
+         this
+         (comp/composite (vec (vals joined))
+                         {:name (:composite-name this)
+                          :branch (:current-branch-name this)}
+                         opts)))))
   (-conflict-free? [this]
     (every? c/convergent? (vals (:systems this)))))

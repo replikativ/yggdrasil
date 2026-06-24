@@ -305,23 +305,8 @@
       :mergeable false
       :overlayable false}"))
 
-;; ============================================================
-;; Runtime-mode helpers (supported API; do not peek :opts directly)
-;; ============================================================
-
-(defn system-sync?
-  "Whether `sys` runs in SYNCHRONOUS mode (JVM blocking values) vs async (cljs /
-   konserve-async, returning CPS/channels). The ONE supported way to ask — consumers
-   MUST NOT read `(:sync? (:opts sys))` directly; this isolates them from where the
-   runtime flag lives (domain config vs runtime opts were split — task #145).
-
-   Default: SYNC. A JVM in-mem / datahike / git system carries no `:opts` (or
-   `:sync? true`); only an explicitly async-opened system sets `:sync? false`. So a
-   system is sync UNLESS it opted out — matching the convention spindel dispatches on."
-  [sys]
-  (not (false? (:sync? (:opts sys)))))
-
-(defn system-async?
-  "Complement of `system-sync?`."
-  [sys]
-  (not (system-sync? sys)))
+;; NOTE: the per-system runtime-mode helpers `system-sync?`/`system-async?` were
+;; REMOVED — a system no longer carries an execution mode (`:opts {:sync?}` was
+;; dropped from every convergent record). `:sync?` is now a PER-CALL choice on each
+;; op, defaulting to `yggdrasil.convergent/default-opts`. A caller that needs the
+;; mode passes it explicitly to the op (it always knew the platform).

@@ -6,6 +6,9 @@
         ;; canonical node handlers (org.replikativ.persistent-sorted-set.fressian)
         ;; + MST content-defined boundary, shipped in 0.4.126.
         org.replikativ/persistent-sorted-set {:mvn/version "0.4.126"}
+        ;; PSS 0.4.126's boundary requires `hasch.fast` (added in hasch 0.3.97), but
+        ;; PSS still transitively pins the stale 0.3.96 — pin 0.3.97 explicitly.
+        org.replikativ/hasch {:mvn/version "0.3.97"}
         is.simm/partial-cps {:mvn/version "0.1.58"}
         org.clojure/core.async {:mvn/version "1.6.681"}}
 

@@ -28,7 +28,9 @@
    reuse but correct in an append-only PSS. `keys` / `as-of` are full scans (listing
    everything is inherently O(n)); only the per-key `get`/`dissoc` slice.
 
-   **Fully cross-platform** via `async+sync` (sync on JVM, CPS on cljs)."
+   **Fully cross-platform**: the record does NOT carry an execution mode — each
+   content-touching op takes an OPTIONAL trailing `opts` ({:sync?}, default
+   `c/default-opts`: sync on JVM, CPS on cljs)."
   (:refer-clojure :exclude [assoc dissoc get keys])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
@@ -100,8 +102,7 @@
             adds        ; immutable PSS set of [hk uid k v]
             removals    ; immutable PSS set of [hk uid k v]
             dirty
-            config      ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
-            opts]       ; RUNTIME: {:sync?} — the record's execution mode
+            config]     ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
 
   p/SystemIdentity
   (system-id [_] id)
@@ -111,10 +112,10 @@
 
   p/Snapshotable
   ;; shared two-half snapshot; `as-of` projects the FROZEN map {k value-or-set}.
-  (snapshot-id [this] (d/two-half-snapshot-id this opts))
+  (snapshot-id [this] (d/two-half-snapshot-id this c/default-opts))
   (parent-ids [_] #{})
-  (as-of [this snap-id] (p/as-of this snap-id nil))
-  (as-of [this snap-id _opts]
+  (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
+  (as-of [this snap-id opts]
     (async+sync (:sync? opts)
                 (async
                  (let [[adds* rems*] (await (d/two-half-restore-halves this snap-id opts))
@@ -140,20 +141,22 @@
   p/Committable
   (commit! [this] (flush! this))
   (commit! [this _message] (flush! this))
-  (commit! [this _message _opts] (flush! this))
+  (commit! [this _message opts] (flush! this opts))
 
   c/PConvergent
-  (-join [this other] (d/two-half-join this other opts))
+  (-join [this other] (c/-join this other c/default-opts))
+  (-join [this other opts] (d/two-half-join this other opts))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
   (-apply-delta [this delta] (apply-delta this delta))
+  (-apply-delta [this delta opts] (apply-delta this delta opts))
 
   p/GarbageCollectable
   (gc-roots [this]
-    (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids gc-opts opts))
+    (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
+  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids (merge c/default-opts gc-opts)))
 
   p/Overlayable
   (overlay [this opts]
@@ -167,65 +170,67 @@
 ;; ============================================================
 ;; Value ops — each returns a NEW record (value-semantic)
 ;; ============================================================
+;; Each op takes an OPTIONAL trailing `opts` ({:sync?}); omit it for the
+;; platform default (`c/default-opts`).
 
 (defn assoc
   "Assoc `v` under `k` with a FRESH uid (local op). (async+sync) NEW o."
-  [o k v]
-  (let [opts (:opts o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [entry [(hk k) (str (random-uuid)) k v]
-                       s'    (await (d/set-conj (:adds o) entry (:comparator o) opts))]
-                   (c/with-delta (clojure.core/assoc o :adds s' :dirty true)
-                     half-accrue {:adds #{entry}}))))))
+  ([o k v] (assoc o k v c/default-opts))
+  ([o k v opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [entry [(hk k) (str (random-uuid)) k v]
+                      s'    (await (d/set-conj (:adds o) entry (:comparator o) opts))]
+                  (c/with-delta (clojure.core/assoc o :adds s' :dirty true)
+                    half-accrue {:adds #{entry}}))))))
 
 (defn dissoc
   "Observed-remove `k`: tombstone exactly the entries currently live for it
    (slice-scoped, add-wins). (async+sync) NEW o."
-  [o k]
-  (let [opts (:opts o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [tombstones (await (live-for-key o k opts))
-                       removals'  (loop [r (:removals o) ts (seq tombstones)]
-                                    (if ts
-                                      (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
-                                      r))]
-                   (c/with-delta (clojure.core/assoc o :removals removals' :dirty true)
-                     half-accrue {:removals (set tombstones)}))))))
+  ([o k] (dissoc o k c/default-opts))
+  ([o k opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [tombstones (await (live-for-key o k opts))
+                      removals'  (loop [r (:removals o) ts (seq tombstones)]
+                                   (if ts
+                                     (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
+                                     r))]
+                  (c/with-delta (clojure.core/assoc o :removals removals' :dirty true)
+                    half-accrue {:removals (set tombstones)}))))))
 
 (defn apply-delta
   "Consume a peer's δ ({:adds #{entries} :removals #{entries}}) — union each half
    into the local halves (OP-path; cf. -join the STATE-path). NEW o. (async+sync)"
-  [o delta]
-  (let [opts (:opts o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [adds (loop [a (:adds o) ps (seq (:adds delta))]
-                              (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
-                       rems (loop [r (:removals o) ps (seq (:removals delta))]
-                              (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
-                   (c/clear-delta (clojure.core/assoc o :adds adds :removals rems :dirty true)))))))
+  ([o delta] (apply-delta o delta c/default-opts))
+  ([o delta opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [adds (loop [a (:adds o) ps (seq (:adds delta))]
+                             (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
+                      rems (loop [r (:removals o) ps (seq (:removals delta))]
+                             (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
+                  (c/clear-delta (clojure.core/assoc o :adds adds :removals rems :dirty true)))))))
 
 (defn get
   "The value for `k`: a SET of live values (plain) or the merge-fn FOLD of them
    (merging), or nil. A range SLICE — reads only `k`'s nodes. (async+sync)"
-  [o k]
-  (let [opts (:opts o)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [vs (map #(nth % 3) (await (live-for-key o k opts)))]
-                   (when (seq vs)
-                     (if-let [mfn (:merge-fn o)]
-                       (reduce mfn nil (sort-by hash vs))
-                       (set vs))))))))
+  ([o k] (get o k c/default-opts))
+  ([o k opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [vs (map #(nth % 3) (await (live-for-key o k opts)))]
+                  (when (seq vs)
+                    (if-let [mfn (:merge-fn o)]
+                      (reduce mfn nil (sort-by hash vs))
+                      (set vs))))))))
 
 (defn keys
   "The set of keys with ≥1 live value (full scan — inherently O(n)). (async+sync)"
-  [o]
-  (let [opts (:opts o)]
-    (async+sync (:sync? opts)
-                (async (into #{} (map #(nth % 2)) (await (all-live o opts)))))))
+  ([o] (keys o c/default-opts))
+  ([o opts]
+   (async+sync (:sync? opts)
+               (async (into #{} (map #(nth % 2)) (await (all-live o opts)))))))
 
 ;; ============================================================
 ;; Persistence + cross-store sync
@@ -233,16 +238,17 @@
 
 (defn flush!
   "Persist both halves + :crdt/roots + freed; clear `dirty`. (async+sync)"
-  ([o] (d/two-half-flush! o (:opts o)))
+  ([o] (d/two-half-flush! o c/default-opts))
   ([o opts] (d/two-half-flush! o opts)))
 
 (defn merge-peer!
   "Cross-store -join: ship the peer's nodes into this store and union both halves.
    Returns a NEW o. (async+sync)"
-  [o other] (d/two-half-merge-peer! o other (:opts o)))
+  ([o other] (merge-peer! o other c/default-opts))
+  ([o other opts] (d/two-half-merge-peer! o other opts)))
 
 (defn gc!
-  ([o] (p/gc-sweep! o nil nil))
+  ([o] (p/gc-sweep! o nil c/default-opts))
   ([o opts] (p/gc-sweep! o nil opts)))
 
 ;; ============================================================
@@ -256,7 +262,7 @@
   [id merge-fn {:keys [store-config comparator kv-store roots-key freed-key]
                 :or {comparator compare}}
    {:keys [sync?] :or {sync? true}}]
-  (let [opts        {:sync? sync?}
+  (let [open-opts   {:sync? sync?}
         merge-fn-id (when (keyword? merge-fn) merge-fn)
         mfn         (if (keyword? merge-fn) (fr/resolve-fn merge-fn) merge-fn)]
     (async+sync sync?
@@ -265,10 +271,10 @@
                        (await (d/two-half-open store-config
                                                {:comparator comparator :kv-store kv-store
                                                 :roots-key roots-key :freed-key freed-key}
-                                               opts))
+                                               open-opts))
                        config (cond-> config merge-fn-id (clojure.core/assoc :merge-fn-id merge-fn-id))]
                    (->ORMap id kv-store store-config storage comparator (wrap mfn)
-                            adds removals false config opts))))))
+                            adds removals false config))))))
 
 (defn ormap
   "Open (or create) a durable OR-Map (multi-value: `get` returns the live value-set)."
@@ -291,16 +297,16 @@
 ;; → multi-value) and `:merging-ormap` (id → the resolved fold). The entries
 ;; (adds/removals) are preserved regardless; only the read-time fold is recovered.
 #?(:clj
-   (let [project     (fn [{:keys [id store-config storage adds removals dirty config opts]}]
+   (let [project     (fn [{:keys [id store-config storage adds removals dirty config]}]
                        {:id id :store-config store-config
-                        :adds     (str (d/store-set! adds storage opts))
-                        :removals (str (d/store-set! removals storage opts))
+                        :adds     (str (d/store-set! adds storage c/default-opts))
+                        :removals (str (d/store-set! removals storage c/default-opts))
                         :dirty dirty :config config})
          reconstruct (fn [blob storage opts]
                        (->ORMap (:id blob) (:kv-store storage) (:store-config blob) storage compare
                                 (wrap (fr/resolve-fn (:merge-fn-id (:config blob))))   ; nil id → plain
                                 (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
                                 (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
-                                (or (:dirty blob) false) (:config blob) opts))]
+                                (or (:dirty blob) false) (:config blob)))]
      (yf/register-system! :ormap ORMap project reconstruct)
      (yf/register-system! :merging-ormap ORMap project reconstruct)))

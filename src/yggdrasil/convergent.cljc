@@ -22,17 +22,28 @@
    and the general distributed model merges peers with `-join`, not to a parent."
   (:refer-clojure :exclude []))
 
+(def default-opts
+  "Default RUNTIME opts for a convergent op when the caller omits them. A system no
+   longer carries its execution mode — `:sync?` is a per-call choice (so a JVM caller
+   can run one op blocking and another async). When omitted it defaults SYNC on the JVM
+   (blocking values) and ASYNC on cljs (no blocking primitive against IndexedDB). Pass
+   an explicit `{:sync? …}` to override."
+  #?(:clj {:sync? true} :cljs {:sync? false}))
+
 (defprotocol PConvergent
   "A system whose value forms a join-semilattice — a CRDT."
-  (-join [this other]
+  (-join [this other] [this other opts]
     "Least-upper-bound (merge) of this replica with peer `other`. Commutative,
-     associative, idempotent. No ancestor, no conflicts, no parent/child.")
+     associative, idempotent. No ancestor, no conflicts, no parent/child. `opts`
+     ({:sync?}, default `default-opts`) selects the sync/async return; the 2-arity
+     uses the default.")
   (-conflict-free? [this]
     "True — marks this system as auto-converging (capability dispatch: the
      merge path skips ancestor lookup and never surfaces conflicts)."))
 
 (defn join
-  "Fold `-join` over peer replicas → the converged value. Order-independent."
+  "Fold `-join` over peer replicas → the converged value. Order-independent.
+   Uses `default-opts`; for a non-default mode call `-join` with explicit opts."
   [replica & more]
   (reduce -join replica more))
 
@@ -94,7 +105,8 @@
 
 (defprotocol PDeltaApply
   "Consume a peer's δ — the OP-path counterpart to `-join` (the STATE-path)."
-  (-apply-delta [this delta]
+  (-apply-delta [this delta] [this delta opts]
     "Integrate δ (a value produced by `delta-of` on a peer replica) into this
      replica's state — O(δ), no full -join, no diffing. Returns the new replica
-     WITHOUT a local δ (remote-integrated ops do not re-propagate)."))
+     WITHOUT a local δ (remote-integrated ops do not re-propagate). `opts` ({:sync?},
+     default `default-opts`) selects the sync/async return; the 2-arity uses the default."))

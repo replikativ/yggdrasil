@@ -25,8 +25,9 @@
    shipping the root keyword-last, the same gate gives network-atomic
    propagation.
 
-   **Cross-platform (`async+sync`).** The composite carries its sync-mode
-   (`opts`) and the history index is an in-memory `{snap-id → entry}` map, so
+   **Cross-platform (`async+sync`).** The composite does NOT carry a sync-mode —
+   each op takes an OPTIONAL trailing `opts` ({:sync?}, default `c/default-opts`).
+   The history index is an in-memory `{snap-id → entry}` map, so
    every history *read* (snapshot-meta / ancestors / history / …) is plain sync
    on both platforms. Only the methods that touch sub-systems
    (snapshot-id / as-of / commit! / merge! / gc-*) or persist the index dispatch
@@ -46,6 +47,7 @@
             [yggdrasil.types :as t]
             [yggdrasil.storage :as store]
             [yggdrasil.kbridge :as kb]
+            [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
             #?(:clj [yggdrasil.fressian :as yf])
@@ -211,7 +213,7 @@
    manifest). A per-sub gc! would delete siblings (unreachable from one sub's
    roots), so the composite must sweep as a whole. (async+sync) Returns the
    reclamation report {:deleted <set-of-keys>}."
-  [kv-store storage index-atom systems opts gc-opts]
+  [kv-store storage index-atom systems opts]
   (async+sync (:sync? opts)
               (async
                ;; persist the latest state we mean to keep
@@ -227,7 +229,7 @@
                                  (if ss
                                    (let [s (val (first ss))]
                                      (recur (next ss)
-                                            (into acc (vals (await (d/load-roots (:kv-store s) (:config s) (:opts s)))))))
+                                            (into acc (vals (await (d/load-roots (:kv-store s) (:config s) opts))))))
                                    acc))
                      roots (filterv some? (cons comp-root sub-roots))
                      spare (into #{composite-subs-key}
@@ -237,7 +239,6 @@
                                            {:roots-key composite-root-key
                                             :freed-key composite-freed-key}
                                            (-> opts
-                                               (merge (select-keys gc-opts [:remove-before :grace-period-ms]))
                                                (assoc :spare-keys spare))))]
                  {:deleted deleted}))))
 
@@ -253,14 +254,14 @@
 ;; `mode` is the REQUESTED mode; each sub negotiates its own (a CRDT sub grants
 ;; :following, a datahike/git sub degrades to :frozen) — see each sub-overlay's
 ;; `:mode`. So a composite overlay is honestly mixed-mode.
-(defrecord CompositeOverlay [parent sub-overlays opts mode]
+(defrecord CompositeOverlay [parent sub-overlays mode]
   p/Overlayable
   (base-ref [_] nil)
   (peek-parent [ov] (:parent ov)) (peek-parent [ov _] (:parent ov))
   (overlay-writes [ov] (:sub-overlays ov))
 
-  (advance! [ov] (p/advance! ov nil))
-  (advance! [ov _]
+  (advance! [ov] (p/advance! ov c/default-opts))
+  (advance! [ov opts]
     (async+sync (:sync? opts)
                 (async
                  (loop [ss (seq sub-overlays)]
@@ -270,8 +271,8 @@
   ;; merge each sub-overlay back into the parent's matching sub, keeping the
   ;; parent composite's store/index. (CRDT sub-overlays -join, never fail; the
   ;; staged-with-rollback compose helper matters once VERSIONED subs join in.)
-  (merge-down! [ov] (p/merge-down! ov nil))
-  (merge-down! [_ _]
+  (merge-down! [ov] (p/merge-down! ov c/default-opts))
+  (merge-down! [_ opts]
     (async+sync (:sync? opts)
                 (async
                  (let [merged (loop [ss (seq sub-overlays) acc (:systems parent)]
@@ -281,7 +282,7 @@
                                   acc))]
                    (assoc parent :systems merged)))))
 
-  (discard! [ov] (p/discard! ov nil))
+  (discard! [ov] (p/discard! ov c/default-opts))
   (discard! [_ _]
     (doseq [[_ sub-ov] sub-overlays] (p/discard! sub-ov))
     nil))
@@ -297,7 +298,7 @@
    re-seat it (the sub-overlay is a conn over `:local-writes`). Returns the
    composite-overlay. (async+sync)"
   [composite-overlay sid f]
-  (async+sync (:sync? (:opts composite-overlay))
+  (async+sync (:sync? c/default-opts)
               (async
                (await (ovl/overlay-swap! (get (:sub-overlays composite-overlay) sid) f))
                composite-overlay)))
@@ -313,8 +314,7 @@
             index-atom           ;; atom of {snap-id → entry} (in-memory history)
             kv-store             ;; konserve store (nil for ephemeral)
             store-config         ;; konserve store config (nil for ephemeral)
-            storage              ;; shared content-addressed KonserveStorage (nil ephemeral)
-            opts]                ;; the composite's sync-mode {:sync? bool}
+            storage]             ;; shared content-addressed KonserveStorage (nil ephemeral)
 
   p/SystemIdentity
   (system-id [_] composite-name)
@@ -322,18 +322,19 @@
   (capabilities [_] (intersect-capabilities systems))
 
   p/Snapshotable
-  (snapshot-id [_] (composite-snapshot-id systems opts))
+  (snapshot-id [_] (composite-snapshot-id systems c/default-opts))
 
   (parent-ids [_]
-    (async+sync (:sync? opts)
+    (async+sync (:sync? c/default-opts)
                 (async
-                 (let [snap (await (composite-snapshot-id systems opts))
+                 (let [snap (await (composite-snapshot-id systems c/default-opts))
                        entry (lookup-entry index-atom snap)]
                    (or (:parent-ids entry) #{})))))
 
-  (as-of [this snap-id] (p/as-of this snap-id nil))
-  (as-of [_ snap-id _opts]
-    (async+sync (:sync? opts)
+  (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
+  (as-of [_ snap-id opts]
+    (let [opts (merge c/default-opts opts)]   ; opts may be a DOMAIN map without :sync?
+     (async+sync (:sync? opts)
                 (async
                  (if-let [sub-snaps (resolve-sub-snapshots index-atom snap-id)]
                    (loop [ss (seq systems) acc {}]
@@ -341,9 +342,9 @@
                        (let [[sid sys] (first ss)]
                          (recur (next ss) (assoc acc sid (await (p/as-of sys (get sub-snaps sid))))))
                        acc))
-                   nil))))
+                   nil)))))
 
-  (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id nil))
+  (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id c/default-opts))
   (snapshot-meta [_ snap-id _opts]
     (when-let [entry (lookup-entry index-atom (str snap-id))]
       {:snapshot-id (str snap-id)
@@ -353,7 +354,7 @@
        :sub-snapshots (:sub-snapshots entry)}))
 
   p/Branchable
-  (branches [this] (p/branches this nil))
+  (branches [this] (p/branches this c/default-opts))
   (branches [_ _opts]
     (if (empty? systems)
       #{}
@@ -364,7 +365,7 @@
 
   (branch! [this name]
     (assoc this :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/branch! sys name))) {} systems)))
-  (branch! [this name from] (p/branch! this name from nil))
+  (branch! [this name from] (p/branch! this name from c/default-opts))
   (branch! [this name from _opts]
     ;; `from` may be a composite SNAPSHOT-ID → branch each sub from ITS recorded
     ;; sub-snapshot (freeze+isolate the whole composite at a fixed version); or a
@@ -375,21 +376,22 @@
                           (assoc acc sid (p/branch! sys name (if sub-snaps (get sub-snaps sid) from))))
                         {} systems))))
 
-  (delete-branch! [this name] (p/delete-branch! this name nil))
+  (delete-branch! [this name] (p/delete-branch! this name c/default-opts))
   (delete-branch! [this name _opts]
     (assoc this :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/delete-branch! sys name))) {} systems)))
 
-  (checkout [this name] (p/checkout this name nil))
+  (checkout [this name] (p/checkout this name c/default-opts))
   (checkout [this name _opts]
     (assoc this
            :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/checkout sys name))) {} systems)
            :current-branch-name (keyword name)))
 
   p/Committable
-  (commit! [this] (p/commit! this nil nil))
-  (commit! [this message] (p/commit! this message nil))
-  (commit! [this message _opts]
-    (async+sync (:sync? opts)
+  (commit! [this] (p/commit! this nil c/default-opts))
+  (commit! [this message] (p/commit! this message c/default-opts))
+  (commit! [this message opts]
+    (let [opts (merge c/default-opts opts)]
+     (async+sync (:sync? opts)
                 (async
                  (let [old-snap (await (composite-snapshot-id systems opts))
                        new-systems (loop [ss (seq systems) acc {}]
@@ -413,15 +415,16 @@
                            :message message
                            :sub-snapshots sub-snaps})
                    (await (persist-index! kv-store storage index-atom opts))
-                   (assoc this :systems new-systems)))))
+                   (assoc this :systems new-systems))))))
 
   p/Graphable
-  (history [this] (p/history this {}))
+  (history [this] (p/history this c/default-opts))
   (history [_ hopts]
-    (async+sync (:sync? opts)
+    (let [hopts (merge c/default-opts hopts)]
+     (async+sync (:sync? hopts)
                 (async
                  (let [limit (or (:limit hopts) 100)]
-                   (loop [snap-id (await (composite-snapshot-id systems opts)) result [] visited #{}]
+                   (loop [snap-id (await (composite-snapshot-id systems hopts)) result [] visited #{}]
                      (cond
                        (visited snap-id) result
                        (nil? snap-id) result
@@ -429,9 +432,9 @@
                        :else
                        (let [entry (lookup-entry index-atom snap-id)
                              parents (or (:parent-ids entry) #{})]
-                         (recur (first parents) (conj result snap-id) (conj visited snap-id)))))))))
+                         (recur (first parents) (conj result snap-id) (conj visited snap-id))))))))))
 
-  (ancestors [this snap-id] (p/ancestors this snap-id nil))
+  (ancestors [this snap-id] (p/ancestors this snap-id c/default-opts))
   (ancestors [_ snap-id _opts]
     (loop [queue [(str snap-id)] visited #{}]
       (if (empty? queue)
@@ -443,11 +446,11 @@
                   parents (or (:parent-ids entry) #{})]
               (recur (into rest-q parents) (conj visited current))))))))
 
-  (ancestor? [this a b] (p/ancestor? this a b nil))
+  (ancestor? [this a b] (p/ancestor? this a b c/default-opts))
   (ancestor? [this a b _opts]
     (contains? (set (p/ancestors this b)) (str a)))
 
-  (common-ancestor [this a b] (p/common-ancestor this a b nil))
+  (common-ancestor [this a b] (p/common-ancestor this a b c/default-opts))
   (common-ancestor [this a b _opts]
     (let [ancestors-a (conj (set (p/ancestors this a)) (str a))]
       (loop [queue [(str b)] visited #{}]
@@ -462,9 +465,10 @@
                     parents (vec (or (:parent-ids entry) #{}))]
                 (recur (into rest-q parents) (conj visited current)))))))))
 
-  (commit-graph [this] (p/commit-graph this nil))
-  (commit-graph [_ _opts]
-    (async+sync (:sync? opts)
+  (commit-graph [this] (p/commit-graph this c/default-opts))
+  (commit-graph [_ opts]
+    (let [opts (merge c/default-opts opts)]
+     (async+sync (:sync? opts)
                 (async
                  (let [entries (vals @index-atom)
                        cur (await (composite-snapshot-id systems opts))]
@@ -475,9 +479,9 @@
                                           :meta {:timestamp (:timestamp e) :message (:message e)}}]))
                                  entries)
                     :branches {current-branch-name cur}
-                    :roots (set (keep (fn [e] (when (empty? (or (:parent-ids e) #{})) (:composite-snap-id e))) entries))}))))
+                    :roots (set (keep (fn [e] (when (empty? (or (:parent-ids e) #{})) (:composite-snap-id e))) entries))})))))
 
-  (commit-info [this snap-id] (p/commit-info this snap-id nil))
+  (commit-info [this snap-id] (p/commit-info this snap-id c/default-opts))
   (commit-info [_ snap-id _opts]
     (when-let [entry (lookup-entry index-atom (str snap-id))]
       {:parent-ids (:parent-ids entry)
@@ -486,12 +490,15 @@
        :sub-snapshots (:sub-snapshots entry)}))
 
   p/Mergeable
-  (merge! [this source] (p/merge! this source {}))
+  (merge! [this source] (p/merge! this source c/default-opts))
   (merge! [this source mopts]
     ;; TRANSACTIONAL: merge every sub-system, then commit! (flush each sub durable,
     ;; then write :composite/root LAST). A crash mid-merge leaves the previous
-    ;; committed composite as latest; a reader never sees a half-merge.
-    (async+sync (:sync? opts)
+    ;; committed composite as latest; a reader never sees a half-merge. `mopts` is a
+    ;; DOMAIN merge map (e.g. {:message}) that may omit :sync? — fill the platform
+    ;; default so the mode threads to the sub-merges + commit!.
+    (let [mopts (merge c/default-opts mopts)]
+     (async+sync (:sync? mopts)
                 (async
                  (let [new-systems (loop [ss (seq systems) acc {}]
                                      (if ss
@@ -500,9 +507,9 @@
                                        acc))]
                    (await (p/commit! (assoc this :systems new-systems)
                                      (or (and (map? mopts) (:message mopts)) "merge")
-                                     mopts))))))
+                                     mopts)))))))
 
-  (conflicts [this a b] (p/conflicts this a b nil))
+  (conflicts [this a b] (p/conflicts this a b c/default-opts))
   (conflicts [_ a b copts]
     (into []
           (mapcat (fn [[sid sys]]
@@ -514,7 +521,7 @@
                                         (or copts {}))))))
           systems))
 
-  (diff [this a b] (p/diff this a b nil))
+  (diff [this a b] (p/diff this a b c/default-opts))
   (diff [_ a b dopts]
     (into {}
           (keep (fn [[sid sys]]
@@ -527,7 +534,7 @@
 
   p/GarbageCollectable
   (gc-roots [_]
-    (async+sync (:sync? opts)
+    (async+sync (:sync? c/default-opts)
                 (async
                  (if (empty? systems)
                    #{}
@@ -536,15 +543,17 @@
                        (recur (next ss) (set/union acc (await (p/gc-roots (val (first ss))))))
                        acc))))))
 
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
   (gc-sweep! [_ snapshot-ids gopts]
-    (async+sync (:sync? opts)
+    ;; gopts = GC window, may omit :sync? — fill the platform default for OUR dispatch +
+    ;; the unified path; forward the ORIGINAL gopts to sub gc-sweep!s (each self-normalizes).
+    (async+sync (:sync? (merge c/default-opts gopts))
                 (async
                  (if (and kv-store (seq systems)
                           (every? (fn [[_ sys]] (colocated? kv-store sys)) systems))
                    ;; SHARED store → ONE unified mark-and-sweep over the union of roots
                    ;; (a per-sub sweep would delete siblings/index nodes).
-                   (await (unified-gc! kv-store storage index-atom systems opts gopts))
+                   (await (unified-gc! kv-store storage index-atom systems (merge c/default-opts gopts)))
                    ;; SEPARATE stores → each sub owns its store, safe to fan out.
                    (loop [ss (seq systems) acc {}]
                      (if ss
@@ -560,7 +569,7 @@
   (overlay [this o]
     (->CompositeOverlay this
                         (reduce-kv (fn [acc sid sys] (assoc acc sid (p/overlay sys o))) {} systems)
-                        opts (or (:mode o) :frozen))))
+                        (or (:mode o) :frozen))))
 
 ;; ============================================================
 ;; Lifecycle
@@ -569,13 +578,13 @@
 (defn flush!
   "Persist the composite history index (rebuild PSS + write :composite/root last).
    No-op when ephemeral. (async+sync)"
-  ([composite] (flush! composite (:opts composite)))
+  ([composite] (flush! composite c/default-opts))
   ([composite opts]
    (persist-index! (:kv-store composite) (:storage composite) (:index-atom composite) opts)))
 
 (defn close!
   "Flush and close the composite's store. Safe on ephemeral composites. (async+sync)"
-  ([composite] (close! composite (:opts composite)))
+  ([composite] (close! composite c/default-opts))
   ([composite opts]
    (async+sync (:sync? opts)
                (async
@@ -637,7 +646,7 @@
                        composite-name (or name (str prefix (str/join sep (sort (keys sys-map)))))
                        index-atom (atom (await (load-index kv-store storage opts)))
                        sys (->CompositeSystem sys-map branch composite-name
-                                              index-atom kv-store store-config storage opts)
+                                              index-atom kv-store store-config storage)
                        snap (await (composite-snapshot-id sys-map opts))]
                    ;; manifest of co-located subs (for the konserve-sync composite walker)
                    (when kv-store
@@ -712,7 +721,7 @@
    The value-semantic way to evolve a sub inside a composite — a `get-subsystem`
    handle is an immutable value, so mutating it in place is a no-op."
   [composite id f]
-  (async+sync (:sync? (:opts composite))
+  (async+sync (:sync? c/default-opts)
               (async
                (assoc-in composite [:systems id]
                          (await (f (get (:systems composite) id)))))))
@@ -732,4 +741,4 @@
     (fn [blob storage opts]
       (->CompositeSystem (:systems blob) (:current-branch-name blob) (:composite-name blob)
                          (atom {}) (when storage (:kv-store storage)) (:store-config blob)
-                         storage opts))))
+                         storage))))

@@ -71,10 +71,13 @@
       (if (= joined store)
         this
         (->ConflictFreeSystem id stype joined current vjoin bottom config))))
+  ;; PURE (in-memory) — no IO, so the runtime mode is irrelevant; ignore opts.
+  (-join [this other _opts] (c/-join this other))
   (-conflict-free? [_] true)
 
   c/PDeltaApply
-  (-apply-delta [this delta] (apply-delta this delta)))
+  (-apply-delta [this delta] (apply-delta this delta))
+  (-apply-delta [this delta _opts] (apply-delta this delta)))
 
 (defn conflict-free-system
   "Construct a conflict-free system. `vjoin`/`bottom` define the CRDT; optional

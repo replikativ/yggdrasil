@@ -28,7 +28,10 @@
    `merge` (authored) resolves heads via a merge commit. `-conflict-free?` is FALSE.
 
    The pure `cdvcs.graph` + `cdvcs.core` stay as the value-level reference (covered
-   by the pure `cdvcs_test`); this ns is the durable + cross-platform wrapping."
+   by the pure `cdvcs_test`); this ns is the durable + cross-platform wrapping.
+   **Runtime mode**: the record does NOT carry an execution mode — each op takes an
+   OPTIONAL trailing `opts` ({:sync?}, default `c/default-opts`: sync on JVM, CPS on
+   cljs)."
   (:refer-clojure :exclude [merge])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
@@ -107,27 +110,29 @@
 ;; ============================================================
 ;; Functional verbs — each returns a NEW record (value-semantic)
 ;; ============================================================
+;; Each verb takes an OPTIONAL trailing `opts` ({:sync?}); omit it for the
+;; platform default (`c/default-opts`).
 
 (defn commit
   "Commit `transactions` onto a single-head CDVCS (throws on multiple heads). Appends
    `[id value]` (the inlined commit) to the graph PSS. (async+sync)"
-  [cd author transactions]
-  (let [opts (:opts cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [heads (:heads (:state cd))]
-                   (when (not= 1 (count heads))
-                     (throw (ex-info "CDVCS has multiple heads — merge before committing."
-                                     {:type :multiple-heads :heads heads})))
-                   (let [{:keys [id value]} (core/make-commit author (vec heads) transactions)
-                         graph' (await (d/set-conj (:graph cd) [id value] graph-cmp opts))]
-                     ;; accrue the OP δ — the FULL self-contained commit {:id :value}
-                     ;; (the value carries :parents), so a peer applies it directly
-                     ;; (set-conj into its graph; content-addressing dedups).
-                     (c/with-delta (assoc cd :graph graph'
-                                          :state {:heads #{id} :version (inc (:version (:state cd)))}
-                                          :dirty true)
-                       set/union #{{:id id :value value}})))))))
+  ([cd author transactions] (commit cd author transactions c/default-opts))
+  ([cd author transactions opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [heads (:heads (:state cd))]
+                  (when (not= 1 (count heads))
+                    (throw (ex-info "CDVCS has multiple heads — merge before committing."
+                                    {:type :multiple-heads :heads heads})))
+                  (let [{:keys [id value]} (core/make-commit author (vec heads) transactions)
+                        graph' (await (d/set-conj (:graph cd) [id value] graph-cmp opts))]
+                    ;; accrue the OP δ — the FULL self-contained commit {:id :value}
+                    ;; (the value carries :parents), so a peer applies it directly
+                    ;; (set-conj into its graph; content-addressing dedups).
+                    (c/with-delta (assoc cd :graph graph'
+                                         :state {:heads #{id} :version (inc (:version (:state cd)))}
+                                         :dirty true)
+                      set/union #{{:id id :value value}})))))))
 
 (defn merge
   "Reconcile this CDVCS with `remote` (a CDVCS record), or its OWN multiple heads
@@ -135,52 +140,52 @@
    selection) + record a merge commit whose parents are all the heads. Returns a NEW
    single-head record. (async+sync)"
   ([cd author remote] (merge cd author remote []))
-  ([cd author remote correcting-transactions]
-   (let [opts (:opts cd)]
-     (async+sync (:sync? opts)
-                 (async
-                  (let [merged    (await (d/set-union (:graph cd) (:graph remote) graph-cmp opts))
-                        all-heads (vec (set/union (:heads (:state cd)) (:heads (:state remote))))
-                        {:keys [id value]} (core/make-commit author all-heads correcting-transactions)
-                        graph'    (await (d/set-conj merged [id value] graph-cmp opts))]
-                    ;; the δ carries BOTH the merge commit AND the remote's commits we
-                    ;; just unioned in (so a peer that has neither converges from the δ
-                    ;; alone); the remote's δ — if any — is folded in too.
-                    (let [remote-delta (or (c/delta-of remote) #{})]
-                      (c/with-delta (assoc cd :graph graph'
-                                           :state {:heads #{id}
-                                                   :version (inc (max (:version (:state cd)) (:version (:state remote))))}
-                                           :dirty true)
-                        set/union (set/union remote-delta #{{:id id :value value}})))))))))
+  ([cd author remote correcting-transactions] (merge cd author remote correcting-transactions c/default-opts))
+  ([cd author remote correcting-transactions opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [merged    (await (d/set-union (:graph cd) (:graph remote) graph-cmp opts))
+                      all-heads (vec (set/union (:heads (:state cd)) (:heads (:state remote))))
+                      {:keys [id value]} (core/make-commit author all-heads correcting-transactions)
+                      graph'    (await (d/set-conj merged [id value] graph-cmp opts))]
+                  ;; the δ carries BOTH the merge commit AND the remote's commits we
+                  ;; just unioned in (so a peer that has neither converges from the δ
+                  ;; alone); the remote's δ — if any — is folded in too.
+                  (let [remote-delta (or (c/delta-of remote) #{})]
+                    (c/with-delta (assoc cd :graph graph'
+                                         :state {:heads #{id}
+                                                 :version (inc (max (:version (:state cd)) (:version (:state remote))))}
+                                         :dirty true)
+                      set/union (set/union remote-delta #{{:id id :value value}}))))))))
 
 (defn pull
   "Fast-forward to `remote-tip` from `remote`'s graph. Throws if the remote is not a
    superset (use `merge`) or if pulling would induce multiple heads. (async+sync)"
-  [cd remote remote-tip]
-  (let [opts (:opts cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (when (some? (await ((parents-of (:graph cd) (:storage cd) opts) remote-tip)))
-                   (throw (ex-info "No pull necessary — remote-tip already present."
-                                   {:type :pull-unnecessary :remote-tip remote-tip})))
-                 (let [cd-heads (:heads (:state cd))
-                       merged   (await (d/set-union (:graph cd) (:graph remote) graph-cmp opts))
-                       pof-cd   (parents-of (:graph cd) (:storage cd) opts)
-                       pof-rem  (parents-of (:graph remote) (:storage remote) opts)
-                       pof-m    (parents-of merged (:storage cd) opts)
-                       {:keys [lcas]} (await (gs/lowest-common-ancestors
-                                              pof-cd cd-heads pof-rem #{remote-tip} opts))
-                       new-heads (await (gs/remove-ancestors pof-m pof-cd cd-heads #{remote-tip} opts))]
-                   (when-not (set/superset? lcas cd-heads)
-                     (throw (ex-info "Remote is not pullable (not a superset) — use merge."
-                                     {:type :not-superset :lcas lcas :heads cd-heads})))
-                   (when (> (count new-heads) 1)
-                     (throw (ex-info "Cannot pull without inducing a conflict — use merge."
-                                     {:type :multiple-heads :heads new-heads})))
-                   (await (save-graph! (:kv-store cd) merged (:storage cd) (:config cd) opts))
-                   (let [state' {:heads new-heads :version (inc (:version (:state cd)))}]
-                     (await (save-state! (:kv-store cd) state' (:config cd) opts))
-                     (assoc cd :graph merged :state state' :dirty false)))))))
+  ([cd remote remote-tip] (pull cd remote remote-tip c/default-opts))
+  ([cd remote remote-tip opts]
+   (async+sync (:sync? opts)
+               (async
+                (when (some? (await ((parents-of (:graph cd) (:storage cd) opts) remote-tip)))
+                  (throw (ex-info "No pull necessary — remote-tip already present."
+                                  {:type :pull-unnecessary :remote-tip remote-tip})))
+                (let [cd-heads (:heads (:state cd))
+                      merged   (await (d/set-union (:graph cd) (:graph remote) graph-cmp opts))
+                      pof-cd   (parents-of (:graph cd) (:storage cd) opts)
+                      pof-rem  (parents-of (:graph remote) (:storage remote) opts)
+                      pof-m    (parents-of merged (:storage cd) opts)
+                      {:keys [lcas]} (await (gs/lowest-common-ancestors
+                                             pof-cd cd-heads pof-rem #{remote-tip} opts))
+                      new-heads (await (gs/remove-ancestors pof-m pof-cd cd-heads #{remote-tip} opts))]
+                  (when-not (set/superset? lcas cd-heads)
+                    (throw (ex-info "Remote is not pullable (not a superset) — use merge."
+                                    {:type :not-superset :lcas lcas :heads cd-heads})))
+                  (when (> (count new-heads) 1)
+                    (throw (ex-info "Cannot pull without inducing a conflict — use merge."
+                                    {:type :multiple-heads :heads new-heads})))
+                  (await (save-graph! (:kv-store cd) merged (:storage cd) (:config cd) opts))
+                  (let [state' {:heads new-heads :version (inc (:version (:state cd)))}]
+                    (await (save-state! (:kv-store cd) state' (:config cd) opts))
+                    (assoc cd :graph merged :state state' :dirty false)))))))
 
 (defn apply-delta
   "OP-path: integrate a peer's δ (a set of self-contained commits `{:id :value}`,
@@ -188,34 +193,34 @@
    graph (content-addressed ⇒ idempotent), then recompute the frontier via
    `remove-ancestors` (≡ the STATE-path `-join`, but O(δ) not O(graph)). Returns a
    δ-FREE record (remote ops do not re-propagate). (async+sync)"
-  [cd delta]
-  (let [opts (:opts cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [entries (vec delta)]
-                   (if (empty? entries)
-                     (c/clear-delta cd)
-                     (let [graph' (loop [es (seq entries) g (:graph cd)]
-                                    (if es
-                                      (let [{:keys [id value]} (first es)]
-                                        (recur (next es)
-                                               (await (d/set-conj g [id value] graph-cmp opts))))
-                                      g))]
-                       (if (= graph' (:graph cd))
-                         (c/clear-delta cd)                      ; nothing new — idempotent
-                         (let [all-parents (set (mapcat #(:parents (:value %)) entries))
-                               ;; the δ's OWN frontier: incoming ids that are not a parent
-                               ;; of another incoming commit — a valid head set, so the
-                               ;; recompute matches `-join`'s (heads-a ∪ heads-b − LCAs).
-                               incoming    (into #{} (comp (map :id) (remove all-parents)) entries)
-                               new-heads   (await (gs/remove-ancestors
-                                                   (parents-of graph' (:storage cd) opts)
-                                                   (parents-of (:graph cd) (:storage cd) opts)
-                                                   (:heads (:state cd)) incoming opts))]
-                           (await (save-graph! (:kv-store cd) graph' (:storage cd) (:config cd) opts))
-                           (let [state' {:heads new-heads :version (inc (:version (:state cd)))}]
-                             (await (save-state! (:kv-store cd) state' (:config cd) opts))
-                             (c/clear-delta (assoc cd :graph graph' :state state' :dirty false))))))))))))
+  ([cd delta] (apply-delta cd delta c/default-opts))
+  ([cd delta opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [entries (vec delta)]
+                  (if (empty? entries)
+                    (c/clear-delta cd)
+                    (let [graph' (loop [es (seq entries) g (:graph cd)]
+                                   (if es
+                                     (let [{:keys [id value]} (first es)]
+                                       (recur (next es)
+                                              (await (d/set-conj g [id value] graph-cmp opts))))
+                                     g))]
+                      (if (= graph' (:graph cd))
+                        (c/clear-delta cd)                      ; nothing new — idempotent
+                        (let [all-parents (set (mapcat #(:parents (:value %)) entries))
+                              ;; the δ's OWN frontier: incoming ids that are not a parent
+                              ;; of another incoming commit — a valid head set, so the
+                              ;; recompute matches `-join`'s (heads-a ∪ heads-b − LCAs).
+                              incoming    (into #{} (comp (map :id) (remove all-parents)) entries)
+                              new-heads   (await (gs/remove-ancestors
+                                                  (parents-of graph' (:storage cd) opts)
+                                                  (parents-of (:graph cd) (:storage cd) opts)
+                                                  (:heads (:state cd)) incoming opts))]
+                          (await (save-graph! (:kv-store cd) graph' (:storage cd) (:config cd) opts))
+                          (let [state' {:heads new-heads :version (inc (:version (:state cd)))}]
+                            (await (save-state! (:kv-store cd) state' (:config cd) opts))
+                            (c/clear-delta (assoc cd :graph graph' :state state' :dirty false))))))))))))
 
 (defn heads          [cd] (:heads (:state cd)))
 (defn multiple-heads? [cd] (> (count (:heads (:state cd))) 1))
@@ -223,12 +228,12 @@
 (defn commit-graph
   "Drain the graph PSS into a `{id -> parents}` map. O(graph) — debug/inspection
    only; the durable layer never materialises it. (async+sync)"
-  [cd]
-  (let [opts (:opts cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (into {} (map (fn [e] [(first e) (:parents (second e))]))
-                       (await (d/set->clj (:graph cd) opts)))))))
+  ([cd] (commit-graph cd c/default-opts))
+  ([cd opts]
+   (async+sync (:sync? opts)
+               (async
+                (into {} (map (fn [e] [(first e) (:parents (second e))]))
+                      (await (d/set->clj (:graph cd) opts)))))))
 
 (defn full-delta
   "The ENTIRE commit set as a δ — a set of self-contained `{:id :value}` commits
@@ -237,46 +242,48 @@
    projection (plain data) for a connect handshake / catch-up: pass as signal-sync's
    `state-fn` so a joiner reconstructs the whole lineage via `-apply-delta`, instead
    of shipping the non-serializable CDVCS record. (async+sync)"
-  [cd]
-  (let [opts (:opts cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (into #{} (map (fn [e] {:id (first e) :value (second e)}))
-                       (await (d/set->clj (:graph cd) opts)))))))
+  ([cd] (full-delta cd c/default-opts))
+  ([cd opts]
+   (async+sync (:sync? opts)
+               (async
+                (into #{} (map (fn [e] {:id (first e) :value (second e)}))
+                      (await (d/set->clj (:graph cd) opts)))))))
 
 (defn history
   "Linear commit history (ids) of the single head — DFS over the graph PSS. Throws on
    multiple heads. (async+sync) Delegates DIRECTLY to the (already async+sync)
    `gs/commit-history` — wrapping a pure tail-await in its own `async+sync` leaves the
    inner CPS fn unresolved on a nested await (cljs)."
-  [cd]
-  (let [heads (:heads (:state cd))]
-    (when (> (count heads) 1)
-      (throw (ex-info "CDVCS has multiple heads — linearise a chosen head explicitly."
-                      {:type :multiple-heads :heads heads})))
-    (gs/commit-history (parents-of (:graph cd) (:storage cd) (:opts cd)) (first heads) (:opts cd))))
+  ([cd] (history cd c/default-opts))
+  ([cd opts]
+   (let [heads (:heads (:state cd))]
+     (when (> (count heads) 1)
+       (throw (ex-info "CDVCS has multiple heads — linearise a chosen head explicitly."
+                       {:type :multiple-heads :heads heads})))
+     (gs/commit-history (parents-of (:graph cd) (:storage cd) opts) (first heads) opts))))
 
 (defn read-commit
   "Read a commit value by its id — slices the inlined graph entry (nil if absent).
    (async+sync)"
-  [cd id]
-  (let [opts (:opts cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [es (await (d/slice->clj (:graph cd) [id] [id] opts))]
-                   (when (seq es) (second (first es))))))))
+  ([cd id] (read-commit cd id c/default-opts))
+  ([cd id opts]
+   (async+sync (:sync? opts)
+               (async
+                (let [es (await (d/slice->clj (:graph cd) [id] [id] opts))]
+                  (when (seq es) (second (first es))))))))
 
 (defn ship!
   "Copy to `dst-store` every graph PSS node it is MISSING (content-addressed ⇒
    incremental + idempotent). The commit values ride INLINE in those nodes, so this
    single node-copy makes every commit readable on `dst-store` after a restore +
    `-join` (no separate blob layer). Returns the count copied. (async+sync)"
-  [cd dst-store]
-  (let [opts (:opts cd) src (:kv-store cd) storage (:storage cd)]
-    (async+sync (:sync? opts)
-                (async
-                 (let [graph-root (await (d/store-set! (:graph cd) storage opts))]
-                   (await (d/ship! src dst-store graph-root opts)))))))
+  ([cd dst-store] (ship! cd dst-store c/default-opts))
+  ([cd dst-store opts]
+   (let [src (:kv-store cd) storage (:storage cd)]
+     (async+sync (:sync? opts)
+                 (async
+                  (let [graph-root (await (d/store-set! (:graph cd) storage opts))]
+                    (await (d/ship! src dst-store graph-root opts))))))))
 
 ;; ============================================================
 ;; Record
@@ -287,8 +294,7 @@
             graph     ; grow-only PSS of [id parents] — the convergent commit-graph
             state     ; {:heads #{id} :version n} — the DERIVED frontier cache
             dirty     ; unflushed graph/state?
-            config    ; DOMAIN: {:graph-key :state-key …}
-            opts]     ; RUNTIME: {:sync?}
+            config]   ; DOMAIN: {:graph-key :state-key …}
 
   p/SystemIdentity
   (system-id [_] id)
@@ -302,15 +308,15 @@
   ;; equal value ⇒ equal id. `as-of` returns that FROZEN handle (realise the graph
   ;; with `(restore-set graph-cmp (:graph snap) storage)`).
   (snapshot-id [_]
-    (async+sync (:sync? opts)
+    (async+sync (:sync? c/default-opts)
                 (async
-                 (let [root (await (d/store-set! graph storage opts))]
+                 (let [root (await (d/store-set! graph storage c/default-opts))]
                    (str (await (d/store-commit! kv-store {:graph root
                                                           :heads (:heads state)
-                                                          :version (:version state)} opts)))))))
+                                                          :version (:version state)} c/default-opts)))))))
   (parent-ids [_] #{})
-  (as-of [this snap-id] (p/as-of this snap-id nil))
-  (as-of [_ snap-id _opts]
+  (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
+  (as-of [_ snap-id opts]
     (async+sync (:sync? opts)
                 (async (await (d/read-commit kv-store (parse-uuid (str snap-id)) opts)))))
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
@@ -330,7 +336,7 @@
   p/Committable
   (commit! [this] (flush! this))
   (commit! [this _message] (flush! this))
-  (commit! [this _message _opts] (flush! this))
+  (commit! [this _message opts] (flush! this opts))
 
   c/PConvergent
   ;; -join ≡ downstream: UNION the graph PSSs + recompute heads via remove-ancestors
@@ -340,7 +346,8 @@
   ;; nothing ⟺ no-op — return `this` IDENTICAL (else a mutually-synced signal would
   ;; re-publish forever); equal graph also implies unchanged heads, so the head
   ;; recompute is skipped too. (Matches gset's `(= joined roots)`.) (async+sync)
-  (-join [this other]
+  (-join [this other] (c/-join this other c/default-opts))
+  (-join [this other opts]
     (async+sync (:sync? opts)
                 (async
                  (let [merged (await (d/set-union graph (:graph other) graph-cmp opts))]
@@ -362,15 +369,19 @@
   ;; sync carry CDVCS over the wire (δ self-contained ⇒ no blob fetch) — the SAME
   ;; ygg-delta-fn / ygg-apply-delta-fn / ygg-clear-delta-fn hooks the G-Set uses.
   (-apply-delta [this delta] (apply-delta this delta))
+  (-apply-delta [this delta opts] (apply-delta this delta opts))
 
   p/GarbageCollectable
   (gc-roots [this]
-    (async+sync (:sync? opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+    (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
+  ;; gc-opts carries the GC window and may omit `:sync?` (a user window) — fill the
+  ;; platform default so the mode threads downstream (flush!/d/gc!).
   (gc-sweep! [this snapshot-ids gc-opts]
-    (async+sync (:sync? opts)
+    (let [gc-opts (clojure.core/merge c/default-opts gc-opts)]   ; `merge` is the CDVCS verb here
+     (async+sync (:sync? gc-opts)
                 (async
-                 (await (flush! this))
+                 (await (flush! this gc-opts))
                  ;; reachable = the graph PSS nodes (walked from the live root + each
                  ;; retained snapshot's graph root — the commit values ride INSIDE
                  ;; those nodes, no separate blobs) ∪ the snapshot blobs ∪ the pointer
@@ -378,24 +389,25 @@
                  (let [snap-addrs (mapv #(parse-uuid (str %)) snapshot-ids)
                        snap-roots (loop [as (seq snap-addrs) roots []]
                                     (if as
-                                      (let [snap (await (d/read-commit kv-store (first as) opts))]
+                                      (let [snap (await (d/read-commit kv-store (first as) gc-opts))]
                                         (recur (next as) (conj roots (:graph snap))))
                                       roots))
-                       graph-root (await (d/store-set! graph storage opts))]
+                       graph-root (await (d/store-set! graph storage gc-opts))]
                    (await (d/gc! kv-store (cons graph-root snap-roots) (graph-config config)
-                                 (clojure.core/merge gc-opts opts
+                                 (clojure.core/merge gc-opts
                                                      {:spare-keys [(gk config) (gfk config) (sk config)]
-                                                      :retain-keys (vec snap-addrs)}))))))))
+                                                      :retain-keys (vec snap-addrs)})))))))))
 
 (defn flush!
   "Persist the graph PSS (convergent roots write) + the {:heads :version} cache cell.
    Returns a clean record. (async+sync)"
-  [cd]
-  (async+sync (:sync? (:opts cd))
-              (async
-               (await (save-graph! (:kv-store cd) (:graph cd) (:storage cd) (:config cd) (:opts cd)))
-               (await (save-state! (:kv-store cd) (:state cd) (:config cd) (:opts cd)))
-               (assoc cd :dirty false))))
+  ([cd] (flush! cd c/default-opts))
+  ([cd opts]
+   (async+sync (:sync? opts)
+               (async
+                (await (save-graph! (:kv-store cd) (:graph cd) (:storage cd) (:config cd) opts))
+                (await (save-state! (:kv-store cd) (:state cd) (:config cd) opts))
+                (assoc cd :dirty false)))))
 
 ;; ============================================================
 ;; Factory
@@ -408,12 +420,13 @@
 
    config (DOMAIN): :store-config | :kv-store, :author, :state-key / :graph-key
            (cell keys; defaults :cdvcs/state / :cdvcs/graph).
-   opts (RUNTIME): :sync? (default true)."
+   opts (RUNTIME): :sync? (default true). The mode opens the store; it is NOT stamped
+        on the record — each op picks its own `:sync?` (default `c/default-opts`)."
   ([id] (cdvcs id {} {:sync? true}))
   ([id config] (cdvcs id config {:sync? true}))
   ([id {:keys [author store-config kv-store state-key graph-key]}
     {:keys [sync?] :or {sync? true}}]
-   (let [opts {:sync? sync?}
+   (let [open-opts {:sync? sync?}
          cell-config (cond-> {} state-key (assoc :state-key state-key)
                              graph-key (assoc :graph-key graph-key))
          ;; co-located instances (a vector :state-key like [:cdvcs/state id] sharing
@@ -427,17 +440,17 @@
          open-config (cond-> {} kv-store (assoc :kv-store kv-store))]
      (async+sync sync?
                  (async
-                  (let [{:keys [kv-store store-config storage]} (await (d/open store-config open-config opts))
-                        graph (await (load-graph kv-store storage cell-config opts))
-                        st    (await (kb/k-get kv-store (sk cell-config) opts))]
+                  (let [{:keys [kv-store store-config storage]} (await (d/open store-config open-config open-opts))
+                        graph (await (load-graph kv-store storage cell-config open-opts))
+                        st    (await (kb/k-get kv-store (sk cell-config) open-opts))]
                     (if st
-                      (->CDVCS id kv-store store-config storage graph st false cell-config opts)
+                      (->CDVCS id kv-store store-config storage graph st false cell-config)
                       (let [{bid :id value :value} (core/new-base author)
-                            graph' (await (d/set-conj graph [bid value] graph-cmp opts))
+                            graph' (await (d/set-conj graph [bid value] graph-cmp open-opts))
                             state  {:heads #{bid} :version 1}]
-                        (await (save-graph! kv-store graph' storage cell-config opts))
-                        (await (save-state! kv-store state cell-config opts))
-                        (->CDVCS id kv-store store-config storage graph' state false cell-config opts)))))))))
+                        (await (save-graph! kv-store graph' storage cell-config open-opts))
+                        (await (save-state! kv-store state cell-config open-opts))
+                        (->CDVCS id kv-store store-config storage graph' state false cell-config)))))))))
 
 ;; Register CDVCS with the system value codec (JVM). The record IS a value: the
 ;; commit-graph rides as its content-addressed root (dedup via the store's nodes);
@@ -446,9 +459,9 @@
    (yf/register-system!
     :cdvcs CDVCS
     ;; project: flush the graph → its root address; value fields verbatim.
-    (fn [{:keys [id store-config storage graph state dirty config opts]}]
+    (fn [{:keys [id store-config storage graph state dirty config]}]
       {:id id :store-config store-config
-       :graph (str (d/store-set! graph storage opts))
+       :graph (str (d/store-set! graph storage c/default-opts))
        :state state :dirty dirty :config config})
     ;; reconstruct: restore the graph with `graph-cmp` — `slice` (parents-of) reads
     ;; the set's OWN comparator, so it MUST be graph-cmp, not a default; derive
@@ -456,4 +469,4 @@
     (fn [blob storage opts]
       (->CDVCS (:id blob) (:kv-store storage) (:store-config blob) storage
                (d/restore-set graph-cmp (parse-uuid (str (:graph blob))) storage opts)
-               (:state blob) (or (:dirty blob) false) (:config blob) opts))))
+               (:state blob) (or (:dirty blob) false) (:config blob)))))

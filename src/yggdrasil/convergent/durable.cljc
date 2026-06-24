@@ -464,7 +464,10 @@
   "Flush, then mark-and-sweep nodes unreachable from the live roots — retaining the
    commit objects (and both halves' nodes) named by `snapshot-ids` so a frozen
    `as-of` survives. (async+sync)"
-  [{:keys [kv-store config] :as this} snapshot-ids gc-opts opts]
+  ;; `opts` carries BOTH the runtime mode (`:sync?`) AND any GC window
+  ;; (`:remove-before`/`:grace-period-ms`) — the record no longer stamps a mode, so
+  ;; the caller's per-op opts is the single source.
+  [{:keys [kv-store config] :as this} snapshot-ids opts]
   (async+sync (:sync? opts)
               (async
                (await (two-half-flush! this opts))
@@ -476,8 +479,8 @@
                                       acc))]
                  (await (gc! kv-store (vals (await (load-roots kv-store config opts)))
                              config
-                             (merge gc-opts opts {:retain-roots retain-roots
-                                                  :retain-keys commit-addrs})))))))
+                             (merge opts {:retain-roots retain-roots
+                                          :retain-keys commit-addrs})))))))
 
 (defn two-half-open
   "Open a two-half CRDT's store and restore both halves from `:crdt/roots`. Returns
