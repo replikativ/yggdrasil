@@ -68,6 +68,35 @@ Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.repli
 
 > **Note:** A Python binding (`py/`) exists with protocol definitions and types, but it has not been updated since the initial release and is missing newer protocols (GarbageCollectable, Addressable, Committable) and coordination features (workspace, registry, composite). Use it as a reference, not a production dependency.
 
+## Public API
+
+These are the supported namespaces. **Everything else under `yggdrasil.*` is implementation detail and may change between releases** (marked `^:no-doc`): the storage/serialization plumbing (`storage`, `fressian`, `kbridge`, `fn-registry`, `macros`) and the durable backing (`convergent.durable`, `convergent.overlay`, `convergent.cdvcs.{commit,graph-store}`).
+
+**Core**
+- `yggdrasil.protocols` — the CoW memory-model protocols every system implements (Snapshotable, Branchable, Graphable, Mergeable, Overlayable, Watchable, GarbageCollectable, …).
+- `yggdrasil.types` — shared value types: `SnapshotRef`, `HLC`, `Conflict`, `RegistryEntry`, + HLC helpers.
+- `yggdrasil.convergent` — the conflict-free convergent merge law (`join`): symmetric, no-ancestor CRDT merge of peer replicas.
+
+**Convergent (CRDT) catalog** — each a durable yggdrasil system
+- `yggdrasil.convergent.gset` (`gset`) · `…orset` (`orset`) · `…twopset` (`twopset`) · `…ormap` (`ormap`/`merging-ormap`) · `…lwwr` (`lwwr`) · `…cdvcs` (`cdvcs`)
+- `yggdrasil.convergent.system` — build your own CRDT-as-system (`conflict-free-system`).
+
+**Composition & orchestration**
+- `yggdrasil.composite` — pullback of N sub-systems as one logical system (`composite`/`pullback`).
+- `yggdrasil.compose` — mechanical multi-system commit/discard helpers.
+- `yggdrasil.workspace` — HLC-coordinated multi-system workspace + ref management.
+- `yggdrasil.registry` — cross-system snapshot registry (a durable 2P-Set lens).
+- `yggdrasil.gc` — coordinated garbage collection across systems.
+- `yggdrasil.migrate` — on-disk store migration between yggdrasil versions.
+
+**Adapters** (pick a backend; call its `create` / `init!`)
+- `yggdrasil.adapters.{datahike, git, dolt, lakefs, iceberg, ipfs, btrfs, zfs, overlayfs, podman}`
+
+**Extension points** (for new backends)
+- `yggdrasil.protocols` + `yggdrasil.hooks` — implement the protocols + commit hooks.
+- `yggdrasil.compliance` — run the protocol conformance suite against your adapter (`run-compliance-tests`).
+- Advanced cross-platform adapters also use `yggdrasil.macros/async+sync` and the `yggdrasil.convergent.system` toolkit (documented here in prose rather than the generated API index).
+
 ## Protocol Layers
 
 | Layer | Protocol | Purpose |
@@ -157,18 +186,20 @@ Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.repli
 
 | Adapter | Snapshot | Branch | Graph | Merge | Overlay | Watch | GC | Addressable | Committable |
 |---------|----------|--------|-------|-------|---------|-------|----|-------------|-------------|
-| Git | commits | branches (worktrees) | full DAG | 3-way | - | poll | yes | yes | yes |
+| Git | commits | branches (worktrees) | full DAG | 3-way | worktree fork | poll | yes | yes | yes |
 | ZFS | snapshots | clones | linear | - | - | poll | yes | yes | yes |
 | Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll | yes | yes | yes |
 | IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes | - | yes |
 | Iceberg | snapshots | branches | full DAG | manual | - | poll | yes | - | yes |
-| Datahike | commit-id | branch! | full DAG | merge! | - | listen | yes | - | - |
+| Datahike | commit-id | branch! | full DAG | merge! | branch fork | via hooks¹ | yes | - | - |
 | Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes | yes | yes |
 | OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes | yes | yes |
 | Podman | image layers | containers | full DAG | diff+apply | - | poll | yes | - | yes |
 | LakeFS | commits | branches | full DAG | 3-way | - | poll | yes | - | yes |
 | Dolt | commits | branches | full DAG | 3-way | - | poll | yes | yes | yes |
 | **Composite** | composite UUID | intersection | composite DAG | per-system | - | - | union | - | delegates |
+
+¹ Datahike does not implement the `Watchable` protocol; commit notification is delivered through `yggdrasil.hooks/install-commit-hook!` (`d/listen` under the hood), a separate mechanism from the `Watchable` capability.
 
 ### Git Adapter
 
@@ -239,24 +270,22 @@ Git-like version control for data lakes on object storage (S3, HDFS, etc.). Trac
 ```clojure
 (require '[yggdrasil.adapters.iceberg :as ice])
 
-;; Initialize new table
-(def sys (ice/init! "s3://my-bucket/warehouse"
-                    "db.table"
-                    {:spark-config {...}}))
+;; Initialize a new table (catalog namespace + table) against a REST catalog +
+;; S3/MinIO; creates the first yggdrasil snapshot.
+(def sys (ice/init! "db" "my_table"
+                    {:rest-endpoint "http://localhost:8181"
+                     :s3-endpoint   "http://localhost:9000"
+                     :system-name   "warehouse"}))
+;; (use `ice/create` instead of `ice/init!` to track an EXISTING table)
 
-;; Create Spark session and register table
-(def spark (ice/create-spark-session sys))
-
-;; Write data via Spark
-(.write (.format df "iceberg") "db.table")
-
-;; Yggdrasil tracks snapshots
+;; Write data with your own query engine (Spark, PyIceberg, …) against db.my_table;
+;; yggdrasil tracks the resulting snapshots.
 (p/commit! sys "Initial data load")
 
 ;; Branch for experimental schema changes
 (p/branch! sys :schema-v2)
 (p/checkout sys :schema-v2)
-;; ... modify table schema via Spark ...
+;; ... modify the table via your engine ...
 (p/commit! sys "Add new columns")
 
 ;; Merge schema changes back
@@ -582,6 +611,44 @@ Each HLC has a `physical` (millis since epoch) and a `logical` counter. The phys
 ;; garbage-collectable, addressable, committable
 ```
 
+## Convergent CRDTs
+
+Yggdrasil ships a catalog of **conflict-free replicated data types** as first-class
+systems — durable on the same persistent-sorted-set + konserve substrate as the
+snapshot registry, and cross-platform (JVM + ClojureScript). Each is a value with a
+commutative/associative/idempotent join (`-join`); a replica is a copy held in a cell,
+and convergence is the join. They are **read on the fly**: the value is never fully
+materialized — a key-scoped read pulls only the B-tree nodes it touches, through an
+in-memory node cache (a key read is an O(log n) range slice). Constructing one without
+a `:store-config` defaults to a fresh in-memory konserve store.
+
+| CRDT | namespace | use it for |
+|---|---|---|
+| G-Set | `convergent.gset` | a set that only grows |
+| OR-Set | `convergent.orset` | convergent removal, re-add allowed (add-wins) |
+| 2P-Set | `convergent.twopset` | a set where removal is final |
+| OR-Map | `convergent.ormap` | a keyed map, concurrent writes surfaced |
+| Merging-OR-Map | `convergent.ormap` (`merging-ormap`) | a keyed map, concurrent writes auto-merged by a lattice fn |
+| LWW-Register | `convergent.lwwr` | last-writer-wins single value (in-memory) |
+| CDVCS | `convergent.cdvcs` | versioned history with explicit conflict resolution |
+
+```clojure
+(require '[yggdrasil.convergent.ormap :as om])
+
+(let [m (-> (om/ormap "kb") (om/assoc :k 1) (om/assoc :k 2))]
+  (om/get m :k))                                   ;; => #{1 2}  (concurrent writes surfaced)
+
+(let [m (-> (om/merging-ormap "kb" max) (om/assoc :k 1) (om/assoc :k 9))]
+  (om/get m :k))                                   ;; => 9       (folded by the merge-fn)
+```
+
+The collection verbs are bare Clojure collection names — alias the namespace so they
+read like `(om/get m k)`. `:sync? true` works on the JVM and on cljs over a synchronous
+konserve backend (memory or node filestore); only a browser IndexedDB store requires
+`:sync? false` + `await`. See **[doc/crdts.md](doc/crdts.md)** for the full
+catalog, storage layout, and sync, and **[doc/cdvcs-convergent-system.md](doc/cdvcs-convergent-system.md)**
+for CDVCS.
+
 ## Multi-System Coordination
 
 Yggdrasil provides two mechanisms for working with multiple systems together. They solve different problems at different levels:
@@ -611,15 +678,16 @@ The `yggdrasil.composite` namespace provides a `CompositeSystem` that wraps N su
 (require '[yggdrasil.composite :as composite])
 (require '[yggdrasil.protocols :as p])
 
-;; Strict: all sub-systems must be on the same branch
+;; Strict: all sub-systems must be on the same branch.
+;; `config` is a MAP (2nd positional arg), `opts` an optional 3rd: (subs config opts).
 (def sys (composite/pullback [git-sys db-sys]
-           :name "my-workspace"))
+           {:name "my-workspace"}))
 
 ;; Lenient: sub-systems may have different native branch names
 ;; (e.g. datahike defaults to :db, scriptum to "main")
 (def sys (composite/composite [dh-sys sc-sys]
-           :name "briefkasten"
-           :branch :main))
+           {:name "briefkasten"
+            :branch :main}))
 
 ;; All protocol operations coordinate across sub-systems
 (p/system-id sys)        ;; => "my-workspace"
@@ -646,11 +714,11 @@ By default, composite history is ephemeral (in-memory only). Pass `:store-config
 ```clojure
 ;; Create a persistent composite — history survives process restarts
 (def sys (composite/composite [dh-sys sc-sys]
-           :name "briefkasten"
-           :branch :main
-           :store-config {:backend :file
-                          :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-                          :path "/var/lib/myapp/composite"}))
+           {:name "briefkasten"
+            :branch :main
+            :store-config {:backend :file
+                           :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                           :path "/var/lib/myapp/composite"}}))
 
 ;; Commit as usual — index is persisted on every commit
 (def c1 (p/commit! sys "sync checkpoint"))
@@ -662,11 +730,11 @@ By default, composite history is ephemeral (in-memory only). Pass `:store-config
 ;; On restart: reopen sub-systems, create composite with same :store-config
 ;; History, commit-graph, commit-info all restored from disk
 (def sys2 (composite/composite [dh-sys2 sc-sys2]
-            :name "briefkasten"
-            :branch :main
-            :store-config {:backend :file
-                           :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-                           :path "/var/lib/myapp/composite"}))
+            {:name "briefkasten"
+             :branch :main
+             :store-config {:backend :file
+                            :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                            :path "/var/lib/myapp/composite"}}))
 (p/history sys2)  ;; => full history chain including c1, c2
 ```
 
@@ -674,12 +742,14 @@ The PSS index stores entries sorted by composite snapshot ID with lazy-loading f
 
 ### Constructors
 
+Both take `(subs config opts)` — `config` is a MAP (`{:name :branch :store-config}`), `opts` an optional `{:sync?}`.
+
 | Function | Branch check | Use case |
 |----------|-------------|----------|
-| `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `:branch` to override | Systems with matching branch names |
-| `composite` | None — accepts explicit `:branch` (default `:main`) | Systems with different branch naming conventions |
+| `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `{:branch …}` to override | Systems with matching branch names |
+| `composite` | None — accepts `{:branch …}` in config (default `:main`) | Systems with different branch naming conventions |
 
-Both constructors accept `:store-config` for persistent history (any konserve backend).
+Both constructors accept `{:store-config …}` in their config map for persistent history (any konserve backend).
 
 ### Aggregation strategies
 
@@ -880,12 +950,12 @@ src/yggdrasil/
   watcher.clj          # Polling watcher infrastructure
   compose.cljc         # Multi-system overlay lifecycle
   compliance.clj       # Protocol compliance test suite
-  workspace.clj        # Multi-system workspace with HLC coordination
-  registry.clj         # Snapshot registry (PSS index in konserve)
-  storage.clj          # IStorage for PSS B-tree nodes (any konserve backend)
+  workspace.cljc       # Multi-system workspace with HLC coordination
+  registry.cljc        # Snapshot registry (PSS index in konserve)
+  storage.cljc         # IStorage for PSS B-tree nodes (any konserve backend)
   gc.clj               # Coordinated cross-system garbage collection
   hooks.clj            # Extension point for adapter-specific commit hooks
-  composite.clj        # CompositeSystem — pullback over shared branch space
+  composite.cljc       # CompositeSystem — pullback over shared branch space
   adapters/
     git.clj            # Git adapter (worktree-based)
     ipfs.clj           # IPFS adapter (P2P content-addressed)

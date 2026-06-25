@@ -142,15 +142,10 @@
                nil)))
          ;; Flush registry changes
          (reg/flush! registry)
-         ;; Sweep freed PSS B-tree nodes from storage
-         (let [freed-count
-               (if-let [storage (:storage registry)]
-                 (let [freed-grace (or (:freed-grace-period-ms opts)
-                                       (* 60 60 1000))]
-                   (store/sweep-freed! (:kv-store registry)
-                                       (:freed-atom storage)
-                                       freed-grace))
-                 0)]
+         ;; Reclaim superseded PSS B-tree nodes from the registry's own storage
+         ;; (the registry is a durable 2P-Set — mark-and-sweep, datahike-style).
+         (let [freed-count (try (count (reg/gc! registry opts))
+                                (catch Exception _ 0))]
            {:swept @swept
             :errors @errors
             :freed-nodes-swept freed-count}))))))

@@ -132,7 +132,7 @@
   (when-let [hook-id (get @(:watchers workspace) system-id)]
     (when-let [sys (get @(:systems workspace) system-id)]
       (try (hooks/remove-commit-hook! workspace sys hook-id)
-           (catch Exception _))))
+           (catch #?(:clj Exception :cljs :default) _))))
   (swap! (:watchers workspace) dissoc system-id)
   (swap! (:systems workspace) dissoc system-id)
   ;; Clean up connection cache entries for this system
@@ -233,7 +233,7 @@
       (try
         (let [entry (commit-with-hlc! workspace system-id pinned-hlc commit-fn)]
           (swap! results assoc system-id entry))
-        (catch Exception e
+        (catch #?(:clj Exception :cljs :default) e
           (swap! errors assoc system-id e))))
     {:results @results
      :errors @errors
@@ -306,7 +306,7 @@
   (when-let [hook-id (get @(:watchers workspace) system-id)]
     (when-let [system (get @(:systems workspace) system-id)]
       (try (hooks/remove-commit-hook! workspace system hook-id)
-           (catch Exception _))))
+           (catch #?(:clj Exception :cljs :default) _))))
   (swap! (:watchers workspace) dissoc system-id))
 
 ;; ============================================================
@@ -367,7 +367,7 @@
     (when-let [hook-id (get @(:watchers workspace) system-id)]
       (try
         (hooks/remove-commit-hook! workspace system hook-id)
-        (catch Exception _))))
+        (catch #?(:clj Exception :cljs :default) _))))
   (remove-system! workspace system-id))
 
 ;; ============================================================
@@ -418,9 +418,9 @@
                   (let [meta (when (satisfies? p/Snapshotable checked-out)
                                (p/snapshot-meta checked-out snap-id))
                         hlc (if-let [ts (:timestamp meta)]
-                              (t/->HLC (try (long (Double/parseDouble (str ts)))
-                                            (catch Exception _
-                                              (System/currentTimeMillis)))
+                              (t/->HLC (try (long #?(:clj (Double/parseDouble (str ts)) :cljs (js/parseFloat (str ts))))
+                                            (catch #?(:clj Exception :cljs :default) _
+                                              (t/now-ms)))
                                        0)
                               (swap! (:hlc-atom workspace) t/hlc-tick))]
                     (swap! batch conj
@@ -457,7 +457,11 @@
    Returns {:swept [...] :errors {...} :freed-nodes-swept count}"
   ([workspace] (gc! workspace {}))
   ([workspace opts]
-   (let [gc-sweep! (requiring-resolve 'yggdrasil.gc/gc-sweep!)]
+   ;; coordinated GC spans native adapters (git/btrfs/zfs/…) → JVM-only. On cljs
+   ;; fail legibly instead of calling `nil` (a silent NPE); durable-CRDT GC is
+   ;; available cross-platform via yggdrasil.convergent.durable/gc!.
+   (let [gc-sweep! #?(:clj (requiring-resolve 'yggdrasil.gc/gc-sweep!)
+                      :cljs (fn [& _] (throw (ex-info "coordinated workspace gc! is JVM-only; use durable-CRDT gc! on cljs" {:platform :cljs}))))]
      (gc-sweep! (:registry workspace)
                 (vals @(:systems workspace))
                 opts))))

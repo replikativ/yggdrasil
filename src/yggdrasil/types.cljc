@@ -28,15 +28,53 @@
       (compare (:logical a) (:logical b))
       pc)))
 
+(def ^:dynamic *now-fn*
+  "Optional clock override — a 0-arg fn returning millis. `nil` ⇒ the real
+   wall-clock. Bind it for deterministic spindel replay / tests (O5): a replay
+   context fixes physical time rather than reading the host clock. HLC's logical
+   counter still ticks under a fixed clock, so order stays monotonic."
+  nil)
+
+(defn now-ms
+  "Portable wall-clock millis since epoch (JVM + cljs), via `*now-fn*` when bound."
+  []
+  (if *now-fn*
+    (*now-fn*)
+    #?(:clj (System/currentTimeMillis)
+       :cljs (.getTime (js/Date.)))))
+
+;; A single shared literal (NOT Integer/MAX_VALUE on JVM vs MAX_SAFE_INTEGER on
+;; cljs): the `as-of` ceiling HLC must be byte-identical across platforms so an
+;; HLC compare against a JVM-written vs cljs-written ceiling agrees, and a
+;; cljs-minted `:logical` never exceeds JVM int range when serialized.
+(def ^:private logical-max 2147483647)
+
 (defn hlc-now
   "Create HLC from current time."
   []
-  (->HLC (System/currentTimeMillis) 0))
+  (->HLC (now-ms) 0))
+
+(defn gc-cutoff
+  "Resolve a GC sweep cutoff (a Date) from `opts` — the ONE convention shared by
+   the whole GC machinery (protocol `gc-sweep!`, `durable/gc!`, composite, registry,
+   coordinator):
+     `:remove-before` (a Date)     ⇒ that exact cutoff (wins);
+     `:grace-period-ms` (a window) ⇒ now − ms;
+     neither                       ⇒ EPOCH ⇒ reclaim NOTHING.
+   The epoch default is SAFE: a GC with no window never sweeps a node an in-flight
+   lazy read might still hold. Pass a window in production (≥ your longest lazy-read
+   drain; ~60 s tight, hours/a day looser) — otherwise superseded trees accumulate
+   without bound."
+  [opts]
+  (or (:remove-before opts)
+      (when-let [g (:grace-period-ms opts)]
+        (#?(:clj java.util.Date. :cljs js/Date.) (- (now-ms) (long g))))
+      (#?(:clj java.util.Date. :cljs js/Date.) 0)))
 
 (defn hlc-tick
   "Advance HLC for local event."
   [hlc]
-  (let [now (System/currentTimeMillis)]
+  (let [now (now-ms)]
     (if (> now (:physical hlc))
       (->HLC now 0)
       (->HLC (:physical hlc) (inc (:logical hlc))))))
@@ -46,12 +84,12 @@
    Captures all events at or before this wall-clock time, including those
    with logical counter > 0 within the same millisecond."
   [physical-ms]
-  (->HLC physical-ms Integer/MAX_VALUE))
+  (->HLC physical-ms logical-max))
 
 (defn hlc-receive
   "Update HLC on receiving message with remote HLC."
   [local-hlc remote-hlc]
-  (let [now (System/currentTimeMillis)
+  (let [now (now-ms)
         max-physical (max now (:physical local-hlc) (:physical remote-hlc))]
     (if (= max-physical (:physical local-hlc) (:physical remote-hlc))
       (->HLC max-physical (inc (max (:logical local-hlc) (:logical remote-hlc))))
@@ -120,6 +158,13 @@
            [from            ; source ref
             to              ; target ref
             error])         ; String - error message
+
+(defn diff-error
+  "Construct a `DiffError` for a failed `diff`/`merge` between `from` and `to`.
+   Supported constructor — use this instead of `->DiffError` so the record's field
+   shape can evolve without breaking callers (e.g. spindel's diff bridge)."
+  [from to error]
+  (->DiffError from to error))
 
 ;; ============================================================
 ;; Registry entry - cross-system snapshot tracking

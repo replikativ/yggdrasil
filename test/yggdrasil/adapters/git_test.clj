@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [yggdrasil.adapters.git :as git]
             [yggdrasil.compliance :as compliance]
+            [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.protocols :as p])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
@@ -152,3 +153,24 @@
           (p/unwatch! sys watch-id)
           (delete-dir-recursive path)
           (delete-dir-recursive (str path "-worktrees")))))))
+
+(deftest overlay-isolate-and-merge-down
+  (testing "git overlay = a native worktree branch fork; mutate it in isolation;
+            merge-down! merges the fork branch back into the parent branch"
+    (let [path (temp-dir)
+          sys  (git/init! path {:system-name "t"})
+          file? (fn [s name] (.exists (java.io.File. (str (p/working-path s) "/entries/" name))))]
+      (try
+        (spit (str (p/working-path sys) "/entries/base.txt") "base")
+        (p/commit! sys "base")
+        (let [ov     (p/overlay sys {})
+              forked (ovl/overlay-system ov)]
+          (spit (str (p/working-path forked) "/entries/fork.txt") "fork-only")
+          (p/commit! forked "fork commit")
+          (is (file? sys "base.txt")        "parent has base")
+          (is (not (file? sys "fork.txt"))  "parent branch untouched while overlay open")
+          (is (file? forked "fork.txt")     "fork branch has the isolated write")
+          (let [merged (p/merge-down! ov)]
+            (is (file? merged "fork.txt")   "merge-down! merged the fork's file into the parent branch")))
+        (is (true? (:overlayable (p/capabilities sys))) "git advertises :overlayable")
+        (finally (delete-dir-recursive path))))))

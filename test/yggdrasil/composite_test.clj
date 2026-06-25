@@ -127,7 +127,7 @@
   (testing "pullback requires all systems on the same branch"
     (let [a (make-mock "sys-a" "snap-a0")
           b (make-mock "sys-b" "snap-b0")]
-      (is (some? (composite/pullback [a b] :name "test-composite")))))
+      (is (some? (composite/pullback [a b] {:name "test-composite"})))))
 
   (testing "pullback rejects mismatched branches"
     (let [a (make-mock "sys-a" "snap-a0")
@@ -139,7 +139,7 @@
 (deftest test-system-identity
   (let [a (make-mock "sys-a" "snap-a0")
         b (make-mock "sys-b" "snap-b0")
-        c (composite/pullback [a b] :name "my-composite")]
+        c (composite/pullback [a b] {:name "my-composite"})]
     (testing "system-id"
       (is (= "my-composite" (p/system-id c))))
     (testing "system-type"
@@ -294,7 +294,7 @@
       (is (thrown? clojure.lang.ExceptionInfo
                    (composite/pullback [a b])))
       ;; composite accepts it with explicit :branch
-      (let [c (composite/composite [a b] :branch :main)]
+      (let [c (composite/composite [a b] {:branch :main})]
         (is (= :main (p/current-branch c)))
         (is (= "composite:sys-a+sys-b" (p/system-id c)))))))
 
@@ -334,9 +334,9 @@
       (let [a (make-mock "sys-a" "snap-a0")
             b (make-mock "sys-b" "snap-b0")
             c (composite/composite [a b]
-                                   :name "test-persist"
-                                   :branch :main
-                                   :store-path dir)
+                                   {:name "test-persist"
+                                    :branch :main
+                                    :store-path dir})
             c1 (p/commit! c "first")
             c2 (p/commit! c1 "second")
             c3 (p/commit! c2 "third")
@@ -353,9 +353,9 @@
         (let [a2 (make-mock "sys-a" final-snap-a)
               b2 (make-mock "sys-b" final-snap-b)
               c-reopened (composite/composite [a2 b2]
-                                              :name "test-persist"
-                                              :branch :main
-                                              :store-path dir)
+                                              {:name "test-persist"
+                                               :branch :main
+                                               :store-path dir})
               hist-after (p/history c-reopened)
               graph-after (p/commit-graph c-reopened)]
           (composite/close! c-reopened)
@@ -380,17 +380,17 @@
       (let [a (make-mock "sys-a" "snap-a0")
             b (make-mock "sys-b" "snap-b0")
             c (composite/composite [a b]
-                                   :name "test-idem"
-                                   :branch :main
-                                   :store-path dir)]
+                                   {:name "test-idem"
+                                    :branch :main
+                                    :store-path dir})]
         (composite/close! c)
 
         (let [a2 (make-mock "sys-a" "snap-a0")
               b2 (make-mock "sys-b" "snap-b0")
               c2 (composite/composite [a2 b2]
-                                      :name "test-idem"
-                                      :branch :main
-                                      :store-path dir)
+                                      {:name "test-idem"
+                                       :branch :main
+                                       :store-path dir})
               hist (p/history c2)]
           (composite/close! c2)
 
@@ -408,9 +408,9 @@
       (let [a (make-mock "sys-a" "snap-a0")
             b (make-mock "sys-b" "snap-b0")
             c (composite/composite [a b]
-                                   :name "test-info"
-                                   :branch :main
-                                   :store-path dir)
+                                   {:name "test-info"
+                                    :branch :main
+                                    :store-path dir})
             c1 (p/commit! c "first commit")
             snap1 (p/snapshot-id c1)
             info-before (p/commit-info c1 snap1)
@@ -421,9 +421,9 @@
         (let [a2 (make-mock "sys-a" final-snap-a)
               b2 (make-mock "sys-b" final-snap-b)
               c-reopened (composite/composite [a2 b2]
-                                              :name "test-info"
-                                              :branch :main
-                                              :store-path dir)
+                                              {:name "test-info"
+                                               :branch :main
+                                               :store-path dir})
               info-after (p/commit-info c-reopened snap1)]
           (composite/close! c-reopened)
 

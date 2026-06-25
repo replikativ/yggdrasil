@@ -7,6 +7,7 @@
   observer mode (external git operations detected via polling watcher)."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
+            [yggdrasil.fressian :as yf]
             [yggdrasil.watcher :as w]
             [clojure.java.shell :refer [sh]]
             [clojure.string :as str]
@@ -124,13 +125,40 @@
              :branch actual-branch}
      :events events}))
 
+;; ============================================================
+;; GitOverlay — worktree branch fork (Overlayable)
+;; ============================================================
+;; git is VERSIONED: its overlay is a native branch fork (its own worktree).
+;; `overlay` branches+checks-out a fresh overlay branch (a new worktree) as the
+;; writable system; `merge-down!` merges it back; `discard!` deletes the branch +
+;; worktree. (Same separate-record pattern as datahike; `local-writes` holds the
+;; forked system so the uniform `overlay-system` accessor works.)
+
+;; `mode` is always :frozen — git can't do live fall-through across worktrees; a
+;; `:following` request degrades to :frozen + manual `advance!` (git merge main).
+(defrecord GitOverlay [parent local-writes fork-branch parent-branch mode]
+  p/Overlayable
+  (base-ref [_] (p/snapshot-id parent))
+  (peek-parent [_] parent)
+  (peek-parent [_ _] parent)
+  (overlay-writes [_] (p/diff parent (p/snapshot-id parent) (p/snapshot-id @local-writes)))
+
+  (advance! [ov] (p/advance! ov nil))
+  (advance! [ov _] (reset! local-writes (p/merge! @local-writes parent-branch)) ov)
+
+  (merge-down! [ov] (p/merge-down! ov nil))
+  (merge-down! [_ _] (-> parent (p/checkout parent-branch) (p/merge! fork-branch)))
+
+  (discard! [_] (p/delete-branch! parent fork-branch) nil)
+  (discard! [_ _] (p/delete-branch! parent fork-branch) nil))
+
 (defrecord GitSystem [repo-path worktrees-dir current-branch
                       system-name watcher-state branch-locks]
   p/SystemIdentity
   (system-id [_] (or system-name (str "git:" repo-path)))
   (system-type [_] :git)
   (capabilities [_]
-    (t/->Capabilities true true true true false true true true true))
+    (t/->Capabilities true true true true true true true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -327,6 +355,17 @@
         (git wt "commit" "-m" (or message "") "--allow-empty"))
       this))
 
+  p/Overlayable
+  ;; native worktree branch fork: branch+checkout a fresh overlay branch (its own
+  ;; worktree) as the writable system; `merge-down!` merges it back, `discard!`
+  ;; deletes branch + worktree.
+  (overlay [this _opts]
+    (let [pbranch (p/current-branch this)
+          fbranch (keyword (str "overlay-" (random-uuid)))
+          forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
+      ;; :following degrades to :frozen for git (honest fallback).
+      (->GitOverlay this (atom forked) fbranch pbranch :frozen)))
+
   p/GarbageCollectable
   (gc-roots [_]
     ;; All branch HEADs are GC roots
@@ -414,3 +453,20 @@
                    (if (try (p/delete-branch! git-sys b) true (catch Throwable _ false))
                      (conj acc b) acc))
                  []))))
+
+;; Register Git with the system value codec — the EXTERNAL-system flavor. There is no
+;; konserve store and no PSS: the data lives in the git repo. So the serialized form is
+;; the external IDENTITY (repo-path + branch), and reconstruct RECONNECTS via `create`
+;; (fresh watcher-state + branch-locks). resolve-storage is unused (the ref is self-
+;; contained); a RELOCATABLE repo-path would resolve through the fn-registry, the
+;; external analog of PSS's storage-id. The same shape fits iceberg/zfs/btrfs/ipfs/…:
+;; project the external snapshot ref + identity, reconstruct reconnects.
+(yf/register-system!
+ :git GitSystem
+ (fn [{:keys [repo-path worktrees-dir current-branch system-name]}]
+   {:repo-path repo-path :worktrees-dir worktrees-dir
+    :current-branch current-branch :system-name system-name})
+ (fn [blob _storage _opts]
+   (create (:repo-path blob) {:worktrees-dir  (:worktrees-dir blob)
+                              :initial-branch (:current-branch blob)
+                              :system-name    (:system-name blob)})))
