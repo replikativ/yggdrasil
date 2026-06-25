@@ -334,15 +334,15 @@
   (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
   (as-of [_ snap-id opts]
     (let [opts (merge c/default-opts opts)]   ; opts may be a DOMAIN map without :sync?
-     (async+sync (:sync? opts)
-                (async
-                 (if-let [sub-snaps (resolve-sub-snapshots index-atom snap-id)]
-                   (loop [ss (seq systems) acc {}]
-                     (if ss
-                       (let [[sid sys] (first ss)]
-                         (recur (next ss) (assoc acc sid (await (p/as-of sys (get sub-snaps sid))))))
-                       acc))
-                   nil)))))
+      (async+sync (:sync? opts)
+                  (async
+                   (if-let [sub-snaps (resolve-sub-snapshots index-atom snap-id)]
+                     (loop [ss (seq systems) acc {}]
+                       (if ss
+                         (let [[sid sys] (first ss)]
+                           (recur (next ss) (assoc acc sid (await (p/as-of sys (get sub-snaps sid))))))
+                         acc))
+                     nil)))))
 
   (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id c/default-opts))
   (snapshot-meta [_ snap-id _opts]
@@ -391,48 +391,48 @@
   (commit! [this message] (p/commit! this message c/default-opts))
   (commit! [this message opts]
     (let [opts (merge c/default-opts opts)]
-     (async+sync (:sync? opts)
-                (async
-                 (let [old-snap (await (composite-snapshot-id systems opts))
-                       new-systems (loop [ss (seq systems) acc {}]
+      (async+sync (:sync? opts)
+                  (async
+                   (let [old-snap (await (composite-snapshot-id systems opts))
+                         new-systems (loop [ss (seq systems) acc {}]
+                                       (if ss
+                                         (let [[sid sys] (first ss)]
+                                           (recur (next ss)
+                                                  (assoc acc sid (if (satisfies? p/Committable sys)
+                                                                   (await (p/commit! sys message))
+                                                                   sys))))
+                                         acc))
+                         new-snap (await (composite-snapshot-id new-systems opts))
+                         sub-snaps (loop [ss (seq new-systems) acc {}]
                                      (if ss
                                        (let [[sid sys] (first ss)]
-                                         (recur (next ss)
-                                                (assoc acc sid (if (satisfies? p/Committable sys)
-                                                                 (await (p/commit! sys message))
-                                                                 sys))))
-                                       acc))
-                       new-snap (await (composite-snapshot-id new-systems opts))
-                       sub-snaps (loop [ss (seq new-systems) acc {}]
-                                   (if ss
-                                     (let [[sid sys] (first ss)]
-                                       (recur (next ss) (assoc acc sid (await (p/snapshot-id sys)))))
-                                     acc))]
-                   (swap! index-atom assoc (str new-snap)
-                          {:composite-snap-id (str new-snap)
-                           :parent-ids #{(str old-snap)}
-                           :timestamp (t/now-ms)
-                           :message message
-                           :sub-snapshots sub-snaps})
-                   (await (persist-index! kv-store storage index-atom opts))
-                   (assoc this :systems new-systems))))))
+                                         (recur (next ss) (assoc acc sid (await (p/snapshot-id sys)))))
+                                       acc))]
+                     (swap! index-atom assoc (str new-snap)
+                            {:composite-snap-id (str new-snap)
+                             :parent-ids #{(str old-snap)}
+                             :timestamp (t/now-ms)
+                             :message message
+                             :sub-snapshots sub-snaps})
+                     (await (persist-index! kv-store storage index-atom opts))
+                     (assoc this :systems new-systems))))))
 
   p/Graphable
   (history [this] (p/history this c/default-opts))
   (history [_ hopts]
     (let [hopts (merge c/default-opts hopts)]
-     (async+sync (:sync? hopts)
-                (async
-                 (let [limit (or (:limit hopts) 100)]
-                   (loop [snap-id (await (composite-snapshot-id systems hopts)) result [] visited #{}]
-                     (cond
-                       (visited snap-id) result
-                       (nil? snap-id) result
-                       (>= (count result) limit) result
-                       :else
-                       (let [entry (lookup-entry index-atom snap-id)
-                             parents (or (:parent-ids entry) #{})]
-                         (recur (first parents) (conj result snap-id) (conj visited snap-id))))))))))
+      (async+sync (:sync? hopts)
+                  (async
+                   (let [limit (or (:limit hopts) 100)]
+                     (loop [snap-id (await (composite-snapshot-id systems hopts)) result [] visited #{}]
+                       (cond
+                         (visited snap-id) result
+                         (nil? snap-id) result
+                         (>= (count result) limit) result
+                         :else
+                         (let [entry (lookup-entry index-atom snap-id)
+                               parents (or (:parent-ids entry) #{})]
+                           (recur (first parents) (conj result snap-id) (conj visited snap-id))))))))))
 
   (ancestors [this snap-id] (p/ancestors this snap-id c/default-opts))
   (ancestors [_ snap-id _opts]
@@ -468,18 +468,18 @@
   (commit-graph [this] (p/commit-graph this c/default-opts))
   (commit-graph [_ opts]
     (let [opts (merge c/default-opts opts)]
-     (async+sync (:sync? opts)
-                (async
-                 (let [entries (vals @index-atom)
-                       cur (await (composite-snapshot-id systems opts))]
-                   {:nodes (into {}
-                                 (map (fn [e]
-                                        [(:composite-snap-id e)
-                                         {:parent-ids (:parent-ids e)
-                                          :meta {:timestamp (:timestamp e) :message (:message e)}}]))
-                                 entries)
-                    :branches {current-branch-name cur}
-                    :roots (set (keep (fn [e] (when (empty? (or (:parent-ids e) #{})) (:composite-snap-id e))) entries))})))))
+      (async+sync (:sync? opts)
+                  (async
+                   (let [entries (vals @index-atom)
+                         cur (await (composite-snapshot-id systems opts))]
+                     {:nodes (into {}
+                                   (map (fn [e]
+                                          [(:composite-snap-id e)
+                                           {:parent-ids (:parent-ids e)
+                                            :meta {:timestamp (:timestamp e) :message (:message e)}}]))
+                                   entries)
+                      :branches {current-branch-name cur}
+                      :roots (set (keep (fn [e] (when (empty? (or (:parent-ids e) #{})) (:composite-snap-id e))) entries))})))))
 
   (commit-info [this snap-id] (p/commit-info this snap-id c/default-opts))
   (commit-info [_ snap-id _opts]
@@ -498,16 +498,16 @@
     ;; DOMAIN merge map (e.g. {:message}) that may omit :sync? — fill the platform
     ;; default so the mode threads to the sub-merges + commit!.
     (let [mopts (merge c/default-opts mopts)]
-     (async+sync (:sync? mopts)
-                (async
-                 (let [new-systems (loop [ss (seq systems) acc {}]
-                                     (if ss
-                                       (let [[sid sys] (first ss)]
-                                         (recur (next ss) (assoc acc sid (await (p/merge! sys source mopts)))))
-                                       acc))]
-                   (await (p/commit! (assoc this :systems new-systems)
-                                     (or (and (map? mopts) (:message mopts)) "merge")
-                                     mopts)))))))
+      (async+sync (:sync? mopts)
+                  (async
+                   (let [new-systems (loop [ss (seq systems) acc {}]
+                                       (if ss
+                                         (let [[sid sys] (first ss)]
+                                           (recur (next ss) (assoc acc sid (await (p/merge! sys source mopts)))))
+                                         acc))]
+                     (await (p/commit! (assoc this :systems new-systems)
+                                       (or (and (map? mopts) (:message mopts)) "merge")
+                                       mopts)))))))
 
   (conflicts [this a b] (p/conflicts this a b c/default-opts))
   (conflicts [_ a b copts]

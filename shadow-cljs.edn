@@ -3,4 +3,6 @@
  {:test {:target    :node-test
          :output-to "target/node-tests.js"
          :ns-regexp "-test$"
+         ;; quiet konserve's per-op :trace logging (floods the durable suite)
+         :init-fn   yggdrasil.test-init/init!
          :compiler-options {:optimizations :none}}}}

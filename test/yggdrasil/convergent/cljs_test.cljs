@@ -4,7 +4,7 @@
    over konserve, async on cljs) and proven on node by their own durable_*_test
    ns; this file just (a) forces cljs compilation of the storage/registry/
    composite/workspace layer and (b) covers LWWR, the one in-memory (sync) CRDT."
-  (:require [cljs.test :refer-macros [deftest is testing run-tests]]
+  (:require [cljs.test :as t :refer-macros [deftest is testing run-tests]]
             ;; force cljs compilation of the cross-platform storage + index layer
             [yggdrasil.storage]
             [yggdrasil.registry]
@@ -22,6 +22,11 @@
     (is (contains? #{:a :b} (lwwr/value (c/-join a b))))
     (is (= (lwwr/value (c/-join a b)) (lwwr/value (c/-join b a))))
     (is (true? (c/-conflict-free? a)))))
+
+;; node won't self-terminate after run-tests; exit with the test status so the
+;; CI runner (and a local `clojure -M:cljs-test`) returns a real exit code.
+(defmethod t/report [:cljs.test/default :end-run-tests] [m]
+  (js/process.exit (if (t/successful? m) 0 1)))
 
 (defn -main [& _]
   (run-tests))

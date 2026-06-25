@@ -38,7 +38,7 @@
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.cdvcs.commit :as core]
+            [yggdrasil.convergent.cdvcs.builder :as builder]
             [yggdrasil.convergent.cdvcs.graph-store :as gs]
             [yggdrasil.kbridge :as kb]
             [clojure.set :as set]
@@ -126,7 +126,7 @@
                   (when (not= 1 (count heads))
                     (throw (ex-info "CDVCS has multiple heads — merge before committing."
                                     {:type :multiple-heads :heads heads})))
-                  (let [{:keys [id value]} (core/make-commit author (vec heads) transactions)
+                  (let [{:keys [id value]} (builder/make-commit author (vec heads) transactions)
                         graph' (await (d/set-conj (:graph cd) [id value] graph-cmp opts))]
                     ;; accrue the OP δ — the FULL self-contained commit {:id :value}
                     ;; (the value carries :parents), so a peer applies it directly
@@ -148,7 +148,7 @@
                (async
                 (let [merged    (await (d/set-union (:graph cd) (:graph remote) graph-cmp opts))
                       all-heads (vec (set/union (:heads (:state cd)) (:heads (:state remote))))
-                      {:keys [id value]} (core/make-commit author all-heads correcting-transactions)
+                      {:keys [id value]} (builder/make-commit author all-heads correcting-transactions)
                       graph'    (await (d/set-conj merged [id value] graph-cmp opts))]
                   ;; the δ carries BOTH the merge commit AND the remote's commits we
                   ;; just unioned in (so a peer that has neither converges from the δ
@@ -381,24 +381,24 @@
   ;; platform default so the mode threads downstream (flush!/d/gc!).
   (gc-sweep! [this snapshot-ids gc-opts]
     (let [gc-opts (clojure.core/merge c/default-opts gc-opts)]   ; `merge` is the CDVCS verb here
-     (async+sync (:sync? gc-opts)
-                (async
-                 (await (flush! this gc-opts))
+      (async+sync (:sync? gc-opts)
+                  (async
+                   (await (flush! this gc-opts))
                  ;; reachable = the graph PSS nodes (walked from the live root + each
                  ;; retained snapshot's graph root — the commit values ride INSIDE
                  ;; those nodes, no separate blobs) ∪ the snapshot blobs ∪ the pointer
                  ;; cells. The cutoff rides in `gc-opts`.
-                 (let [snap-addrs (mapv #(parse-uuid (str %)) snapshot-ids)
-                       snap-roots (loop [as (seq snap-addrs) roots []]
-                                    (if as
-                                      (let [snap (await (d/read-commit kv-store (first as) gc-opts))]
-                                        (recur (next as) (conj roots (:graph snap))))
-                                      roots))
-                       graph-root (await (d/store-set! graph storage gc-opts))]
-                   (await (d/gc! kv-store (cons graph-root snap-roots) (graph-config config)
-                                 (clojure.core/merge gc-opts
-                                                     {:spare-keys [(gk config) (gfk config) (sk config)]
-                                                      :retain-keys (vec snap-addrs)})))))))))
+                   (let [snap-addrs (mapv #(parse-uuid (str %)) snapshot-ids)
+                         snap-roots (loop [as (seq snap-addrs) roots []]
+                                      (if as
+                                        (let [snap (await (d/read-commit kv-store (first as) gc-opts))]
+                                          (recur (next as) (conj roots (:graph snap))))
+                                        roots))
+                         graph-root (await (d/store-set! graph storage gc-opts))]
+                     (await (d/gc! kv-store (cons graph-root snap-roots) (graph-config config)
+                                   (clojure.core/merge gc-opts
+                                                       {:spare-keys [(gk config) (gfk config) (sk config)]
+                                                        :retain-keys (vec snap-addrs)})))))))))
 
 (defn flush!
   "Persist the graph PSS (convergent roots write) + the {:heads :version} cache cell.
@@ -447,7 +447,7 @@
                         st    (await (kb/k-get kv-store (sk cell-config) open-opts))]
                     (if st
                       (->CDVCS id kv-store store-config storage graph st false cell-config)
-                      (let [{bid :id value :value} (core/new-base author)
+                      (let [{bid :id value :value} (builder/new-base author)
                             graph' (await (d/set-conj graph [bid value] graph-cmp open-opts))
                             state  {:heads #{bid} :version 1}]
                         (await (save-graph! kv-store graph' storage cell-config open-opts))

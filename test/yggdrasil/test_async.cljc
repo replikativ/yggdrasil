@@ -91,16 +91,31 @@
   (if (cljs-env? &env)
     `(cljs.test/deftest ~tname
        (cljs.test/async done#
-                        ((is.simm.partial-cps.async/async
-                          (try ~@body
-                               (catch :default e#
-                                 (cljs.test/is false (str "deftest-async threw: "
-                                                          (or (.-message e#) e#) "\n"
-                                                          (.-stack e#))))))
-                         (fn [_#] (done#))
-                         (fn [e#]
-                           (cljs.test/is false (str "deftest-async rejected: "
-                                                    (or (.-message e#) e#) "\n"
-                                                    (when (and e# (.-stack e#)) (.-stack e#))))
-                           (done#)))))
+                        ;; `cljs.test/run-block` chains the NEXT test block synchronously
+                        ;; through this `done` continuation (its `@d`). When our blocks
+                        ;; resolve synchronously (in-memory store), `done#` fires from
+                        ;; INSIDE this block's partial-cps trampoline, where
+                        ;; `*in-trampoline*` is true — so the next block would enter as a
+                        ;; fresh top-level async invocation but skip establishing its own
+                        ;; forcing loop, and run-block discards the Thunk it returns →
+                        ;; dropped continuation → hang. Reset `*in-trampoline*` to false at
+                        ;; this boundary (we are handing control back to a foreign driver)
+                        ;; so the next block self-trampolines. (partial-cps contract: a
+                        ;; foreign caller must either trampoline the returned Thunk or
+                        ;; invoke with `*in-trampoline*` false.)
+                        (let [done!# (fn []
+                                       (binding [is.simm.partial-cps.async/*in-trampoline* false]
+                                         (done#)))]
+                          ((is.simm.partial-cps.async/async
+                            (try ~@body
+                                 (catch :default e#
+                                   (cljs.test/is false (str "deftest-async threw: "
+                                                            (or (.-message e#) e#) "\n"
+                                                            (.-stack e#))))))
+                           (fn [_#] (done!#))
+                           (fn [e#]
+                             (cljs.test/is false (str "deftest-async rejected: "
+                                                      (or (.-message e#) e#) "\n"
+                                                      (when (and e# (.-stack e#)) (.-stack e#))))
+                             (done!#))))))
     `(clojure.test/deftest ~tname ~@body)))

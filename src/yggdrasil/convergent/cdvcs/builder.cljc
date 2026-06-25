@@ -1,8 +1,13 @@
-(ns ^:no-doc yggdrasil.convergent.cdvcs.commit
+(ns ^:no-doc yggdrasil.convergent.cdvcs.builder
   "The PRODUCTION commit builders the durable CDVCS wrapper (`yggdrasil.convergent.cdvcs`)
    needs: a content-addressed commit value + the canonical shared base. Pure, tiny, and
    store-free — the rest of the value-level CDVCS algebra (the pure `graph`/`core`
-   reference) lives in the TEST tree as a correctness oracle, not in the shipped library."
+   reference) lives in the TEST tree as a correctness oracle, not in the shipped library.
+
+   NAMED `builder`, NOT `commit`: a child ns `…cdvcs.commit` munges to the SAME
+   ClojureScript JS path as the parent's `commit` VAR (`cdvcs/commit` → `…cdvcs.commit`),
+   so on cljs the var assignment CLOBBERS the namespace object (vars + namespaces share
+   one JS object graph) — wiping `make-commit`/`new-base`. Keep this name var-collision-free."
   (:require [hasch.core :as hasch]
             [yggdrasil.types :as t]))
 
