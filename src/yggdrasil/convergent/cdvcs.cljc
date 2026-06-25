@@ -293,7 +293,7 @@
 
 (defrecord CDVCS
            [id kv-store store-config storage
-            graph     ; grow-only PSS of [id parents] — the convergent commit-graph
+            graph     ; grow-only PSS of [id value] (commit value inlined) — the convergent commit-graph
             state     ; {:heads #{id} :version n} — the DERIVED frontier cache
             dirty     ; unflushed graph/state?
             config]   ; DOMAIN: {:graph-key :state-key …}

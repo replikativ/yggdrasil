@@ -24,14 +24,19 @@ This document is the catalog. For CDVCS specifically see
   carries what to build — `:store-config`, `:comparator`, `:branch`, `:kv-store`,
   `:roots-key`/`:freed-key`, element handlers, `:author`/`:state-key` (cdvcs), …; the
   RUNTIME map (`opts`, 3rd arg) carries ONLY the execution mode `:sync?`. So `opts`
-  never holds store/domain arguments. All three arities exist: `(ctor id)`,
-  `(ctor id config)`, `(ctor id config opts)`.
+  never holds store/domain arguments. The storage-backed constructors take all three
+  arities — `(ctor id)`, `(ctor id config)`, `(ctor id config opts)` — except `lwwr`
+  (in-memory: `(lwwr id)` / `(lwwr id {:branch :init})`, no `opts`) and `merging-ormap`
+  (the fold shifts it to `(merging-ormap id merge-fn config opts)`). NOTE: `:sync?` is
+  ALSO a PER-CALL choice on every op (it is NOT stamped on the record); the
+  constructor's `opts` only opens the store — see the sync bullet below.
 - **Memory = a memory-backed store.** Constructing a CRDT without a `:store-config`
   defaults to a fresh in-memory konserve store. There is no separate "in-memory"
   implementation — the memory variant is the durable one over a memory store.
 - **Cross-platform via `async+sync`.** Every storage-touching op is written once and
   the macro emits a synchronous body (returns values) or a partial-cps continuation you
-  `await`, per the record's sync-mode in `opts` (`{:sync? true|false}`). `:sync? true`
+  `await`, per the PER-CALL `opts` (`{:sync? true|false}`, default `c/default-opts` —
+  sync on JVM, async on cljs; the record carries no sync-mode). `:sync? true`
   works on the JVM **and on ClojureScript over a synchronous konserve backend (memory or
   node filestore)** — reads stay on-the-fly even synchronously (a key read is an O(log n)
   range slice). Only a browser **IndexedDB** store has no synchronous konserve API, so
@@ -128,7 +133,8 @@ conflict. `merge` resolves heads into one via a merge commit. `-conflict-free?` 
 `false`. Git-like verbs. See [cdvcs-convergent-system.md](cdvcs-convergent-system.md).
 
 Like the other CRDTs it is **bounded-resident**: the commit-graph is a grow-only PSS
-of `[id parents]` (read on the fly — a parent lookup is an O(log n) slice), and only
+of `[id value]` entries (the commit value inlined; `parents-of` slices the entry and
+reads the value's `:parents` on the fly — an O(log n) slice), and only
 the derived `:heads` (frontier) + `:version` stay in the record. The graph's roots
 cell is the convergent source of truth (grow-map merge ⇒ peers converge on one
 content-hash root); `:heads` is a cache that `-join` recomputes. `commit`/`merge`

@@ -70,7 +70,7 @@ Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.repli
 
 ## Public API
 
-These are the supported namespaces. **Everything else under `yggdrasil.*` is implementation detail and may change between releases** (marked `^:no-doc`): the storage/serialization plumbing (`storage`, `fressian`, `kbridge`, `fn-registry`, `macros`), the durable backing (`convergent.durable`, `convergent.overlay`, `convergent.composite`, `convergent.cdvcs.{commit,graph-store}`).
+These are the supported namespaces. **Everything else under `yggdrasil.*` is implementation detail and may change between releases** (marked `^:no-doc`): the storage/serialization plumbing (`storage`, `fressian`, `kbridge`, `fn-registry`, `macros`) and the durable backing (`convergent.durable`, `convergent.overlay`, `convergent.cdvcs.{commit,graph-store}`).
 
 **Core**
 - `yggdrasil.protocols` — the CoW memory-model protocols every system implements (Snapshotable, Branchable, Graphable, Mergeable, Overlayable, Watchable, GarbageCollectable, …).
@@ -186,18 +186,20 @@ These are the supported namespaces. **Everything else under `yggdrasil.*` is imp
 
 | Adapter | Snapshot | Branch | Graph | Merge | Overlay | Watch | GC | Addressable | Committable |
 |---------|----------|--------|-------|-------|---------|-------|----|-------------|-------------|
-| Git | commits | branches (worktrees) | full DAG | 3-way | - | poll | yes | yes | yes |
+| Git | commits | branches (worktrees) | full DAG | 3-way | worktree fork | poll | yes | yes | yes |
 | ZFS | snapshots | clones | linear | - | - | poll | yes | yes | yes |
 | Btrfs | ro snapshots | subvolumes | full DAG | file-level | - | poll | yes | yes | yes |
 | IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes | - | yes |
 | Iceberg | snapshots | branches | full DAG | manual | - | poll | yes | - | yes |
-| Datahike | commit-id | branch! | full DAG | merge! | - | listen | yes | - | - |
+| Datahike | commit-id | branch! | full DAG | merge! | branch fork | via hooks¹ | yes | - | - |
 | Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes | yes | yes |
 | OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes | yes | yes |
 | Podman | image layers | containers | full DAG | diff+apply | - | poll | yes | - | yes |
 | LakeFS | commits | branches | full DAG | 3-way | - | poll | yes | - | yes |
 | Dolt | commits | branches | full DAG | 3-way | - | poll | yes | yes | yes |
 | **Composite** | composite UUID | intersection | composite DAG | per-system | - | - | union | - | delegates |
+
+¹ Datahike does not implement the `Watchable` protocol; commit notification is delivered through `yggdrasil.hooks/install-commit-hook!` (`d/listen` under the hood), a separate mechanism from the `Watchable` capability.
 
 ### Git Adapter
 
@@ -676,15 +678,16 @@ The `yggdrasil.composite` namespace provides a `CompositeSystem` that wraps N su
 (require '[yggdrasil.composite :as composite])
 (require '[yggdrasil.protocols :as p])
 
-;; Strict: all sub-systems must be on the same branch
+;; Strict: all sub-systems must be on the same branch.
+;; `config` is a MAP (2nd positional arg), `opts` an optional 3rd: (subs config opts).
 (def sys (composite/pullback [git-sys db-sys]
-           :name "my-workspace"))
+           {:name "my-workspace"}))
 
 ;; Lenient: sub-systems may have different native branch names
 ;; (e.g. datahike defaults to :db, scriptum to "main")
 (def sys (composite/composite [dh-sys sc-sys]
-           :name "briefkasten"
-           :branch :main))
+           {:name "briefkasten"
+            :branch :main}))
 
 ;; All protocol operations coordinate across sub-systems
 (p/system-id sys)        ;; => "my-workspace"
@@ -711,11 +714,11 @@ By default, composite history is ephemeral (in-memory only). Pass `:store-config
 ```clojure
 ;; Create a persistent composite — history survives process restarts
 (def sys (composite/composite [dh-sys sc-sys]
-           :name "briefkasten"
-           :branch :main
-           :store-config {:backend :file
-                          :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-                          :path "/var/lib/myapp/composite"}))
+           {:name "briefkasten"
+            :branch :main
+            :store-config {:backend :file
+                           :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                           :path "/var/lib/myapp/composite"}}))
 
 ;; Commit as usual — index is persisted on every commit
 (def c1 (p/commit! sys "sync checkpoint"))
@@ -727,11 +730,11 @@ By default, composite history is ephemeral (in-memory only). Pass `:store-config
 ;; On restart: reopen sub-systems, create composite with same :store-config
 ;; History, commit-graph, commit-info all restored from disk
 (def sys2 (composite/composite [dh-sys2 sc-sys2]
-            :name "briefkasten"
-            :branch :main
-            :store-config {:backend :file
-                           :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-                           :path "/var/lib/myapp/composite"}))
+            {:name "briefkasten"
+             :branch :main
+             :store-config {:backend :file
+                            :id #uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                            :path "/var/lib/myapp/composite"}}))
 (p/history sys2)  ;; => full history chain including c1, c2
 ```
 
@@ -739,12 +742,14 @@ The PSS index stores entries sorted by composite snapshot ID with lazy-loading f
 
 ### Constructors
 
+Both take `(subs config opts)` — `config` is a MAP (`{:name :branch :store-config}`), `opts` an optional `{:sync?}`.
+
 | Function | Branch check | Use case |
 |----------|-------------|----------|
-| `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `:branch` to override | Systems with matching branch names |
-| `composite` | None — accepts explicit `:branch` (default `:main`) | Systems with different branch naming conventions |
+| `pullback` | Strict — all sub-systems must report same `current-branch`, or pass `{:branch …}` to override | Systems with matching branch names |
+| `composite` | None — accepts `{:branch …}` in config (default `:main`) | Systems with different branch naming conventions |
 
-Both constructors accept `:store-config` for persistent history (any konserve backend).
+Both constructors accept `{:store-config …}` in their config map for persistent history (any konserve backend).
 
 ### Aggregation strategies
 
@@ -945,12 +950,12 @@ src/yggdrasil/
   watcher.clj          # Polling watcher infrastructure
   compose.cljc         # Multi-system overlay lifecycle
   compliance.clj       # Protocol compliance test suite
-  workspace.clj        # Multi-system workspace with HLC coordination
-  registry.clj         # Snapshot registry (PSS index in konserve)
-  storage.clj          # IStorage for PSS B-tree nodes (any konserve backend)
+  workspace.cljc       # Multi-system workspace with HLC coordination
+  registry.cljc        # Snapshot registry (PSS index in konserve)
+  storage.cljc         # IStorage for PSS B-tree nodes (any konserve backend)
   gc.clj               # Coordinated cross-system garbage collection
   hooks.clj            # Extension point for adapter-specific commit hooks
-  composite.clj        # CompositeSystem — pullback over shared branch space
+  composite.cljc       # CompositeSystem — pullback over shared branch space
   adapters/
     git.clj            # Git adapter (worktree-based)
     ipfs.clj           # IPFS adapter (P2P content-addressed)
