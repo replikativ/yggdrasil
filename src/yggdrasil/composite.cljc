@@ -742,3 +742,54 @@
       (->CompositeSystem (:systems blob) (:current-branch-name blob) (:composite-name blob)
                          (atom {}) (when storage (:kv-store storage)) (:store-config blob)
                          storage))))
+
+;; ============================================================
+;; CompositeSystem as a CONVERGENT system (peer-mergeable)
+;; ============================================================
+;; Make a CompositeSystem itself conflict-free-mergeable: joining two PEER composites
+;; fans `-join` out to matching sub-systems — convergent subs `-join` (symmetric, no
+;; ancestor), versioned (datahike/git) subs 3-way `merge!` on the shared branch.
+;; "Merge peers" with NO new interface: merging two contexts IS merging their two
+;; workspace composites via the existing `PConvergent`/`-join`. (Lives HERE, with the
+;; CompositeSystem defrecord, so the extension is ALWAYS present in production — a
+;; separate ns would only be loaded if a consumer happened to require it.)
+;;
+;; The composite is a STATE container with NO op-δ: a δ is the change a LOCAL mutation
+;; made, but a composite isn't mutated directly — you mutate a SUB (which returns a new
+;; δ-carrying record the composite doesn't capture). The OP path is therefore per-LEAF
+;; (sync each sub as its own ygg-signal); forcing an aggregate δ onto the composite
+;; would be a duplication against the grain.
+(extend-type CompositeSystem
+  c/PConvergent
+  (-join
+    ([this other] (c/-join this other c/default-opts))
+    ([this other opts]
+     (let [others (:systems other)
+           joined (reduce
+                   (fn [m [id sys]]
+                     (let [o (get others id)]
+                       (assoc m id
+                              (cond
+                                (nil? o) sys                          ; system only on `this`
+                                (c/convergent? sys) (c/-join sys o opts) ; CRDT: symmetric 2-way join
+                               ;; versioned (datahike/git): 3-way merge — merge `other`'s
+                               ;; branch into `this`'s on the shared store; conflicts surface
+                               ;; via the composite's `conflicts` (the merge-review seam), not
+                               ;; auto-resolved here. Needs a resolvable common ancestor.
+                                (satisfies? p/Mergeable sys)
+                                (-> sys
+                                    (p/checkout (p/current-branch sys))
+                                    (p/merge! (p/current-branch o) opts))
+                                :else sys))))
+                   {} (:systems this))]
+       ;; IDEMPOTENCE: when every sub-join changed nothing (each returns the SAME sub),
+       ;; the composite is unchanged → return `this` identical, so a composite-valued
+       ;; signal doesn't re-fire / re-publish on a no-op.
+       (if (= joined (:systems this))
+         this
+         (composite (vec (vals joined))
+                    {:name (:composite-name this)
+                     :branch (:current-branch-name this)}
+                    opts)))))
+  (-conflict-free? [this]
+    (every? c/convergent? (vals (:systems this)))))

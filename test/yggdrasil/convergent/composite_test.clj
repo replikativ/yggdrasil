@@ -4,8 +4,7 @@
   (:require [clojure.test :refer [deftest testing is]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
-            [yggdrasil.composite :as comp]
-            [yggdrasil.convergent.composite]
+            [yggdrasil.composite :as comp]   ; the CompositeSystem `-join` extension lives here now
             [yggdrasil.convergent.gset :as g]))
 
 ;; A minimal VERSIONED (non-convergent) system fixture: a register on a shared

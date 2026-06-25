@@ -9,11 +9,10 @@
   (:require [cljs.test :refer-macros [deftest is async]]
             [cljs.core.async :as a :refer [go <!]]
             [yggdrasil.protocols :as p]
+            ;; the CompositeSystem `-join` extension lives in yggdrasil.composite now
+            ;; (logic proven on JVM by composite-test). TODO: a cljs peer -join
+            ;; assertion (PARITY gap).
             [yggdrasil.composite :as cmp]
-            ;; compile-verify the ported convergent composite -join on cljs
-            ;; (extends CompositeSystem with PConvergent; logic proven on JVM by
-            ;; composite-test). TODO: a cljs peer -join assertion (PARITY gap).
-            [yggdrasil.convergent.composite]
             [yggdrasil.convergent.gset :as g]))
 
 (defn- realize [cps]
