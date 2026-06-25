@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.overlay
+(ns ^:no-doc yggdrasil.convergent.overlay
   "`Overlayable` for convergent (CRDT) systems — the UNIFORM isolate primitive.
 
    `overlay` clones the system with fresh mutable state at its current value; you

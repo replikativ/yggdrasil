@@ -1,4 +1,4 @@
-(ns yggdrasil.kbridge
+(ns ^:no-doc yggdrasil.kbridge
   "Bridge konserve to partial-cps `await` for the storage layer's `async+sync`.
 
    `k-get`/`k-assoc`/`k-dissoc` dispatch on `:sync?`:

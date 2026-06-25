@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.durable
+(ns ^:no-doc yggdrasil.convergent.durable
   "Reusable DURABLE backing for conflict-free systems — the registry's
    PSS+konserve+root-cell+reachability pattern, lifted out so the catalog can
    share it.

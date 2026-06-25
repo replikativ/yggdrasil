@@ -1,4 +1,4 @@
-(ns yggdrasil.storage
+(ns ^:no-doc yggdrasil.storage
   "Persistent storage layer for the convergent CRDT catalog + snapshot registry —
    cross-platform.
 

@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.cdvcs.commit
+(ns ^:no-doc yggdrasil.convergent.cdvcs.commit
   "The PRODUCTION commit builders the durable CDVCS wrapper (`yggdrasil.convergent.cdvcs`)
    needs: a content-addressed commit value + the canonical shared base. Pure, tiny, and
    store-free — the rest of the value-level CDVCS algebra (the pure `graph`/`core`

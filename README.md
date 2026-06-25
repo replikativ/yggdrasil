@@ -68,6 +68,35 @@ Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.repli
 
 > **Note:** A Python binding (`py/`) exists with protocol definitions and types, but it has not been updated since the initial release and is missing newer protocols (GarbageCollectable, Addressable, Committable) and coordination features (workspace, registry, composite). Use it as a reference, not a production dependency.
 
+## Public API
+
+These are the supported namespaces. **Everything else under `yggdrasil.*` is implementation detail and may change between releases** (marked `^:no-doc`): the storage/serialization plumbing (`storage`, `fressian`, `kbridge`, `fn-registry`, `macros`), the durable backing (`convergent.durable`, `convergent.overlay`, `convergent.composite`, `convergent.cdvcs.{commit,graph-store}`).
+
+**Core**
+- `yggdrasil.protocols` — the CoW memory-model protocols every system implements (Snapshotable, Branchable, Graphable, Mergeable, Overlayable, Watchable, GarbageCollectable, …).
+- `yggdrasil.types` — shared value types: `SnapshotRef`, `HLC`, `Conflict`, `RegistryEntry`, + HLC helpers.
+- `yggdrasil.convergent` — the conflict-free convergent merge law (`join`): symmetric, no-ancestor CRDT merge of peer replicas.
+
+**Convergent (CRDT) catalog** — each a durable yggdrasil system
+- `yggdrasil.convergent.gset` (`gset`) · `…orset` (`orset`) · `…twopset` (`twopset`) · `…ormap` (`ormap`/`merging-ormap`) · `…lwwr` (`lwwr`) · `…cdvcs` (`cdvcs`)
+- `yggdrasil.convergent.system` — build your own CRDT-as-system (`conflict-free-system`).
+
+**Composition & orchestration**
+- `yggdrasil.composite` — pullback of N sub-systems as one logical system (`composite`/`pullback`).
+- `yggdrasil.compose` — mechanical multi-system commit/discard helpers.
+- `yggdrasil.workspace` — HLC-coordinated multi-system workspace + ref management.
+- `yggdrasil.registry` — cross-system snapshot registry (a durable 2P-Set lens).
+- `yggdrasil.gc` — coordinated garbage collection across systems.
+- `yggdrasil.migrate` — on-disk store migration between yggdrasil versions.
+
+**Adapters** (pick a backend; call its `create` / `init!`)
+- `yggdrasil.adapters.{datahike, git, dolt, lakefs, iceberg, ipfs, btrfs, zfs, overlayfs, podman}`
+
+**Extension points** (for new backends)
+- `yggdrasil.protocols` + `yggdrasil.hooks` — implement the protocols + commit hooks.
+- `yggdrasil.compliance` — run the protocol conformance suite against your adapter (`run-compliance-tests`).
+- Advanced cross-platform adapters also use `yggdrasil.macros/async+sync` and the `yggdrasil.convergent.system` toolkit (documented here in prose rather than the generated API index).
+
 ## Protocol Layers
 
 | Layer | Protocol | Purpose |

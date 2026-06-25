@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.composite
+(ns ^:no-doc yggdrasil.convergent.composite
   "Make a CompositeSystem itself conflict-free-mergeable: joining two PEER
    workspaces fans `-join` out to matching sub-systems. This is \"merge peers\"
    with NO new interface and NO parent — merging two contexts is merging their

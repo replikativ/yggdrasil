@@ -1,4 +1,4 @@
-(ns yggdrasil.fn-registry
+(ns ^:no-doc yggdrasil.fn-registry
   "Named behavioral functions a system carries but CANNOT serialize — an OR-Set's
    `tag-fn`, a merging-OR-Map's `merge-fn` (and, later, an adapter's connection
    resolver). A function is not a value; you can ship its NAME, not its code.

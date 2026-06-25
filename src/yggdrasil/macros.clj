@@ -1,4 +1,4 @@
-(ns yggdrasil.macros
+(ns ^:no-doc yggdrasil.macros
   "Sync/async duality for the konserve-backed storage layer, via partial-cps —
    the same substrate spindel and persistent-sorted-set use (so a yggdrasil
    storage op is `await`-able inside a spin, with value semantics + no channel

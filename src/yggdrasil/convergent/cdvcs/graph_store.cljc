@@ -1,4 +1,4 @@
-(ns yggdrasil.convergent.cdvcs.graph-store
+(ns ^:no-doc yggdrasil.convergent.cdvcs.graph-store
   "Store-backed (`async+sync`) commit-graph algebra — the SAME LCA / frontier /
    history algorithms as the pure `cdvcs.graph`, but a commit's parents are read
    through an injected accessor `parents-of : id -> (async parents-or-nil)` instead

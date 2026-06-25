@@ -1,4 +1,4 @@
-(ns yggdrasil.fressian
+(ns ^:no-doc yggdrasil.fressian
   "Optional Fressian handlers that serialize a yggdrasil SYSTEM **as a value**, the
    way persistent-sorted-set serializes a set: the plain-data fields are written
    verbatim and every PSS-backed field is written as its content-addressed ROOT
