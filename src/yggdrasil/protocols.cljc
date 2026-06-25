@@ -17,7 +17,39 @@
     4. Mergeable           - combine lineages (value-semantic)
     5. Overlayable         - live fork with observation modes
     6. Watchable           - state change observation
-    7. GarbageCollectable  - coordinated cross-system GC"
+    7. GarbageCollectable  - coordinated cross-system GC
+
+  ## Execution model: ONE portable codebase, sync on JVM / async on cljs
+
+  Every IO-touching op takes `:sync?` in its `opts` and dispatches through the
+  `async+sync` duality (`yggdrasil.macros`): with `:sync? true` it BLOCKS and returns
+  a plain value; with `:sync? false` it returns a partial-cps CPS you `await`. The
+  point is that you write your logic ONCE — `(await (snapshot-id sys opts))`, etc. —
+  and it runs synchronously on the JVM and as non-blocking CPS on cljs, with no
+  per-platform branching. (In the sync branch `async+sync` rewrites `await`→`do`, so a
+  plain value flows straight through.)
+
+  `:sync?` is a PER-CALL choice, not a property of the system (systems carry no
+  execution mode). Omitted, it defaults to the PLATFORM default — `:sync? true` on the
+  JVM, `:sync? false` on cljs. So the two natural regimes are **JVM-sync** and
+  **cljs-async**, and portable code targets both for free.
+
+  Fixed-arity reads with no `opts` slot (`snapshot-id`/`parent-ids`/`gc-roots`/
+  `current-branch`) necessarily use the platform default; they are the reason a
+  *mixed* JVM-async regime (`:sync? false` ON the JVM) is not a supported target — on
+  the JVM those reads run sync and return a bare value, which a CPS caller cannot
+  `await`. Use `:sync? false` on cljs (its platform default) or for explicitly
+  async-konserve ops; do not force it on a JVM read path.
+
+  VERSIONED ADAPTERS (git/datahike/dolt/iceberg/…) are JVM-only and inherently
+  blocking (filesystem / JDBC / shelling out), so they are SYNC-ONLY: they accept
+  `opts` for uniform protocol shape but ignore `:sync?` and always return plain
+  values. This is sound because they only ever live where sync is the platform
+  default (the JVM); they have no cljs incarnation, so the async branch never reaches
+  them. Do NOT place a versioned adapter inside a `:sync? false` (async) composite —
+  there is no async git/JDBC to dispatch to, and the bare value would break the
+  caller's `await`. Only the convergent catalog + composite + storage layer are truly
+  cross-platform."
   (:refer-clojure :exclude [ancestors]))
 
 ;; ============================================================

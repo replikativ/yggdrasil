@@ -11,7 +11,6 @@
    its pure counterpart 1:1, with `(mapcat graph heads)` → `parents-set` and
    `(select-keys graph ids)`-counting → `count-present` (both awaited)."
   (:require [clojure.set :as set]
-            [yggdrasil.convergent.cdvcs.graph :as graph]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -57,9 +56,9 @@
                            va    (set/union visited-a new-a)
                            vb    (set/union visited-b new-b)]
                        (if (and (not-empty new-b)
-                                (empty? (graph/intersection va new-b)))
+                                (empty? (set/intersection va new-b)))
                          (recur new-a va start-a new-b vb start-b)
-                         (let [lcas    (graph/intersection va vb)
+                         (let [lcas    (set/intersection va vb)
                                present (await (count-present parents-of-a new-b opts))]
                            (if (and (not (empty? lcas))
                                     (= present (count new-b)))

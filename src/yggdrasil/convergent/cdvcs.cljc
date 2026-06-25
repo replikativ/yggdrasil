@@ -27,8 +27,10 @@
    commutative/associative/idempotent. May leave >1 head: the lifted conflict.
    `merge` (authored) resolves heads via a merge commit. `-conflict-free?` is FALSE.
 
-   The pure `cdvcs.graph` + `cdvcs.core` stay as the value-level reference (covered
-   by the pure `cdvcs_test`); this ns is the durable + cross-platform wrapping.
+   The pure `cdvcs.graph` + `cdvcs.core` value-level reference lives in the TEST tree
+   (a correctness oracle for the store-backed algebra here, not shipped); production
+   needs only the tiny `cdvcs.commit` builders. This ns is the durable + cross-platform
+   wrapping.
    **Runtime mode**: the record does NOT carry an execution mode — each op takes an
    OPTIONAL trailing `opts` ({:sync?}, default `c/default-opts`: sync on JVM, CPS on
    cljs)."
@@ -36,7 +38,7 @@
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.cdvcs.core :as core]
+            [yggdrasil.convergent.cdvcs.commit :as core]
             [yggdrasil.convergent.cdvcs.graph-store :as gs]
             [yggdrasil.kbridge :as kb]
             [clojure.set :as set]
