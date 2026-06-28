@@ -21,7 +21,7 @@
                       ;; datahike is an OPTIONAL adapter dep (the adapter only
                       ;; loads when datahike is present); provide it at test
                       ;; time so yggdrasil.adapters.datahike-test can exercise it.
-                      org.replikativ/datahike {:mvn/version "0.8.1707"}}
+                      org.replikativ/datahike {:mvn/version "0.8.1708"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
@@ -43,7 +43,7 @@
                         ;; datahike provides the cljs build for the (optional)
                         ;; datahike adapter — it is the same JVM :test dep, here so
                         ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
-                        org.replikativ/datahike {:mvn/version "0.8.1707"}}}
+                        org.replikativ/datahike {:mvn/version "0.8.1708"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
