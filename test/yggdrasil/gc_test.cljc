@@ -1,24 +1,36 @@
 (ns yggdrasil.gc-test
+  "GC coordinator tests. PORTABLE: the reachability / candidate / sweep / report
+   tests run on a MockSystem defrecord and exercise the .cljc coordinator on BOTH
+   the JVM and cljs/node. The git end-to-end reclamation test and the
+   java.util.Date / `requiring-resolve` opts-forwarding tests are JVM-only (a real
+   git repo + Date sentinels) and live under #?(:clj …)."
   (:require [clojure.test :refer [deftest testing is]]
             [yggdrasil.gc :as gc]
             [yggdrasil.registry :as reg]
             [yggdrasil.types :as t]
             [yggdrasil.protocols :as p]
-            [yggdrasil.adapters.git :as git]
-            [clojure.java.shell :refer [sh]]
-            [clojure.string :as str])
-  (:import [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+            #?@(:clj [[yggdrasil.adapters.git :as git]
+                      [clojure.java.shell :refer [sh]]
+                      [clojure.string :as str]]))
+  #?(:clj (:import [java.nio.file Files]
+                   [java.nio.file.attribute FileAttribute])))
 
 ;; ============================================================
 ;; Mock system for testing
 ;; ============================================================
 
+(defn- index-of
+  "Portable first-index-of (replaces JVM `.indexOf`); -1 when absent."
+  [coll x]
+  (or (first (keep-indexed (fn [i v] (when (= v x) i)) coll)) -1))
+
 (defrecord MockSystem [id branch-name snapshots swept-atom]
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] :mock)
-  (capabilities [_] (t/->Capabilities true true true false false false true))
+  ;; 9 booleans: snapshotable branchable graphable mergeable overlayable
+  ;; watchable garbage-collectable addressable committable
+  (capabilities [_] (t/->Capabilities true true true false false false true false false))
 
   p/Snapshotable
   (snapshot-id [_] (last snapshots))
@@ -51,15 +63,15 @@
   (history [_ _] (vec (reverse snapshots)))
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _]
-    (let [idx (.indexOf (vec snapshots) (str snap-id))]
+    (let [idx (index-of (vec snapshots) (str snap-id))]
       (if (pos? idx)
         (vec (take idx snapshots))
         [])))
   (ancestor? [this a b] (p/ancestor? this a b nil))
   (ancestor? [_ a b _]
     (let [ids (vec snapshots)
-          idx-a (.indexOf ids (str a))
-          idx-b (.indexOf ids (str b))]
+          idx-a (index-of ids (str a))
+          idx-b (index-of ids (str b))]
       (and (>= idx-a 0) (>= idx-b 0) (< idx-a idx-b))))
   (common-ancestor [this a b] (p/common-ancestor this a b nil))
   (common-ancestor [_ _ _ _] nil)
@@ -105,6 +117,17 @@
       (is (contains? roots "snap-3")))))
 
 ;; ============================================================
+;; JVM-only from here down. These tests drive the durable 2P-Set REGISTRY
+;; (reg/create-registry), whose konserve ops are async on cljs (CPS, not values),
+;; plus a real git repo and java.util.Date sentinels. Porting the registry tests
+;; to cljs needs the deftest-async/<? harness (a follow-up); the pure reachability
+;; tests above already run cross-platform.
+;; ============================================================
+
+#?(:clj
+   (do
+
+;; ============================================================
 ;; GC candidate selection tests
 ;; ============================================================
 
@@ -112,10 +135,10 @@
   (testing "reachable snapshots are never GC candidates"
     (let [r (reg/create-registry)
           ;; Register entries, some old enough for GC
-          old-time (- (System/currentTimeMillis) (* 8 24 60 60 1000)) ; 8 days ago
+          old-time (- (t/now-ms) (* 8 24 60 60 1000)) ; 8 days ago
           e1 (make-entry "snap-1" "git:repo1" "main" old-time)
           e2 (make-entry "snap-2" "git:repo1" "main" (+ old-time 1000))
-          e3 (make-entry "snap-3" "git:repo1" "main" (System/currentTimeMillis))]
+          e3 (make-entry "snap-3" "git:repo1" "main" (t/now-ms))]
       (reg/register-batch! r [e1 e2 e3])
 
       ;; snap-3 is the head (reachable), snap-1 and snap-2 are old
@@ -131,7 +154,7 @@
 (deftest test-gc-candidates-respects-grace-period
   (testing "recent snapshots are not GC candidates even if unreachable"
     (let [r (reg/create-registry)
-          now (System/currentTimeMillis)
+          now (t/now-ms)
           ;; Recent entry (1 hour ago) — within 7-day grace period
           e1 (make-entry "snap-1" "git:repo1" "main" (- now 3600000))]
       (reg/register! r e1)
@@ -152,10 +175,10 @@
           sys (->MockSystem "git:repo1" "main"
                             ["snap-3"] ; only head is snap-3
                             swept)
-          old-time (- (System/currentTimeMillis) (* 8 24 60 60 1000))
+          old-time (- (t/now-ms) (* 8 24 60 60 1000))
           e1 (make-entry "snap-1" "git:repo1" "main" old-time)
           e2 (make-entry "snap-2" "git:repo1" "main" (+ old-time 1000))
-          e3 (make-entry "snap-3" "git:repo1" "main" (System/currentTimeMillis))]
+          e3 (make-entry "snap-3" "git:repo1" "main" (t/now-ms))]
       (reg/register-batch! r [e1 e2 e3])
 
       (let [result (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)})]
@@ -175,11 +198,11 @@
   (testing "dry-run reports candidates without deleting"
     (let [r (reg/create-registry)
           sys (make-mock-system "git:repo1" "main" ["snap-3"])
-          old-time (- (System/currentTimeMillis) (* 8 24 60 60 1000))
+          old-time (- (t/now-ms) (* 8 24 60 60 1000))
           e1 (make-entry "snap-1" "git:repo1" "main" old-time)]
       (reg/register! r e1)
       (reg/register! r (make-entry "snap-3" "git:repo1" "main"
-                                   (System/currentTimeMillis)))
+                                   (t/now-ms)))
 
       (let [result (gc/gc-sweep! r [sys] {:dry-run? true})]
         ;; Candidates reported but not deleted
@@ -198,13 +221,13 @@
     (let [r (reg/create-registry)
           sys1 (make-mock-system "git:repo1" "main" ["snap-3"])
           sys2 (make-mock-system "zfs:pool1" "main" ["snap-z"])
-          old-time (- (System/currentTimeMillis) (* 8 24 60 60 1000))]
+          old-time (- (t/now-ms) (* 8 24 60 60 1000))]
       (reg/register-batch! r
                            [(make-entry "snap-1" "git:repo1" "main" old-time)
                             (make-entry "snap-2" "git:repo1" "main" (+ old-time 1000))
-                            (make-entry "snap-3" "git:repo1" "main" (System/currentTimeMillis))
+                            (make-entry "snap-3" "git:repo1" "main" (t/now-ms))
                             (make-entry "snap-x" "zfs:pool1" "main" old-time)
-                            (make-entry "snap-z" "zfs:pool1" "main" (System/currentTimeMillis))])
+                            (make-entry "snap-z" "zfs:pool1" "main" (t/now-ms))])
 
       (let [report (gc/gc-report r [sys1 sys2])]
         (is (= 5 (:total-entries report)))
@@ -223,7 +246,7 @@
   (testing "snapshot referenced by another system is not collected"
     (let [r (reg/create-registry)
           ;; snap-1 exists in both git and btrfs
-          old-time (- (System/currentTimeMillis) (* 8 24 60 60 1000))
+          old-time (- (t/now-ms) (* 8 24 60 60 1000))
           swept-git (atom #{})
           ;; Git only has snap-3 as head (snap-1 is old and unreachable via git)
           git-sys (->MockSystem "git:repo1" "main" ["snap-3"] swept-git)
@@ -233,7 +256,7 @@
       (reg/register-batch! r
                            [(make-entry "snap-1" "git:repo1" "main" old-time)
                             (make-entry "snap-1" "btrfs:vol1" "main" old-time)
-                            (make-entry "snap-3" "git:repo1" "main" (System/currentTimeMillis))])
+                            (make-entry "snap-3" "git:repo1" "main" (t/now-ms))])
 
       ;; Compute reachable from BOTH systems
       (let [reachable (gc/compute-reachable-set [git-sys btrfs-sys])]
@@ -303,9 +326,9 @@
           ;; 5. Register entries in the registry with old timestamps
           ;;    so they're eligible for GC
           (let [r (reg/create-registry)
-                old-time (- (System/currentTimeMillis) (* 8 24 60 60 1000))
+                old-time (- (t/now-ms) (* 8 24 60 60 1000))
                 e-main (make-entry main-sha "gc-test-git" "main"
-                                   (System/currentTimeMillis))
+                                   (t/now-ms))
                 e-feat1 (make-entry feature-sha1 "gc-test-git" "feature"
                                     old-time)
                 e-feat2 (make-entry feature-sha2 "gc-test-git" "feature"
@@ -381,7 +404,7 @@
   (testing "yggdrasil.gc/gc-sweep! forwards opts down to the adapter"
     (let [sys (->OptsRecorderSystem "git:r" (atom nil))
           r   (reg/create-registry)
-          old (- (System/currentTimeMillis) (* 30 24 60 60 1000))]
+          old (- (t/now-ms) (* 30 24 60 60 1000))]
       (reg/register! r (make-entry "snap-old" "git:r" "main" old))
       (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)
                              :remove-before (java.util.Date. 99)})
@@ -395,3 +418,5 @@
       (is (= {:system-id "s" :reclaimed 7} report))
       (is (nil? (:snapshot-ids @(:seen sys))) "single-system GC passes nil snapshot-ids")
       (is (= (java.util.Date. 5) (:remove-before (:opts @(:seen sys))))))))
+
+)) ; end #?(:clj (do …)) — registry/git/Date tests are JVM-only (see header above)
