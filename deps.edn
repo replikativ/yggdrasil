@@ -39,7 +39,11 @@
   ;; current cljs (an old clojurescript pin is what breaks konserve's async+sync
   ;; macro on cljs). 3.x manages cljs 1.12; pairs with partial-cps 0.1.59.
   :shadow {:extra-paths ["test"]
-           :extra-deps {thheller/shadow-cljs {:mvn/version "3.4.11"}}}
+           :extra-deps {thheller/shadow-cljs {:mvn/version "3.4.11"}
+                        ;; datahike provides the cljs build for the (optional)
+                        ;; datahike adapter — it is the same JVM :test dep, here so
+                        ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
+                        org.replikativ/datahike {:mvn/version "0.8.1704"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
