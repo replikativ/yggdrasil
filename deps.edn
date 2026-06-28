@@ -6,7 +6,7 @@
         ;; canonical node handlers (org.replikativ.persistent-sorted-set.fressian)
         ;; + MST content-defined boundary. 0.4.127 carries partial-cps 0.1.59
         ;; (the cljs-1.12 await-clash fix) so the shadow suite runs on cljs 1.12.
-        org.replikativ/persistent-sorted-set {:mvn/version "0.4.128"}
+        org.replikativ/persistent-sorted-set {:mvn/version "0.4.130"}
         ;; PSS's boundary requires `hasch.fast` (added in hasch 0.3.97), but PSS
         ;; still transitively pins the stale 0.3.96 — pin 0.3.97 explicitly.
         org.replikativ/hasch {:mvn/version "0.3.97"}
@@ -21,7 +21,7 @@
                       ;; datahike is an OPTIONAL adapter dep (the adapter only
                       ;; loads when datahike is present); provide it at test
                       ;; time so yggdrasil.adapters.datahike-test can exercise it.
-                      org.replikativ/datahike {:mvn/version "0.8.1704"}}
+                      org.replikativ/datahike {:mvn/version "0.8.1707"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
@@ -43,7 +43,7 @@
                         ;; datahike provides the cljs build for the (optional)
                         ;; datahike adapter — it is the same JVM :test dep, here so
                         ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
-                        org.replikativ/datahike {:mvn/version "0.8.1704"}}}
+                        org.replikativ/datahike {:mvn/version "0.8.1707"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
