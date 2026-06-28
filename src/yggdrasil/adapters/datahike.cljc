@@ -11,13 +11,21 @@
   datahike is available as a dependency."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
-            [yggdrasil.fressian :as yf]
             [yggdrasil.hooks :as hooks]
             [konserve.core :as k]
+            ;; supervisor-free async helpers (macros) — cljc idiom: :refer on clj,
+            ;; :refer-macros on cljs (same as datahike.online-gc). Only the cljs
+            ;; gc-sweep! branch uses them; the JVM branch blocking-derefs.
+            [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
+            ;; go-try- expands to core.async `go`; on cljs that must be the cljs
+            ;; macro (else macroexpansion uses the JVM go) — as datahike.online-gc does.
+            #?(:cljs [clojure.core.async :refer-macros [go]])
             [datahike.api :as d]
             [datahike.versioning :as dv]
-            [datahike.writing :as dw])
-  (:import [yggdrasil.types DatahikeDiff DiffError]))
+            [datahike.writing :as dw]
+            ;; fressian is the JVM-only value codec (org.fressian); the
+            ;; register-system! call at the bottom is the only user, gated :clj.
+            #?@(:clj [[yggdrasil.fressian :as yf]])))
 
 ;; ============================================================
 ;; Internal helpers
@@ -25,6 +33,15 @@
 
 (defn- store-of [conn]
   (:store @conn))
+
+(defn- reclaimed-count
+  "Normalize datahike gc-storage's return (a count, or the collection of removed
+   addresses) to an integer key-count."
+  [removed]
+  (cond (number? removed)   removed
+        (counted? removed)  (count removed)
+        (seqable? removed)  (count (seq removed))
+        :else 0))
 
 (defn- db-of [conn]
   @conn)
@@ -291,6 +308,10 @@
   (discard! [_] (p/delete-branch! parent fork-branch) nil)
   (discard! [_ _] (p/delete-branch! parent fork-branch) nil))
 
+;; `checkout` below builds a fresh DatahikeSystem via the record's own constructor;
+;; forward-declare it so cljs's single-pass analyzer doesn't warn :undeclared-var.
+(declare ->DatahikeSystem)
+
 (defrecord DatahikeSystem [conn system-name]
   p/SystemIdentity
   (system-id [_]
@@ -443,23 +464,26 @@
     ;;   :dry-run?      — report nothing reclaimed without touching storage.
     ;;   :gc-timeout-ms — bound the blocking wait (default 10 min); on expiry the
     ;;                    GC keeps running in datahike's writer, we just stop waiting.
-    ;; BOUNDARY CALL — `d/gc-storage` returns datahike's async throwable-promise;
-    ;; we deref it WITH A TIMEOUT (never an unbounded @) so a stuck writer can't
-    ;; wedge the caller. Must be invoked from a dedicated/boundary thread, NOT a
-    ;; core.async dispatch thread or a reactive loop (it blocks that thread).
+    ;; ASYNC+SYNC. `d/gc-storage` is datahike's async reclamation (go-try /
+    ;; throwable-promise). On the JVM we blocking-deref it WITH A TIMEOUT (a
+    ;; BOUNDARY CALL — never an unbounded @, must run on a dedicated thread, not a
+    ;; core.async dispatch thread). On cljs (where you cannot block) we return a
+    ;; superv.async channel yielding the report — the caller `<?`s it, matching the
+    ;; convergent layer's async+sync convention.
     ;; Returns {:system-id … :reclaimed <key-count>} (or :timeout?/:dry-run?).
     (if (:dry-run? opts)
       {:system-id system-name :dry-run? true}
-      (let [remove-before (or (:remove-before opts) (java.util.Date. 0))
-            timeout-ms    (or (:gc-timeout-ms opts) 600000)
-            removed       (deref (d/gc-storage conn remove-before) timeout-ms ::timeout)]
-        (if (= removed ::timeout)
-          {:system-id system-name :timeout? true}
-          {:system-id system-name
-           :reclaimed (cond (number? removed) removed
-                            (counted? removed) (count removed)
-                            (seqable? removed) (count (seq removed))
-                            :else 0)}))))
+      (let [remove-before (or (:remove-before opts) (#?(:clj java.util.Date. :cljs js/Date.) 0))]
+        #?(:clj
+           (let [timeout-ms (or (:gc-timeout-ms opts) 600000)
+                 removed    (deref (d/gc-storage conn remove-before) timeout-ms ::timeout)]
+             (if (= removed ::timeout)
+               {:system-id system-name :timeout? true}
+               {:system-id system-name :reclaimed (reclaimed-count removed)}))
+           :cljs
+           (go-try-
+            (let [removed (<?- (d/gc-storage conn remove-before))]
+              {:system-id system-name :reclaimed (reclaimed-count removed)}))))))
 
   p/Mergeable
   (merge! [this source] (p/merge! this source {}))
@@ -561,7 +585,7 @@
                       (on-commit-fn {:type :commit
                                      :snapshot-id snap-id
                                      :branch branch
-                                     :timestamp (System/currentTimeMillis)}))))))
+                                     :timestamp (t/now-ms)}))))))
     listener-key))
 
 (defmethod hooks/remove-commit-hook! :datahike
@@ -573,9 +597,12 @@
 ;; fressian handlers + store-id scope registry). So the value codec serializes only the
 ;; connection CONFIG (a reference) and reconstruct RECONNECTS via `d/connect` — the DB
 ;; data is never inlined here. (Same shape as git; resolve-storage unused.)
-(yf/register-system!
- :datahike DatahikeSystem
- (fn [{:keys [conn system-name]}]
-   {:config (:config @conn) :system-name system-name})
- (fn [blob _storage _opts]
-   (create (d/connect (:config blob)) {:system-name (:system-name blob)})))
+;; JVM-only: fressian (org.fressian) is the wire/at-rest codec; cljs peers carry the
+;; system as a live ygg-signal value, not a serialized blob.
+#?(:clj
+   (yf/register-system!
+    :datahike DatahikeSystem
+    (fn [{:keys [conn system-name]}]
+      {:config (:config @conn) :system-name system-name})
+    (fn [blob _storage _opts]
+      (create (d/connect (:config blob)) {:system-name (:system-name blob)}))))

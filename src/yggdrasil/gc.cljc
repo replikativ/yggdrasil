@@ -19,7 +19,6 @@
    to prevent cross-system reference breakage."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.registry :as reg]
-            [yggdrasil.storage :as store]
             [yggdrasil.types :as t]))
 
 ;; ============================================================
@@ -51,7 +50,7 @@
                 (when (satisfies? p/Graphable checked-out)
                   (when-let [ancs (seq (p/ancestors checked-out head))]
                     (swap! reachable into ancs)))))
-            (catch Exception _
+            (catch #?(:clj Exception :cljs :default) _
               ;; Skip branches we can't checkout
               nil)))))
     @reachable))
@@ -82,7 +81,7 @@
 
    Returns seq of RegistryEntry."
   [registry reachable-set grace-period-ms]
-  (let [now (System/currentTimeMillis)
+  (let [now (t/now-ms)
         cutoff-hlc (t/->HLC (- now grace-period-ms) 0)
         all (reg/all-entries registry)]
     (->> all
@@ -135,7 +134,7 @@
                    (doseq [entry entries]
                      (reg/deregister! registry entry))
                    (swap! swept into entries)
-                   (catch Exception e
+                   (catch #?(:clj Exception :cljs :default) e
                      ;; Conservative: skip on failure — entries stay in registry
                      (swap! errors assoc system-id e))))
                ;; System not GarbageCollectable — skip
@@ -145,7 +144,7 @@
          ;; Reclaim superseded PSS B-tree nodes from the registry's own storage
          ;; (the registry is a durable 2P-Set — mark-and-sweep, datahike-style).
          (let [freed-count (try (count (reg/gc! registry opts))
-                                (catch Exception _ 0))]
+                                (catch #?(:clj Exception :cljs :default) _ 0))]
            {:swept @swept
             :errors @errors
             :freed-nodes-swept freed-count}))))))
