@@ -10,6 +10,7 @@
             [yggdrasil.types :as t]
             [yggdrasil.protocols :as p]
             #?@(:clj [[yggdrasil.adapters.git :as git]
+                      [yggdrasil.test-async :refer [<gc]]
                       [clojure.java.shell :refer [sh]]
                       [clojure.string :as str]]))
   #?(:clj (:import [java.nio.file Files]
@@ -181,7 +182,7 @@
                e3 (make-entry "snap-3" "git:repo1" "main" (t/now-ms))]
            (reg/register-batch! r [e1 e2 e3])
 
-           (let [result (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)})]
+           (let [result (<gc (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)}))]
         ;; snap-1 and snap-2 should be swept (old + unreachable)
              (is (= #{"snap-1" "snap-2"} @swept))
         ;; They should be removed from the registry
@@ -204,7 +205,7 @@
            (reg/register! r (make-entry "snap-3" "git:repo1" "main"
                                         (t/now-ms)))
 
-           (let [result (gc/gc-sweep! r [sys] {:dry-run? true})]
+           (let [result (<gc (gc/gc-sweep! r [sys] {:dry-run? true}))]
         ;; Candidates reported but not deleted
              (is (seq (:candidates result)))
         ;; Entry still in registry
@@ -338,7 +339,7 @@
             ;; 6. Run the GC coordinator. grace 0 ⇒ expire reflog + prune "now" so
             ;; the just-unreachable feature objects are reclaimed immediately (the
             ;; conservative default keeps git's 2-week grace, retaining fresh objects).
-                 (let [result (gc/gc-sweep! r [sys] {:grace-period-ms 0})]
+                 (let [result (<gc (gc/gc-sweep! r [sys] {:grace-period-ms 0}))]
               ;; Feature entries should be swept from registry
                    (is (= 2 (count (:swept result)))
                        "Two feature entries should be swept")
@@ -384,9 +385,12 @@
        p/GarbageCollectable
        (gc-roots [_] #{})
        (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+       ;; GC is async-only now: record the call EAGERLY (so the coordinator's
+       ;; non-awaited fan-out still observes opts), then return an await-able CPS
+       ;; (a bare resolve/reject fn) so the composite/coordinator can `await` it.
        (gc-sweep! [_ snapshot-ids opts]
          (reset! seen {:snapshot-ids snapshot-ids :opts opts})
-         {:system-id id :reclaimed 7}))
+         (fn [resolve _reject] (resolve {:system-id id :reclaimed 7}))))
 
      (deftest test-composite-forwards-opts-and-returns-reports
        (testing "CompositeSystem.gc-sweep! forwards opts to each leaf and returns {sid → report}"
@@ -394,9 +398,10 @@
                b (->OptsRecorderSystem "b" (atom nil))
                comp ((requiring-resolve 'yggdrasil.composite/composite) [a b])
                opts {:remove-before (java.util.Date. 123) :dry-run? false}
-               report (p/gc-sweep! comp #{"snap-x"} opts)]
-           (is (= opts (:opts @(:seen a))) "leaf a received the forwarded opts")
-           (is (= opts (:opts @(:seen b))) "leaf b received the forwarded opts")
+               report (<gc (p/gc-sweep! comp #{"snap-x"} opts))]
+           ;; gc is async-only → opts are coerced to :sync? false before fan-out
+           (is (= (assoc opts :sync? false) (:opts @(:seen a))) "leaf a received the forwarded opts")
+           (is (= (assoc opts :sync? false) (:opts @(:seen b))) "leaf b received the forwarded opts")
            (is (= {:system-id "a" :reclaimed 7} (get report "a")) "report keyed by system-id")
            (is (= {:system-id "b" :reclaimed 7} (get report "b"))))))
 
@@ -406,15 +411,15 @@
                r   (reg/create-registry)
                old (- (t/now-ms) (* 30 24 60 60 1000))]
            (reg/register! r (make-entry "snap-old" "git:r" "main" old))
-           (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)
-                                  :remove-before (java.util.Date. 99)})
+           (<gc (gc/gc-sweep! r [sys] {:grace-period-ms (* 7 24 60 60 1000)
+                                       :remove-before (java.util.Date. 99)}))
            (is (= (java.util.Date. 99) (:remove-before (:opts @(:seen sys))))
                "adapter saw remove-before from the coordinator's opts"))))
 
      (deftest test-gc-system-convenience
        (testing "yggdrasil.gc/gc-system! GCs one system (nil snapshot-ids) and returns its report"
          (let [sys (->OptsRecorderSystem "s" (atom nil))
-               report (gc/gc-system! sys {:remove-before (java.util.Date. 5)})]
+               report (<gc (gc/gc-system! sys {:remove-before (java.util.Date. 5)}))]
            (is (= {:system-id "s" :reclaimed 7} report))
            (is (nil? (:snapshot-ids @(:seen sys))) "single-system GC passes nil snapshot-ids")
            (is (= (java.util.Date. 5) (:remove-before (:opts @(:seen sys)))))))))) ; end #?(:clj (do …)) — registry/git/Date tests are JVM-only (see header above)

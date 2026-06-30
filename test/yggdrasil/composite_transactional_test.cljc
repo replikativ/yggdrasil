@@ -10,15 +10,16 @@
    reads (`snapshot-meta`) stay sync. `get-subsystem`/`branch!`/`checkout`/
    `overlay`/`overlay-subsystem` are sync."
   (:require [clojure.test :refer [is testing]]
-            [yggdrasil.test-async :refer [deftest-async <? sync? file-cfg]]
+            [yggdrasil.test-async :refer [deftest-async <? <gc sync? file-cfg]]
             [yggdrasil.kbridge :as kb]
+            [is.simm.partial-cps.core-async :as ca]
             [konserve.core :as k]
             [yggdrasil.protocols :as p]
             [yggdrasil.composite :as cmp]
             [yggdrasil.convergent.gset :as g]
             #?(:cljs [is.simm.partial-cps.async])
             #?(:cljs [is.simm.partial-cps.runtime]))
-  #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]]
+  #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <? <gc]]
                             [is.simm.partial-cps.async :refer [async]])))
 
 ;; an opener co-locating a durable G-Set in the composite's store under its own cell
@@ -92,11 +93,11 @@
           comp (<? (p/commit! comp "c1"))
           comp (<? (cmp/update-subsystem comp "a" #(g/conj % :z)))
           comp (<? (p/commit! comp "c2"))              ; supersedes c1's index + sub trees
-          before (count (<? (kb/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))
+          before (count (<? (ca/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))
           ;; cutoff 1s ahead = "reclaim every orphan up to now" (reachable nodes are
           ;; spared by the whitelist, not the timestamp; a bare `now` can collide).
-          report (<? (p/gc-sweep! comp nil {:remove-before (future-date) :sync? sync?}))
-          after  (count (<? (kb/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))]
+          report (<gc (p/gc-sweep! comp nil {:remove-before (future-date)}))
+          after  (count (<? (ca/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))]
       (is (seq (:deleted report)) "reclaimed nodes from the superseded trees")
       (is (< after before) "the shared store shrank")
       (is (= #{:x :y :z} (<? (g/elements (cmp/get-subsystem comp "a")))) "live sub state intact")

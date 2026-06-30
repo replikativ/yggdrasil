@@ -12,20 +12,26 @@
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.hooks :as hooks]
+            ;; the shared core.async↔partial-cps adapter: bridges datahike's (core.async)
+            ;; async results into yggdrasil's NATIVE partial-cps substrate, so the adapter's
+            ;; storage ops are `await`-able by the convergent/composite layer (and equally
+            ;; bridged by spindel's distributed.cps) — not ad-hoc core.async.
+            [is.simm.partial-cps.core-async :as ca]
             [konserve.core :as k]
-            ;; supervisor-free async helpers (macros) — cljc idiom: :refer on clj,
-            ;; :refer-macros on cljs (same as datahike.online-gc). Only the cljs
-            ;; gc-sweep! branch uses them; the JVM branch blocking-derefs.
-            [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
-            ;; go-try- expands to core.async `go`; on cljs that must be the cljs
-            ;; macro (else macroexpansion uses the JVM go) — as datahike.online-gc does.
-            #?(:cljs [clojure.core.async :refer-macros [go]])
+            ;; partial-cps async substrate (async/await + the async+sync duality macro):
+            ;; one body → JVM-sync (values) + cljs-async (CPS). Same idiom the convergent
+            ;; CRDTs / composite / storage layer use.
+            #?(:clj  [is.simm.partial-cps.async :refer [async await]]
+               :cljs [is.simm.partial-cps.async :refer [await]])
+            #?(:clj [yggdrasil.macros :refer [async+sync]])
             [datahike.api :as d]
             [datahike.versioning :as dv]
             [datahike.writing :as dw]
             ;; fressian is the JVM-only value codec (org.fressian); the
             ;; register-system! call at the bottom is the only user, gated :clj.
-            #?@(:clj [[yggdrasil.fressian :as yf]])))
+            #?@(:clj [[yggdrasil.fressian :as yf]]))
+  #?(:cljs (:require-macros [yggdrasil.macros :refer [async+sync]]
+                            [is.simm.partial-cps.async :refer [async]])))
 
 ;; ============================================================
 ;; Internal helpers
@@ -33,6 +39,14 @@
 
 (defn- store-of [conn]
   (:store @conn))
+
+(defn- sync?*
+  "Resolve the :sync? mode for a storage-touching op: an explicit `:sync?` opt wins,
+   else the platform default — JVM blocks and returns values, cljs returns a
+   partial-cps CPS (`await`-able). Thread the result into both `async+sync` and the
+   konserve/datahike calls so one body serves both platforms + any backend."
+  [opts]
+  (get opts :sync? #?(:clj true :cljs false)))
 
 (defn- reclaimed-count
   "Normalize datahike gc-storage's return (a count, or the collection of removed
@@ -295,18 +309,28 @@
   (peek-parent [_ _] parent)
   (overlay-writes [_] (p/diff parent (p/snapshot-id parent) (p/snapshot-id @local-writes)))
 
+  ;; These chain the now-async branch!/checkout/merge!/delete-branch! — so they run
+  ;; under async+sync and `await` each step (value on JVM, CPS on cljs). The composite
+  ;; already `await`s merge-down!/advance! (composite.cljc), so a CPS return is expected.
   (advance! [ov] (p/advance! ov nil))
-  (advance! [ov _]                                  ; :following — merge parent INTO the fork
-    (reset! local-writes (p/merge! @local-writes parent-branch))
-    ov)
+  (advance! [ov opts]                               ; :following — merge parent INTO the fork
+    (async+sync (sync?* opts)
+                (async
+                 (reset! local-writes (await (p/merge! @local-writes parent-branch)))
+                 ov)))
 
   ;; 3-way merge the fork branch back into the parent branch → merged parent.
   (merge-down! [ov] (p/merge-down! ov nil))
-  (merge-down! [_ _]
-    (-> parent (p/checkout parent-branch) (p/merge! fork-branch)))
+  (merge-down! [_ opts]
+    (async+sync (sync?* opts)
+                (async
+                 (let [pco (await (p/checkout parent parent-branch))]
+                   (await (p/merge! pco fork-branch))))))
 
-  (discard! [_] (p/delete-branch! parent fork-branch) nil)
-  (discard! [_ _] (p/delete-branch! parent fork-branch) nil))
+  (discard! [ov] (p/discard! ov nil))
+  (discard! [_ opts]
+    (async+sync (sync?* opts)
+                (async (await (p/delete-branch! parent fork-branch)) nil))))
 
 ;; `checkout` below builds a fresh DatahikeSystem via the record's own constructor;
 ;; forward-declare it so cljs's single-pass analyzer doesn't warn :undeclared-var.
@@ -354,25 +378,35 @@
   (current-branch [_]
     (branch-of conn))
 
-  (branch! [this name]
-    (dv/branch! conn (branch-of conn) name)
-    this)
-
+  ;; branch! / delete-branch! are konserve-DIRECT (`dv/*` default `:sync? true`); on a
+  ;; genuinely-async backend `:sync? true` would throw, so thread the platform/opts
+  ;; `:sync?` and bridge via kbridge → value on JVM, await-able CPS on cljs.
+  (branch! [this name] (p/branch! this name (branch-of conn) nil))
   (branch! [this name from] (p/branch! this name from nil))
-  (branch! [this name from _opts]
-    (dv/branch! conn from name)
-    this)
+  (branch! [this name from opts]
+    (let [s? (sync?* opts)]
+      (async+sync s?
+                  (async
+                   (await (ca/sync-or-cps (dv/branch! conn from name {:sync? s?}) {:sync? s?}))
+                   this))))
 
   (delete-branch! [this name] (p/delete-branch! this name nil))
-  (delete-branch! [_ name _opts]
-    (dv/delete-branch! conn name))
+  (delete-branch! [_ name opts]
+    (let [s? (sync?* opts)]
+      (async+sync s?
+                  (async
+                   (await (ca/sync-or-cps (dv/delete-branch! conn name {:sync? s?}) {:sync? s?}))))))
 
+  ;; checkout reconnects on the branch — `d/connect` is `:sync?`-aware (value on
+  ;; JVM, channel on cljs); bridge + yield the branch-scoped system.
   (checkout [this name] (p/checkout this name nil))
-  (checkout [this name _opts]
-    (let [current-cfg (:config @conn)
-          branch-cfg (assoc current-cfg :branch name)
-          branch-conn (d/connect branch-cfg)]
-      (->DatahikeSystem branch-conn system-name)))
+  (checkout [this name opts]
+    (let [s? (sync?* opts)
+          branch-cfg (assoc (:config @conn) :branch name)]
+      (async+sync s?
+                  (async
+                   (->DatahikeSystem (await (ca/sync-or-cps (d/connect branch-cfg {:sync? s?}) {:sync? s?}))
+                                     system-name)))))
 
   p/Graphable
   (history [this] (p/history this {}))
@@ -462,28 +496,18 @@
     ;;     before this instant. Default (Date. 0) = epoch = keep ALL history,
     ;;     deleting only the orphaned rewrite garbage (safe to run anytime).
     ;;   :dry-run?      — report nothing reclaimed without touching storage.
-    ;;   :gc-timeout-ms — bound the blocking wait (default 10 min); on expiry the
-    ;;                    GC keeps running in datahike's writer, we just stop waiting.
-    ;; ASYNC+SYNC. `d/gc-storage` is datahike's async reclamation (go-try /
-    ;; throwable-promise). On the JVM we blocking-deref it WITH A TIMEOUT (a
-    ;; BOUNDARY CALL — never an unbounded @, must run on a dedicated thread, not a
-    ;; core.async dispatch thread). On cljs (where you cannot block) we return a
-    ;; superv.async channel yielding the report — the caller `<?`s it, matching the
-    ;; convergent layer's async+sync convention.
-    ;; Returns {:system-id … :reclaimed <key-count>} (or :timeout?/:dry-run?).
-    (if (:dry-run? opts)
-      {:system-id system-name :dry-run? true}
-      (let [remove-before (or (:remove-before opts) (#?(:clj java.util.Date. :cljs js/Date.) 0))]
-        #?(:clj
-           (let [timeout-ms (or (:gc-timeout-ms opts) 600000)
-                 removed    (deref (d/gc-storage conn remove-before) timeout-ms ::timeout)]
-             (if (= removed ::timeout)
-               {:system-id system-name :timeout? true}
-               {:system-id system-name :reclaimed (reclaimed-count removed)}))
-           :cljs
-           (go-try-
-            (let [removed (<?- (d/gc-storage conn remove-before))]
-              {:system-id system-name :reclaimed (reclaimed-count removed)}))))))
+    ;; `d/gc-storage` is datahike's async reclamation (writer → throwable-promise).
+    ;; GC is ASYNC-ONLY (yggdrasil never blocks): on BOTH platforms we yield a
+    ;; partial-cps CPS over the reclamation channel — await-able like every other
+    ;; adapter op; a caller that wants to wait blocks at its OWN boundary.
+    ;; Returns {:system-id … :reclaimed <key-count>} (or :dry-run?).
+    (let [opts (t/async-gc-opts "datahike/gc-sweep!" opts)]
+      (async
+       (if (:dry-run? opts)
+         {:system-id system-name :dry-run? true}
+         (let [remove-before (or (:remove-before opts) (#?(:clj java.util.Date. :cljs js/Date.) 0))
+               removed (await (ca/chan->cps (d/gc-storage conn remove-before)))]
+           {:system-id system-name :reclaimed (reclaimed-count removed)})))))
 
   p/Mergeable
   (merge! [this source] (p/merge! this source {}))
@@ -500,8 +524,16 @@
                           ;; identity-keyed (sibling-safe), not raw [:db/add e a v]
                           (compute-merge-tx source-db target-db)))
                       [])]
-      (dv/merge! conn parents tx-data (:tx-meta opts))
-      this))
+      ;; merge routes through the datahike WRITER (genuinely async — a go-loop
+      ;; transactor). On the JVM datahike's OWN sync API derefs the writer's
+      ;; CompletableFuture (`dv/merge!` = `@(merge-db! …)`) — its native blocking-wait,
+      ;; not a core.async `<!!`. On cljs the writer hands back a promise-chan (no
+      ;; IDeref); bridge it to an await-able partial-cps CPS. Both yield the system.
+      #?(:clj  (do (dv/merge! conn parents tx-data (:tx-meta opts))
+                   this)
+         :cljs (async
+                (await (ca/chan->cps (dv/merge-async! conn parents tx-data (:tx-meta opts))))
+                this))))
 
   (conflicts [this a b] (p/conflicts this a b nil))
   (conflicts [this a b _opts]
@@ -548,12 +580,17 @@
   p/Overlayable
   ;; native branch fork: branch+checkout a fresh overlay branch as the writable
   ;; system; `merge-down!` 3-way-merges it back, `discard!` deletes it.
-  (overlay [this _opts]
-    (let [pbranch (p/current-branch this)
-          fbranch (keyword (str "overlay-" (random-uuid)))
-          forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
-      ;; :following degrades to :frozen for a versioned store (honest fallback).
-      (->DatahikeOverlay this (atom forked) fbranch pbranch :frozen))))
+  (overlay [this opts]
+    (let [s?      (sync?* opts)
+          pbranch (p/current-branch this)
+          fbranch (keyword (str "overlay-" (random-uuid)))]
+      ;; branch! + checkout are now async (value JVM / CPS cljs) — await each.
+      (async+sync s?
+                  (async
+                   (await (p/branch! this fbranch))
+                   (let [forked (await (p/checkout this fbranch))]
+           ;; :following degrades to :frozen for a versioned store (honest fallback).
+                     (->DatahikeOverlay this (atom forked) fbranch pbranch :frozen)))))))
 
 ;; ============================================================
 ;; Constructor

@@ -25,6 +25,7 @@
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [org.replikativ.persistent-sorted-set.boundary :as pss-bnd]
             [yggdrasil.kbridge :as kb]
+            [is.simm.partial-cps.core-async :as ca]
             [yggdrasil.types :as t]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
@@ -47,9 +48,9 @@
   ([store-config opts]
    (async+sync (:sync? opts)
                (async
-                (if (await (kb/sync-or-cps (kstore/store-exists? store-config opts) opts))
-                  (await (kb/sync-or-cps (kstore/connect-store store-config opts) opts))
-                  (await (kb/sync-or-cps (kstore/create-store store-config opts) opts)))))))
+                (if (await (ca/sync-or-cps (kstore/store-exists? store-config opts) opts))
+                  (await (ca/sync-or-cps (kstore/connect-store store-config opts) opts))
+                  (await (ca/sync-or-cps (kstore/create-store store-config opts) opts)))))))
 
 ;; ============================================================
 ;; Record <-> map conversion for safe serialization (JVM records only)

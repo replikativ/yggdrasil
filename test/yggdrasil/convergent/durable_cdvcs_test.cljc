@@ -6,14 +6,14 @@
    PORTABLE — one .cljc body per concern (JVM sync / cljs async via `<?`)."
   (:require #?(:clj  [clojure.test :refer [is testing]]
                :cljs [cljs.test :refer [is testing]])
-            [yggdrasil.test-async :refer [deftest-async <? sync? file-cfg]]
+            [yggdrasil.test-async :refer [deftest-async <? <gc sync? file-cfg]]
             [yggdrasil.protocols :as p]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.cdvcs :as cd]
             [yggdrasil.convergent.cdvcs.graph :as graph]
             #?(:cljs [is.simm.partial-cps.async])
             #?(:cljs [is.simm.partial-cps.runtime]))
-  #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]]
+  #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <? <gc]]
                             [is.simm.partial-cps.async :refer [async]])))
 
 (deftest-async durable-commit-chain-reopen
@@ -94,7 +94,7 @@
           a (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 1]]))))   ; commit + flush (graph v2)
           a (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 2]]))))   ; commit + flush (graph v3, supersedes v2)
           a (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 3]]))))]
-      (<? (p/gc-sweep! a nil {:grace-period-ms 0 :sync? sync?}))       ; reclaim everything orphaned before now
+      (<gc (p/gc-sweep! a nil {:grace-period-ms 0}))       ; reclaim everything orphaned before now
       (is (= 4 (count (<? (cd/history a)))) "base + 3 commits survive gc")
       (is (some? (<? (cd/read-commit a (first (cd/heads a))))) "head commit still readable after gc"))))
 
@@ -179,6 +179,6 @@
           a   (<? (cd/commit a "al" [[:assoc :x 1]]))
           sid (<? (p/snapshot-id a))                         ; freeze here
           a   (<? (p/commit! (<? (cd/commit a "al" [[:assoc :x 2]]))))]
-      (<? (p/gc-sweep! a [sid] {:grace-period-ms 0 :sync? sync?}))   ; retain the named snapshot
+      (<gc (p/gc-sweep! a [sid] {:grace-period-ms 0}))   ; retain the named snapshot
       (is (some? (<? (p/as-of a sid))) "the retained snapshot survives gc")
       (is (= 3 (count (<? (cd/history a)))) "live history intact"))))

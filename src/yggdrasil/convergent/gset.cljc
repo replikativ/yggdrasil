@@ -140,11 +140,11 @@
   p/GarbageCollectable
   (gc-roots [this]
     (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
-  ;; gc-opts carries the GC window (`:remove-before`/`:grace-period-ms`) and may omit
-  ;; `:sync?` (a user window via `gc!`) — fill the platform default so the mode threads.
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  ;; gc-opts carries the GC window (`:remove-before`/`:grace-period-ms`). GC is
+  ;; async-only — coerce to `:sync? false` (throws on explicit `:sync? true`).
   (gc-sweep! [this snapshot-ids gc-opts]
-    (let [gc-opts (merge c/default-opts gc-opts)]
+    (let [gc-opts (merge c/default-opts (t/async-gc-opts "gset/gc-sweep!" gc-opts))]
       (async+sync (:sync? gc-opts)
                   (async
                    (await (flush! this gc-opts))
@@ -280,7 +280,7 @@
   "Reclaim PSS nodes superseded by prior flushes (mark-and-sweep). SAFE BY DEFAULT
    (reclaims nothing); pass a window in `opts` (`:remove-before`/`:grace-period-ms`).
    (async+sync)"
-  ([g] (p/gc-sweep! g nil c/default-opts))
+  ([g] (p/gc-sweep! g nil nil))
   ([g opts] (p/gc-sweep! g nil opts)))
 
 ;; ============================================================

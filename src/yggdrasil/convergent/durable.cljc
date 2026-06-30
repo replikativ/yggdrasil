@@ -28,6 +28,7 @@
             [yggdrasil.storage :as store]
             [yggdrasil.types :as t]
             [konserve.gc :as kgc]
+            [is.simm.partial-cps.core-async :as ca]
             [hasch.core :as hasch]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
@@ -124,7 +125,12 @@
    writes nodes to konserve)."
   ([s storage] (store-set! s storage {:sync? true}))
   ([s storage opts]
-   #?(:clj  (pss/store s storage)            ; JVM IStorage is synchronous
+   #?(:clj  (if (:sync? opts)
+              (pss/store s storage)          ; JVM IStorage is synchronous → a value
+              ;; async-only callers (e.g. the async-only gc path) on the JVM: PSS
+              ;; store is synchronous, so hand back an already-resolved partial-cps
+              ;; CPS so the root address is `await`-able like every other async op.
+              (let [root (pss/store s storage)] (fn [resolve _reject] (resolve root))))
       :cljs (pss/store s storage opts))))
 
 (defn restore-set
@@ -365,11 +371,12 @@
    (`-join`/flush orphan the old root each time), so pass a window in production
    (≥ your longest lazy-read drain; ~60 s tight, hours/a day looser). Returns the
    set of deleted keys. (async+sync)"
-  ([kv-store roots] (gc! kv-store roots {} {:sync? true}))
+  ([kv-store roots] (gc! kv-store roots {} {}))
   ([kv-store roots config opts]
-   (async+sync (:sync? opts)
-               (async
-                (let [before (t/gc-cutoff opts)
+   (let [opts (t/async-gc-opts "durable/gc!" opts)]
+     (async+sync (:sync? opts)
+                 (async
+                  (let [before (t/gc-cutoff opts)
                       ;; A SHARED-store composite sweeps ONCE over the UNION of every
                       ;; sub's roots (a per-sub gc! would delete siblings, unreachable
                       ;; from one sub's roots) and passes `:spare-keys` = all the extra
@@ -377,14 +384,14 @@
                       ;; id] + the composite manifest). Standalone CRDTs leave it nil.
                       ;; `config` carries the cell-keys to spare; `opts` carries the gc
                       ;; operation params (cutoff / retain / spare) + `:sync?`.
-                      reachable (loop [rs (seq (concat roots (:retain-roots opts)))
-                                       acc (into #{(rk config) (fk config)}
-                                                 (concat (:spare-keys opts) (:retain-keys opts)))]
-                                  (if rs
-                                    (recur (next rs)
-                                           (into acc (await (reachable-addresses kv-store (first rs) opts))))
-                                    acc))]
-                  (await (kb/await-chan (kgc/sweep! kv-store reachable before) opts)))))))
+                        reachable (loop [rs (seq (concat roots (:retain-roots opts)))
+                                         acc (into #{(rk config) (fk config)}
+                                                   (concat (:spare-keys opts) (:retain-keys opts)))]
+                                    (if rs
+                                      (recur (next rs)
+                                             (into acc (await (reachable-addresses kv-store (first rs) opts))))
+                                      acc))]
+                    (await (ca/chan->cps (kgc/sweep! kv-store reachable before)))))))))
 
 ;; ============================================================
 ;; Two-half CRDT shared logic (OR-Set / 2P-Set / OR-Map)
@@ -468,19 +475,20 @@
   ;; (`:remove-before`/`:grace-period-ms`) — the record no longer stamps a mode, so
   ;; the caller's per-op opts is the single source.
   [{:keys [kv-store config] :as this} snapshot-ids opts]
-  (async+sync (:sync? opts)
-              (async
-               (await (two-half-flush! this opts))
-               (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
-                     retain-roots (loop [cs (seq commit-addrs) acc []]
-                                    (if cs
-                                      (let [c (await (read-commit kv-store (first cs) opts))]
-                                        (recur (next cs) (conj acc (:adds c) (:removals c))))
-                                      acc))]
-                 (await (gc! kv-store (vals (await (load-roots kv-store config opts)))
-                             config
-                             (merge opts {:retain-roots retain-roots
-                                          :retain-keys commit-addrs})))))))
+  (let [opts (t/async-gc-opts "durable/two-half-gc-sweep!" opts)]
+    (async+sync (:sync? opts)
+                (async
+                 (await (two-half-flush! this opts))
+                 (let [commit-addrs (map #(parse-uuid (str %)) snapshot-ids)
+                       retain-roots (loop [cs (seq commit-addrs) acc []]
+                                      (if cs
+                                        (let [c (await (read-commit kv-store (first cs) opts))]
+                                          (recur (next cs) (conj acc (:adds c) (:removals c))))
+                                        acc))]
+                   (await (gc! kv-store (vals (await (load-roots kv-store config opts)))
+                               config
+                               (merge opts {:retain-roots retain-roots
+                                            :retain-keys commit-addrs}))))))))
 
 (defn two-half-open
   "Open a two-half CRDT's store and restore both halves from `:crdt/roots`. Returns

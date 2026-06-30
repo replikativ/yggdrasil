@@ -1,52 +1,15 @@
 (ns ^:no-doc yggdrasil.kbridge
-  "Bridge konserve to partial-cps `await` for the storage layer's `async+sync`.
-
-   `k-get`/`k-assoc`/`k-dissoc` dispatch on `:sync?`:
-   - `{:sync? true}` (JVM) → the konserve VALUE directly, so under `async+sync`
-     sync-mode (`await` → `do`) the awaited expression yields the value.
-   - `{:sync? false}` (cljs) → a **partial-cps CPS fn** `(fn [resolve reject] …)`
-     over konserve's core.async channel, so `await` suspends correctly.
-
-   This is the correctness-critical shape: a naive `(await (chan->cps (k/get …)))`
-   would break sync-mode, because `chan->cps` returns a CPS fn but `await`→`do`
-   needs the expression to be the value. Dispatching inside `k-get` fixes it."
+  "Konserve-call conveniences for the `async+sync` storage layer. These are NOT a
+   bridge — the channel↔CPS bridging lives entirely in `is.simm.partial-cps.core-async`
+   (`ca/sync-or-cps`, shared with spindel). Each `k-*` is just `konserve.core/<op>`
+   composed with `ca/sync-or-cps`, which on `{:sync? true}` (JVM) passes the konserve
+   VALUE through and on `{:sync? false}` (cljs) wraps the konserve channel as an
+   `await`-able partial-cps CPS. So one `(await (kb/k-get …))` works on both platforms."
   (:require [konserve.core :as k]
-            #?(:clj  [clojure.core.async :refer [take!]]
-               :cljs [cljs.core.async :refer [take!]])))
-
-(defn- chan->cps
-  "Wrap a konserve core.async channel as a partial-cps CPS fn."
-  [ch]
-  (fn [resolve reject]
-    (take! ch (fn [v]
-                (if (instance? #?(:clj Throwable :cljs js/Error) v)
-                  (reject v)
-                  (resolve v))))))
-
-(defn await-chan
-  "Bridge a RAW konserve/core.async channel (e.g. `konserve.gc/sweep!`, which is
-   not :sync?-aware) into `async+sync`: on JVM-sync, block and return the value
-   (throw on error); on async, a partial-cps CPS fn over the channel."
-  [ch opts]
-  (if (:sync? opts)
-    #?(:clj  (let [v (clojure.core.async/<!! ch)]
-               (if (instance? Throwable v) (throw v) v))
-       :cljs ch)
-    (chan->cps ch)))
-
-(defn sync-or-cps
-  "Bridge a :sync?-aware konserve result into `async+sync`. `result` is what a
-   konserve fn returned: a VALUE on `{:sync? true}` (pass through) or a core.async
-   CHANNEL on `{:sync? false}` (wrap as a CPS fn). Use for store-lifecycle calls
-   (`konserve.store/connect-store` etc.):
-     (await (kb/sync-or-cps (kstore/connect-store cfg opts) opts))"
-  [result opts]
-  (if (:sync? opts) result (chan->cps result)))
+            [is.simm.partial-cps.core-async :as ca]))
 
 (defn k-get [store key opts]
-  (if (:sync? opts)
-    (k/get store key nil opts)
-    (chan->cps (k/get store key nil opts))))
+  (ca/sync-or-cps (k/get store key nil opts) opts))
 
 (def immutable-meta
   "The metadata map marking a content-addressed, WRITE-ONCE value (a PSS node, a
@@ -64,14 +27,10 @@
    4-arity (konserve's own 5-arity collapses to the plain build)."
   ([store key val opts] (k-assoc store key val nil opts))
   ([store key val meta opts]
-   (if (:sync? opts)
-     (k/assoc store key val meta opts)
-     (chan->cps (k/assoc store key val meta opts)))))
+   (ca/sync-or-cps (k/assoc store key val meta opts) opts)))
 
 (defn k-dissoc [store key opts]
-  (if (:sync? opts)
-    (k/dissoc store key opts)
-    (chan->cps (k/dissoc store key opts))))
+  (ca/sync-or-cps (k/dissoc store key opts) opts))
 
 (defn k-update
   "ATOMIC per-key read-modify-write via konserve's `update` (go-locked — no
@@ -79,6 +38,4 @@
    returns the new value. Use for convergent grow-cells (roots/freed) so a
    concurrent flush or synced peer can't lose an interleaved write."
   [store key f opts]
-  (if (:sync? opts)
-    (k/update store key f opts)
-    (chan->cps (k/update store key f opts))))
+  (ca/sync-or-cps (k/update store key f opts) opts))
