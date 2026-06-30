@@ -214,33 +214,38 @@
    roots), so the composite must sweep as a whole. (async+sync) Returns the
    reclamation report {:deleted <set-of-keys>}."
   [kv-store storage index-atom systems opts]
-  (async+sync (:sync? opts)
-              (async
+  (let [opts (t/async-gc-opts "composite/unified-gc!" opts)]
+    (async+sync (:sync? opts)
+                (async
                ;; persist the latest state we mean to keep
-               (loop [ss (seq systems)]
-                 (when ss
-                   (when (satisfies? p/Committable (val (first ss)))
-                     (await (p/commit! (val (first ss)))))
-                   (recur (next ss))))
-               (await (persist-index! kv-store storage index-atom opts))
-               (let [manifest  (colocated-subs-manifest kv-store systems)
-                     comp-root (await (kb/k-get kv-store composite-root-key opts))
-                     sub-roots (loop [ss (seq systems) acc []]
-                                 (if ss
-                                   (let [s (val (first ss))]
-                                     (recur (next ss)
-                                            (into acc (vals (await (d/load-roots (:kv-store s) (:config s) opts))))))
-                                   acc))
-                     roots (filterv some? (cons comp-root sub-roots))
-                     spare (into #{composite-subs-key}
-                                 (mapcat (fn [m] [(:roots-key m) (:freed-key m)]))
-                                 manifest)
-                     deleted (await (d/gc! kv-store roots
-                                           {:roots-key composite-root-key
-                                            :freed-key composite-freed-key}
-                                           (-> opts
-                                               (assoc :spare-keys spare))))]
-                 {:deleted deleted}))))
+                 (loop [ss (seq systems)]
+                   (when ss
+                     (when (satisfies? p/Committable (val (first ss)))
+                     ;; thread the async-only gc opts (`:sync? false`) so the sub's
+                     ;; commit!/flush! runs async and returns an `await`-able CPS
+                     ;; (the no-opts arity defaults to c/default-opts = :sync? true
+                     ;; on the JVM → a plain value that can't be awaited here).
+                       (await (p/commit! (val (first ss)) nil opts)))
+                     (recur (next ss))))
+                 (await (persist-index! kv-store storage index-atom opts))
+                 (let [manifest  (colocated-subs-manifest kv-store systems)
+                       comp-root (await (kb/k-get kv-store composite-root-key opts))
+                       sub-roots (loop [ss (seq systems) acc []]
+                                   (if ss
+                                     (let [s (val (first ss))]
+                                       (recur (next ss)
+                                              (into acc (vals (await (d/load-roots (:kv-store s) (:config s) opts))))))
+                                     acc))
+                       roots (filterv some? (cons comp-root sub-roots))
+                       spare (into #{composite-subs-key}
+                                   (mapcat (fn [m] [(:roots-key m) (:freed-key m)]))
+                                   manifest)
+                       deleted (await (d/gc! kv-store roots
+                                             {:roots-key composite-root-key
+                                              :freed-key composite-freed-key}
+                                             (-> opts
+                                                 (assoc :spare-keys spare))))]
+                   {:deleted deleted})))))
 
 ;; ============================================================
 ;; CompositeOverlay — the composite's isolated workspace
@@ -543,23 +548,25 @@
                        (recur (next ss) (set/union acc (await (p/gc-roots (val (first ss))))))
                        acc))))))
 
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
   (gc-sweep! [_ snapshot-ids gopts]
-    ;; gopts = GC window, may omit :sync? — fill the platform default for OUR dispatch +
-    ;; the unified path; forward the ORIGINAL gopts to sub gc-sweep!s (each self-normalizes).
-    (async+sync (:sync? (merge c/default-opts gopts))
-                (async
-                 (if (and kv-store (seq systems)
-                          (every? (fn [[_ sys]] (colocated? kv-store sys)) systems))
+    ;; gopts = GC window. GC is async-only — coerce to `:sync? false` (throws on
+    ;; explicit `:sync? true`) for OUR dispatch + the unified path; forward the coerced
+    ;; gopts to sub gc-sweep!s (each self-normalizes / re-coerces idempotently).
+    (let [gopts (t/async-gc-opts "composite/gc-sweep!" gopts)]
+      (async+sync (:sync? (merge c/default-opts gopts))
+                  (async
+                   (if (and kv-store (seq systems)
+                            (every? (fn [[_ sys]] (colocated? kv-store sys)) systems))
                    ;; SHARED store → ONE unified mark-and-sweep over the union of roots
                    ;; (a per-sub sweep would delete siblings/index nodes).
-                   (await (unified-gc! kv-store storage index-atom systems (merge c/default-opts gopts)))
+                     (await (unified-gc! kv-store storage index-atom systems (merge c/default-opts gopts)))
                    ;; SEPARATE stores → each sub owns its store, safe to fan out.
-                   (loop [ss (seq systems) acc {}]
-                     (if ss
-                       (let [[sid sys] (first ss)]
-                         (recur (next ss) (assoc acc sid (await (p/gc-sweep! sys snapshot-ids gopts)))))
-                       acc))))))
+                     (loop [ss (seq systems) acc {}]
+                       (if ss
+                         (let [[sid sys] (first ss)]
+                           (recur (next ss) (assoc acc sid (await (p/gc-sweep! sys snapshot-ids gopts)))))
+                         acc)))))))
 
   p/Overlayable
   ;; overlay every sub-system → a CompositeOverlay (a map of sub-overlays). The

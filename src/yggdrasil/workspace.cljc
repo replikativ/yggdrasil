@@ -464,7 +464,7 @@
                       :cljs (fn [& _] (throw (ex-info "coordinated workspace gc! is JVM-only; use durable-CRDT gc! on cljs" {:platform :cljs}))))]
      (gc-sweep! (:registry workspace)
                 (vals @(:systems workspace))
-                opts))))
+                (t/async-gc-opts "workspace/gc!" opts)))))
 
 ;; ============================================================
 ;; Lifecycle

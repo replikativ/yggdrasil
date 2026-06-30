@@ -71,6 +71,21 @@
         (#?(:clj java.util.Date. :cljs js/Date.) (- (now-ms) (long g))))
       (#?(:clj java.util.Date. :cljs js/Date.) 0)))
 
+(defn async-gc-opts
+  "Coerce caller opts for an ASYNC-ONLY gc op into async mode. GC's underlying sweep —
+   `konserve.gc/sweep!` (a bare superv channel) or datahike's `gc-storage` promise — has
+   NO synchronous-value form, and yggdrasil never blocks to fake one. So an EXPLICIT
+   `{:sync? true}` is a misuse ⇒ THROW; otherwise force `{:sync? false}` (overriding any
+   platform default). GC ops therefore return an `await`-able partial-cps CPS on BOTH
+   platforms; a caller that wants to wait blocks at its OWN boundary (app/test code),
+   never inside yggdrasil. `op` labels the error."
+  [op opts]
+  (when (true? (:sync? opts))
+    (throw (ex-info (str op " has no synchronous mode — its gc sweep is async-only; "
+                         "consume the async result (block at your own boundary).")
+                    {:op op :opts opts})))
+  (assoc opts :sync? false))
+
 (defn hlc-tick
   "Advance HLC for local event."
   [hlc]

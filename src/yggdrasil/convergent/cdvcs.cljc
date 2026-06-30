@@ -36,6 +36,7 @@
    cljs)."
   (:refer-clojure :exclude [merge])
   (:require [yggdrasil.protocols :as p]
+            [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.cdvcs.builder :as builder]
@@ -376,11 +377,11 @@
   p/GarbageCollectable
   (gc-roots [this]
     (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
-  ;; gc-opts carries the GC window and may omit `:sync?` (a user window) — fill the
-  ;; platform default so the mode threads downstream (flush!/d/gc!).
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  ;; gc-opts carries the GC window. GC is async-only — coerce to `:sync? false`
+  ;; (throws on explicit `:sync? true`) so the mode threads downstream (flush!/d/gc!).
   (gc-sweep! [this snapshot-ids gc-opts]
-    (let [gc-opts (clojure.core/merge c/default-opts gc-opts)]   ; `merge` is the CDVCS verb here
+    (let [gc-opts (clojure.core/merge c/default-opts (t/async-gc-opts "cdvcs/gc-sweep!" gc-opts))]   ; `merge` is the CDVCS verb here
       (async+sync (:sync? gc-opts)
                   (async
                    (await (flush! this gc-opts))

@@ -29,6 +29,7 @@
   (:refer-clojure :exclude [conj disj contains? into])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
+            [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
@@ -110,8 +111,8 @@
   p/GarbageCollectable
   (gc-roots [this]
     (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
-  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids (merge c/default-opts gc-opts)))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids (merge c/default-opts (t/async-gc-opts "twopset/gc-sweep!" gc-opts))))
 
   p/Overlayable
   ;; :frozen → carry BOTH halves (immutable PSS values; isolated by value).
@@ -210,7 +211,7 @@
 (defn gc!
   "Reclaim PSS nodes unreachable from the live adds/removals roots (mark-and-sweep).
    Returns the set of deleted node keys."
-  ([s] (p/gc-sweep! s nil c/default-opts))
+  ([s] (p/gc-sweep! s nil nil))
   ([s opts] (p/gc-sweep! s nil opts)))
 
 ;; ============================================================

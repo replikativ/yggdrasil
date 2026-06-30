@@ -33,6 +33,7 @@
    `c/default-opts`: sync on JVM, CPS on cljs)."
   (:refer-clojure :exclude [assoc dissoc get keys])
   (:require [yggdrasil.protocols :as p]
+            [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
@@ -155,8 +156,8 @@
   p/GarbageCollectable
   (gc-roots [this]
     (async+sync (:sync? c/default-opts) (async #{(await (p/snapshot-id this))})))
-  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids c/default-opts))
-  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids (merge c/default-opts gc-opts)))
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this snapshot-ids gc-opts] (d/two-half-gc-sweep! this snapshot-ids (merge c/default-opts (t/async-gc-opts "ormap/gc-sweep!" gc-opts))))
 
   p/Overlayable
   (overlay [this opts]
@@ -248,7 +249,7 @@
   ([o other opts] (d/two-half-merge-peer! o other opts)))
 
 (defn gc!
-  ([o] (p/gc-sweep! o nil c/default-opts))
+  ([o] (p/gc-sweep! o nil nil))
   ([o opts] (p/gc-sweep! o nil opts)))
 
 ;; ============================================================

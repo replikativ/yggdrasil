@@ -19,7 +19,10 @@
    to prevent cross-system reference breakage."
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.registry :as reg]
-            [yggdrasil.types :as t]))
+            [yggdrasil.types :as t]
+            #?(:clj  [is.simm.partial-cps.async :refer [async await]]
+               :cljs [is.simm.partial-cps.async :refer [await]]))
+  #?(:cljs (:require-macros [is.simm.partial-cps.async :refer [async]])))
 
 ;; ============================================================
 ;; Reachability analysis
@@ -111,43 +114,48 @@
             :freed-nodes-swept count}"
   ([registry systems] (gc-sweep! registry systems {}))
   ([registry systems opts]
-   (let [grace-ms (or (:grace-period-ms opts)
-                      (* 7 24 60 60 1000))
-         reachable (compute-reachable-set systems)
-         candidates (gc-candidates registry reachable grace-ms)]
-     (if (:dry-run? opts)
-       {:swept [] :candidates candidates :reachable reachable
-        :errors {} :freed-nodes-swept 0}
-       (let [by-system (group-by :system-id candidates)
-             swept (atom [])
-             errors (atom {})]
-         ;; For each system, delegate deletion then deregister
-         (doseq [[system-id entries] by-system]
-           (let [sys (first (filter #(= (p/system-id %) system-id) systems))]
-             (if (and sys (satisfies? p/GarbageCollectable sys))
-               (let [snap-ids (set (map :snapshot-id entries))]
-                 (try
-                   ;; Step 1: adapter deletes native snapshots (forward opts so
-                   ;; per-adapter retention/grace/dry-run reach the leaf)
-                   (p/gc-sweep! sys snap-ids opts)
-                   ;; Step 2: only deregister after adapter confirms success
-                   (doseq [entry entries]
-                     (reg/deregister! registry entry))
-                   (swap! swept into entries)
-                   (catch #?(:clj Exception :cljs :default) e
-                     ;; Conservative: skip on failure — entries stay in registry
-                     (swap! errors assoc system-id e))))
-               ;; System not GarbageCollectable — skip
-               nil)))
-         ;; Flush registry changes
-         (reg/flush! registry)
-         ;; Reclaim superseded PSS B-tree nodes from the registry's own storage
-         ;; (the registry is a durable 2P-Set — mark-and-sweep, datahike-style).
-         (let [freed-count (try (count (reg/gc! registry opts))
-                                (catch #?(:clj Exception :cljs :default) _ 0))]
-           {:swept @swept
-            :errors @errors
-            :freed-nodes-swept freed-count}))))))
+   ;; GC is async-only: coerce opts (throws on explicit `:sync? true`) and return an
+   ;; await-able CPS — the registry's own node-reclamation (`reg/gc!`) is async-only,
+   ;; so the coordinator awaits it. Callers block at their OWN boundary.
+   (let [opts (t/async-gc-opts "gc/gc-sweep!" opts)]
+     (async
+      (let [grace-ms (or (:grace-period-ms opts)
+                         (* 7 24 60 60 1000))
+            reachable (compute-reachable-set systems)
+            candidates (gc-candidates registry reachable grace-ms)]
+        (if (:dry-run? opts)
+          {:swept [] :candidates candidates :reachable reachable
+           :errors {} :freed-nodes-swept 0}
+          (let [by-system (group-by :system-id candidates)
+                swept (atom [])
+                errors (atom {})]
+            ;; For each system, delegate deletion then deregister
+            (doseq [[system-id entries] by-system]
+              (let [sys (first (filter #(= (p/system-id %) system-id) systems))]
+                (if (and sys (satisfies? p/GarbageCollectable sys))
+                  (let [snap-ids (set (map :snapshot-id entries))]
+                    (try
+                      ;; Step 1: adapter deletes native snapshots (forward opts so
+                      ;; per-adapter retention/grace/dry-run reach the leaf)
+                      (p/gc-sweep! sys snap-ids opts)
+                      ;; Step 2: only deregister after adapter confirms success
+                      (doseq [entry entries]
+                        (reg/deregister! registry entry))
+                      (swap! swept into entries)
+                      (catch #?(:clj Exception :cljs :default) e
+                        ;; Conservative: skip on failure — entries stay in registry
+                        (swap! errors assoc system-id e))))
+                  ;; System not GarbageCollectable — skip
+                  nil)))
+            ;; Flush registry changes
+            (reg/flush! registry)
+            ;; Reclaim superseded PSS B-tree nodes from the registry's own storage
+            ;; (the registry is a durable 2P-Set — mark-and-sweep, datahike-style).
+            (let [freed-count (try (count (await (reg/gc! registry opts)))
+                                   (catch #?(:clj Exception :cljs :default) _ 0))]
+              {:swept @swept
+               :errors @errors
+               :freed-nodes-swept freed-count}))))))))
 
 ;; ============================================================
 ;; GC reporting
@@ -195,4 +203,4 @@
    (Per-snapshot adapters that need the candidate set must use gc-sweep! with a
    registry instead.)"
   ([system] (gc-system! system {}))
-  ([system opts] (p/gc-sweep! system nil opts)))
+  ([system opts] (p/gc-sweep! system nil (t/async-gc-opts "gc/gc-system!" opts))))

@@ -34,9 +34,12 @@
      the mode from the record's `:opts`. Pass `{:sync? sync?}` to any op called
      with explicit opts (e.g. `d/load-roots`)."
   #?(:clj  (:require [clojure.test]
-                     [is.simm.partial-cps.async])
+                     [is.simm.partial-cps.async]
+                     [is.simm.partial-cps.core-async]
+                     [clojure.core.async])
      :cljs (:require [cljs.test]
                      [is.simm.partial-cps.async]
+                     [is.simm.partial-cps.core-async]
                      ;; registers konserve's `:file` backend defmethods on node, so
                      ;; `{:backend :file}` resolves via `kstore/connect-store` /
                      ;; `create-store` / `store-exists?` exactly like the JVM file store.
@@ -80,6 +83,18 @@
   (if (cljs-env? &env)
     `(is.simm.partial-cps.async/await ~x)
     x))
+
+(defmacro <gc
+  "Resolve an ASYNC-ONLY gc op portably. Unlike `<?`, a gc op returns an
+   await-able partial-cps CPS on BOTH platforms (it has no synchronous-value
+   form), so the JVM must DRIVE the CPS at this test boundary rather than treat
+   it as identity: bridge it to a core.async channel and block-read it. On cljs
+   `await` the CPS (valid only inside a `deftest-async` body's `async` block)."
+  [x]
+  (if (cljs-env? &env)
+    `(is.simm.partial-cps.async/await ~x)
+    `(is.simm.partial-cps.core-async/unwrap-result
+      (clojure.core.async/<!! (is.simm.partial-cps.core-async/->chan ~x)))))
 
 (defmacro deftest-async
   "Like `clojure.test/deftest`, but the body may use `<?` to resolve async

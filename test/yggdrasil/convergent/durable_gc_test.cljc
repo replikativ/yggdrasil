@@ -10,7 +10,7 @@
    are JVM-only: a sequential async fold over 300 elements / a sync registry
    facade don't translate to a single cljs `async` body without loop/recur."
   (:require [clojure.test :refer [is testing]]
-            [yggdrasil.test-async :refer [deftest-async <? sync? file-cfg]]
+            [yggdrasil.test-async :refer [deftest-async <? <gc sync? file-cfg]]
             [konserve.core :as k]
             [yggdrasil.types :as ytypes]
             [yggdrasil.protocols :as p]
@@ -21,7 +21,7 @@
             #?(:clj [yggdrasil.convergent.twopset :as d2p])
             #?(:clj [yggdrasil.registry :as reg])
             #?(:clj [yggdrasil.types :as t]))
-  #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <?]]
+  #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <? <gc]]
                             [is.simm.partial-cps.async :refer [async]])))
 
 ;; gc! is SAFE BY DEFAULT (reclaims nothing); pass a cutoff of `now` to reclaim
@@ -40,10 +40,10 @@
           gs (<? (g/conj gs :b)) gs (<? (g/flush! gs))
           kv (:kv-store gs)
           roots (vals (<? (d/load-roots kv {} {:sync? sync?})))]
-      (is (empty? (<? (d/gc! kv roots {} {:sync? sync?}))) "default (epoch cutoff) ⇒ reclaim nothing")
-      (is (empty? (<? (d/gc! kv roots {} {:sync? sync? :grace-period-ms 600000})))
+      (is (empty? (<gc (d/gc! kv roots {} {}))) "default (epoch cutoff) ⇒ reclaim nothing")
+      (is (empty? (<gc (d/gc! kv roots {} {:grace-period-ms 600000})))
           "a 10-min grace still spares the just-written orphans")
-      (is (pos? (count (<? (d/gc! kv roots {} {:sync? sync? :grace-period-ms 0}))))
+      (is (pos? (count (<gc (d/gc! kv roots {} {:grace-period-ms 0}))))
           ":grace-period-ms 0 reclaims orphans older than now"))))
 
 (deftest-async gc-retains-held-snapshot
@@ -56,7 +56,7 @@
           gs   (<? (g/conj gs :d))  gs (<? (g/flush! gs))]
       ;; GC pinning S0: its now-unreferenced nodes must be RETAINED (else as-of
       ;; below would read a swept node). Guards the gc-sweep! :retain-roots wiring.
-      (<? (p/gc-sweep! gs #{snap} {:sync? sync? :remove-before (now)}))
+      (<gc (p/gc-sweep! gs #{snap} {:remove-before (now)}))
       (is (= #{:a :b} (<? (p/as-of gs snap))) "held snapshot survived GC (retention works)")
       (is (= #{:a :b :c :d} (<? (g/elements gs))) "live set intact after GC"))))
 
@@ -78,14 +78,14 @@
            (let [kv (:kv-store gs)
                  before (node-key-count kv)
                  live-before (g/elements gs)
-                 deleted (g/gc! gs {:remove-before (now)})
+                 deleted (<gc (g/gc! gs {:remove-before (now)}))
                  after (node-key-count kv)]
              (is (pos? (count deleted)) "GC deleted superseded nodes")
              (is (< after before) "node count dropped")
              (is (= live-before (g/elements gs)) "live set unchanged after GC")
              (is (= (set (range 300)) (g/elements gs)))
              (testing "GC is idempotent — a second sweep on the quiescent store deletes nothing"
-               (is (empty? (g/gc! gs {:remove-before (now)}))))
+               (is (empty? (<gc (g/gc! gs {:remove-before (now)})))))
              (testing "every node reachable from the current root survived"
                (let [root (get (d/load-roots kv) :main)]
                  (is (every? #(some? (k/get kv % {:sync? true}))
@@ -98,7 +98,7 @@
                           (partition-all 30 (range 150)))
                s  (d2p/flush! (-> s0 (d2p/disj 7) (d2p/disj 42)))]
            (let [live-before (d2p/elements s)
-                 deleted (d2p/gc! s {:remove-before (now)})]
+                 deleted (<gc (d2p/gc! s {:remove-before (now)}))]
              (is (pos? (count deleted)))
              (is (= live-before (d2p/elements s)) "live (adds − removals) unchanged")
              (is (not (contains? (d2p/elements s) 7)) "tombstoned element stays removed")))))
@@ -114,7 +114,7 @@
            (let [kv (:kv-store r)
                  before (node-key-count kv)
                  n-before (reg/entry-count r)
-                 deleted (reg/gc! r {:remove-before (now)})
+                 deleted (<gc (reg/gc! r {:remove-before (now)}))
                  after (node-key-count kv)]
              (is (pos? (count deleted)))
              (is (<= after before))
