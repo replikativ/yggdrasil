@@ -1,5 +1,13 @@
 # Convergent CRDTs
 
+> [!WARNING]
+> **Experimental — not yet stable.** The durable convergent CRDT layer's **on-disk storage
+> format** (per-branch head cells, commit lineage, node fusion) is actively evolving and may
+> change between releases **without a migration path** while we stabilize durable branchability.
+> Pin an exact version and expect to rebuild stores until this settles. The in-memory value /
+> `-join` semantics documented below are stable; the **durability + branchability substrate is
+> the moving part**.
+
 Yggdrasil ships a catalog of **conflict-free replicated data types** as first-class
 yggdrasil *systems*: each is a value with a commutative/associative/idempotent join
 (`-join`), durable on the same PSS-over-konserve substrate as the snapshot registry,
