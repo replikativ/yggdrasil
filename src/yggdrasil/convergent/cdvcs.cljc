@@ -65,7 +65,9 @@
 ;; ordered by id only — so a partial `[id]` vector is a valid slice bound (the
 ;; comparator ignores the rest). Same id ⟺ same content-addressed value, so the
 ;; id-only order is a true set (conj of an equal entry is a no-op).
-(def ^:private graph-cmp d/commit-graph-cmp)          ; the shared id-only commit-graph order
+;; CDVCS keeps its OWN commit-graph as a PSS grow-set (its multi-head graph IS its :main
+;; payload) — id-only order, distinct from the flat CRDTs' standalone commit keys.
+(def ^:private graph-cmp (fn [a b] (compare (first a) (first b))))
 
 ;; ============================================================
 ;; Graph PSS persistence (commit values ride inline in the entries)
@@ -103,10 +105,15 @@
               (async (await (kb/k-assoc kv-store (sk config) state opts)))))
 
 (defn parents-of
-  "The shared `d/commit-parents-of` accessor (`id -> async parents-or-nil` over the commit
-   graph). A thin cdvcs-local alias that drops the `storage` arg its call sites still pass."
+  "An accessor `id -> (async parents-or-nil)` over cdvcs's OWN commit-graph PSS `graph` — its
+   multi-head grow-set of `[id value]` entries (the value carries `:parents`) IS its `:main`
+   payload, distinct from the flat CRDTs' standalone commit keys. (async+sync)"
   [graph _storage opts]
-  (d/commit-parents-of graph opts))
+  (fn [id]
+    (async+sync (:sync? opts)
+                (async
+                 (let [es (await (d/slice->clj graph [id] [id] opts))]
+                   (when (seq es) (:parents (second (first es)))))))))
 
 ;; ============================================================
 ;; Functional verbs — each returns a NEW record (value-semantic)

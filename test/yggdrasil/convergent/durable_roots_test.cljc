@@ -21,9 +21,9 @@
           kv (:kv-store gs)]
       (<? (d/register-branch! kv :main {} {:sync? sync?}))
       (<? (d/register-branch! kv :feature {} {:sync? sync?}))    ; a writer that only knows :feature
-      (is (= #{:main :feature} (disj (<? (d/load-branches kv {} {:sync? sync?})) d/commit-graph-branch)) ":main survived")
+      (is (= #{:main :feature} (<? (d/load-branches kv {} {:sync? sync?}))) ":main survived")
       (<? (d/register-branch! kv :main {} {:sync? sync?}))       ; idempotent re-add
-      (is (= #{:main :feature} (disj (<? (d/load-branches kv {} {:sync? sync?})) d/commit-graph-branch))))))
+      (is (= #{:main :feature} (<? (d/load-branches kv {} {:sync? sync?})))))))
 
 (deftest-async multi-branch-peers-converge
   (testing "two peers each add a distinct branch → merge keeps BOTH branches"
@@ -48,4 +48,4 @@
       (is (= #{:shared :a-only} (<? (g/elements (<? (p/checkout a :fa {:sync? sync?}))))))
       (is (= #{:shared :b-only} (<? (g/elements (<? (p/checkout b :fb {:sync? sync?}))))))
       ;; and the branch registry on disk reflects all three branches
-      (is (= #{:main :fa :fb} (disj (<? (d/load-branches (:kv-store a) {} {:sync? sync?})) d/commit-graph-branch))))))
+      (is (= #{:main :fa :fb} (<? (d/load-branches (:kv-store a) {} {:sync? sync?})))))))

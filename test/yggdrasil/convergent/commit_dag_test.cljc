@@ -34,28 +34,22 @@
     (is (= (:id (d/base-commit)) (:id (d/base-commit))) "base id is stable across calls")
     (is (= {:root nil :parents []} (:value (d/base-commit))))))
 
-(deftest-async commit-graph-persist-and-walk
-  (testing "append commits to the shared graph, persist to the reserved-branch head cell,
-            COLD-reload, and slice each commit's parents — the walkable substrate merge-base
-            rides on (no historical root trees involved)."
-    (let [{:keys [kv-store storage]} (<? (d/open (file-cfg) {} {:sync? sync?}))
-          config {}
+(deftest-async commit-persist-and-walk
+  (testing "store commits as STANDALONE content-addressed keys (O(1), no PSS grow-set); COLD-read
+            each commit's parents — the walkable lineage merge-base rides on."
+    (let [{:keys [kv-store]} (<? (d/open (file-cfg) {} {:sync? sync?}))
           base (d/base-commit)
           c1   (d/make-commit "root1" #{(:id base)})
           c2   (d/make-commit "root2" #{(:id c1)})
-          g0   (<? (d/load-commit-graph kv-store storage config {:sync? sync?}))
-          g1   (<? (d/append-commit! g0 base {:sync? sync?}))
-          g2   (<? (d/append-commit! g1 c1 {:sync? sync?}))
-          g3   (<? (d/append-commit! g2 c2 {:sync? sync?}))
-          _    (<? (d/save-commit-graph! kv-store g3 storage config {:sync? sync?}))
-          ;; COLD reload from the store (fresh restore-fused)
-          g    (<? (d/load-commit-graph kv-store storage config {:sync? sync?}))
-          pof  (d/commit-parents-of g {:sync? sync?})]
+          _    (<? (d/append-commit! kv-store base {:sync? sync?}))
+          _    (<? (d/append-commit! kv-store c1 {:sync? sync?}))
+          _    (<? (d/append-commit! kv-store c2 {:sync? sync?}))
+          pof  (d/commit-parents-of kv-store {:sync? sync?})]
       (is (= #{(:id c1)}   (set (<? (pof (:id c2))))) "c2's parents = {c1}")
       (is (= #{(:id base)} (set (<? (pof (:id c1))))) "c1's parents = {base}")
       (is (empty? (<? (pof (:id base)))) "base has no parents")
-      (is (nil? (<? (pof "nonexistent"))) "an absent commit slices to nil")
-      ;; the dag algebra linearizes the same graph via parents-of
+      (is (nil? (<? (pof "nonexistent"))) "an absent commit reads nil")
+      ;; the dag algebra linearizes the lineage via parents-of
       (is (= #{(:id base) (:id c1) (:id c2)}
              (set (<? (dag/commit-history pof (:id c2) {:sync? sync?}))))
           "commit-history walks the full ancestry of the tip"))))

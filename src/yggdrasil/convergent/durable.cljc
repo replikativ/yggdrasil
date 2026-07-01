@@ -459,93 +459,52 @@
 (defn make-commit
   "A commit VALUE + its content-addressed id. `root-handle` is the materialized root
    address (single-root) or `{:adds <addr> :removals <addr>}` (two-half); `parents` any coll of
-   parent commit-ids. id = `hash {:root :parents}` with parents sorted → order-independent +
-   author/ts-free, so equal (state, parents) across peers ⇒ equal id."
+   parent commit-ids. The commit is stored as a STANDALONE content-addressed key (`store-commit!`)
+   — so the id IS its store key `(hasch/uuid value)`. Parents sorted → order-independent +
+   author/ts-free, so equal (state, parents) across peers ⇒ equal id (one O(1) write per commit,
+   no tree-path amplification)."
   [root-handle parents]
   (let [cval {:root root-handle :parents (vec (sort-by str parents))}]
-    ;; STRING id (like the snapshot-id convention) so the id-ordered graph slices with a
-    ;; uniform comparator (a UUID id would break `compare` against a string slice bound).
-    {:id (str (hasch/uuid cval)) :value cval}))
+    {:id (hasch/uuid cval) :value cval}))
 
 (defn base-commit
   "The canonical base commit (no root, no parents) — a fixed shared sentinel every fresh convergent
    CRDT starts from, so same-origin CRDTs always share a common ancestor (merge-base never nil)."
   []
   (let [cval {:root nil :parents []}]
-    {:id (str (hasch/uuid cval)) :value cval}))
-
-(def commit-graph-branch
-  "Reserved branch whose head cell holds the shared commit-graph PSS. Registered in the SAME
-   branches registry as the value branches (so the walker / registry / GC cover it uniformly),
-   but filtered from user-facing `branches`. A simple keyword so `head-key` stays single-slash."
-  :commit-graph)
-
-(def commit-graph-cmp
-  "Order `[commit-id value]` graph entries by id ONLY — a partial `[id]` is a valid slice
-   bound, and (crucially) two entries for the SAME commit (e.g. a shared base across peers)
-   compare equal WITHOUT touching the non-`Comparable` value maps. Consumers unioning the
-   commit-graph across stores MUST use this, not a full-vector `compare`."
-  (fn [a b] (compare (first a) (first b))))
-
-(defn load-commit-graph
-  "Restore the commit-graph PSS from its reserved-branch head cell (empty when none).
-   (async+sync)"
-  [kv-store storage config opts]
-  (async+sync (:sync? opts)
-              (async
-               (restore-fused commit-graph-cmp
-                              (:root (await (load-head kv-store commit-graph-branch config opts)))
-                              storage opts))))
-
-(defn save-commit-graph!
-  "Persist the commit-graph PSS — fused root inlined into the reserved-branch head cell —
-   + register the reserved branch. Returns the fused root node. (async+sync)"
-  [kv-store graph storage config opts]
-  (async+sync (:sync? opts)
-              (async
-               (let [{root-node :root-node} (await (flush-set-fused! graph storage opts))]
-                 (await (save-head! kv-store commit-graph-branch {:root root-node} config opts))
-                 (await (register-branch! kv-store commit-graph-branch config opts))
-                 root-node))))
+    {:id (hasch/uuid cval) :value cval}))
 
 (defn append-commit!
-  "Append a commit (`{:id :value}` from `make-commit`) to the commit-graph grow-set
-   as an `[id value]` entry — content-addressing dedups a re-commit. Returns the new graph.
-   (async+sync)"
-  [graph commit opts]
-  (set-conj graph [(:id commit) (:value commit)] commit-graph-cmp opts))
+  "Persist a commit (`{:id :value}` from `make-commit`) as a STANDALONE content-addressed,
+   write-once key (`store-commit!` — key == id). Idempotent (content-addressed dedups a
+   re-commit). Returns the id. (async+sync)"
+  [kv-store commit opts]
+  (store-commit! kv-store (:value commit) opts))
 
 (defn commit-parents-of
-  "An accessor `commit-id -> (async parents-or-nil)` over a restored commit-graph `graph`, for
-   `dag/lowest-common-ancestors`: slices the `[id value]` entry and yields the value's
-   `:parents` (a canonical sorted vec), or nil when the commit is absent. (async+sync)"
-  [graph opts]
+  "An accessor `commit-id -> (async parents-or-nil)` over the STANDALONE commit keys, for
+   `dag/lowest-common-ancestors`: reads the commit and yields its `:parents` (a canonical sorted
+   vec), or nil when the commit is absent. (async+sync)"
+  [kv-store opts]
   (fn [id]
     (async+sync (:sync? opts)
-                (async
-                 (let [es (await (slice->clj graph [id] [id] opts))]
-                   (when (seq es) (:parents (second (first es)))))))))
+                (async (:parents (await (read-commit kv-store id opts)))))))
 
 ;; ---- shared Graphable / merge-base over the commit-graph (gset + two-half all delegate) ----
 
 (defn commit-history
   "The commit-DAG history (DFS linearization) of a branch tip `commit`. (async+sync)"
-  [kv-store storage config commit opts]
+  [kv-store _storage _config commit opts]
   (async+sync (:sync? opts)
               (async
-               (await (dag/commit-history
-                       (commit-parents-of (await (load-commit-graph kv-store storage config opts)) opts)
-                       commit opts)))))
+               (await (dag/commit-history (commit-parents-of kv-store opts) commit opts)))))
 
 (defn commit-ancestors
   "All ancestor commit-ids of commit `s` (excluding `s`). (async+sync)"
-  [kv-store storage config s opts]
+  [kv-store _storage _config s opts]
   (async+sync (:sync? opts)
               (async
-               (remove #{s}
-                       (await (dag/commit-history
-                               (commit-parents-of (await (load-commit-graph kv-store storage config opts)) opts)
-                               s opts))))))
+               (remove #{s} (await (dag/commit-history (commit-parents-of kv-store opts) s opts))))))
 
 (defn commit-ancestor?
   "True if commit `a` is an ancestor of commit `b`. (async+sync)"
@@ -555,42 +514,49 @@
 
 (defn commit-common-ancestor
   "The merge-base of commits `a` and `b` (most recent common ancestor). (async+sync)"
-  [kv-store storage config a b opts]
+  [kv-store _storage _config a b opts]
   (async+sync (:sync? opts)
               (async
-               (let [pof (commit-parents-of (await (load-commit-graph kv-store storage config opts)) opts)]
+               (let [pof (commit-parents-of kv-store opts)]
                  (first (:lcas (await (dag/lowest-common-ancestors pof #{a} pof #{b} opts))))))))
 
 (defn commit-graph-map
-  "The whole commit-DAG as `{commit-id {:parent-ids #{…}}}`. (async+sync)"
-  [kv-store storage config opts]
+  "The whole commit-DAG — every commit reachable from a branch tip — as
+   `{commit-id {:parent-ids #{…}}}`. (async+sync)"
+  [kv-store _storage config opts]
   (async+sync (:sync? opts)
               (async
-               (into {} (map (fn [e] [(first e) {:parent-ids (set (:parents (second e)))}]))
-                     (await (slice->clj (await (load-commit-graph kv-store storage config opts))
-                                        [""] ["￿"] opts))))))
+               (let [branches (await (load-branches kv-store config opts))
+                     tips     (loop [bs (seq branches) acc []]
+                                (if bs
+                                  (recur (next bs) (conj acc (:commit (await (load-head kv-store (first bs) config opts)))))
+                                  acc))]
+                 (loop [stack (vec (remove nil? tips)) graph {}]
+                   (if-let [id (peek stack)]
+                     (if (contains? graph id)
+                       (recur (pop stack) graph)
+                       (let [parents (:parents (await (read-commit kv-store id opts)))]
+                         (recur (into (pop stack) parents)
+                                (assoc graph id {:parent-ids (set parents)}))))
+                     graph))))))
 
 (defn commit-info
   "`{:parent-ids #{…} :root <handle>}` for commit `id`, or nil. (async+sync)"
-  [kv-store storage config id opts]
+  [kv-store _storage _config id opts]
   (async+sync (:sync? opts)
               (async
-               (let [es (await (slice->clj (await (load-commit-graph kv-store storage config opts))
-                                           [id] [id] opts))]
-                 (when (seq es)
-                   (let [v (second (first es))]
-                     {:parent-ids (set (:parents v)) :root (:root v)}))))))
+               (when-let [v (await (read-commit kv-store id opts))]
+                 {:parent-ids (set (:parents v)) :root (:root v)}))))
 
 (defn commit-merge-base
-  "The merge-base commit of branches `a-branch` and `b-branch` — LCA over the commit-graph,
-   seeded from each branch's tip. nil if no shared ancestor. (async+sync)"
-  [kv-store storage config a-branch b-branch opts]
+  "The merge-base commit of branches `a-branch` and `b-branch` — LCA over the standalone commit
+   keys, seeded from each branch's tip. nil if no shared ancestor. (async+sync)"
+  [kv-store _storage config a-branch b-branch opts]
   (async+sync (:sync? opts)
               (async
-               (let [ha    (await (load-head kv-store a-branch config opts))
-                     hb    (await (load-head kv-store b-branch config opts))
-                     graph (await (load-commit-graph kv-store storage config opts))
-                     pof   (commit-parents-of graph opts)]
+               (let [ha  (await (load-head kv-store a-branch config opts))
+                     hb  (await (load-head kv-store b-branch config opts))
+                     pof (commit-parents-of kv-store opts)]
                  (first (:lcas (await (dag/lowest-common-ancestors
                                        pof #{(:commit ha)} pof #{(:commit hb)} opts))))))))
 
@@ -605,10 +571,8 @@
                (let [{:keys [kv-store storage branch config]} this
                      a-addr (str (await (materialize-root! adds storage opts)))
                      r-addr (str (await (materialize-root! removals storage opts)))
-                     mc     (make-commit {:adds a-addr :removals r-addr} (disj (into #{} parents) nil))
-                     graph' (await (append-commit!
-                                    (await (load-commit-graph kv-store storage config opts)) mc opts))]
-                 (await (save-commit-graph! kv-store graph' storage config opts))
+                     mc     (make-commit {:adds a-addr :removals r-addr} (disj (into #{} parents) nil))]
+                 (await (append-commit! kv-store mc opts))     ; standalone content-addressed commit key
                  (await (save-head! kv-store branch
                                     {:adds (root-node-blob adds) :removals (root-node-blob removals) :commit (:id mc)}
                                     config opts))
@@ -638,18 +602,16 @@
    walk-truncation; commits are anonymous so the root's store time is the recency proxy).
    `remove-before` nil/epoch ⇒ every commit in-window ⇒ ALL historical roots retained (the
    safe default — reclaims nothing). (async+sync)"
-  [kv-store storage tips remove-before config opts]
+  [kv-store _storage tips remove-before _config opts]
   (async+sync (:sync? opts)
               (async
-               (let [graph  (await (load-commit-graph kv-store storage config opts))
-                     cutoff (when remove-before (inst-ms remove-before))
+               (let [cutoff (when remove-before (inst-ms remove-before))
                      all?   (or (nil? cutoff) (zero? cutoff))]
                  (loop [stack (vec (remove nil? tips)) seen #{} roots #{}]
                    (if-let [id (peek stack)]
                      (if (contains? seen id)
                        (recur (pop stack) seen roots)
-                       (let [es (await (slice->clj graph [id] [id] opts))
-                             v  (when (seq es) (second (first es)))]
+                       (let [v (await (read-commit kv-store id opts))]
                          (if v
                            (let [addrs     (commit-root-addresses (:root v))
                                  lw        (when (and (not all?) (seq addrs))
@@ -661,6 +623,22 @@
                                     (into roots addrs)))
                            (recur (pop stack) (conj seen id) roots))))
                      roots))))))
+
+(defn commit-reachable-keys
+  "The set of commit KEYS reachable from `tips` (the FULL parent chain — commit metadata is tiny,
+   so it is retained in full; only historical ROOT TREES are window-pruned by
+   `commit-reachable-roots`). Pass as `:retain-keys` to `gc!` so live commits survive and a
+   deleted branch's orphan commits become reclaimable. (async+sync)"
+  [kv-store tips opts]
+  (async+sync (:sync? opts)
+              (async
+               (loop [stack (vec (remove nil? tips)) seen #{}]
+                 (if-let [id (peek stack)]
+                   (if (contains? seen id)
+                     (recur (pop stack) seen)
+                     (let [parents (:parents (await (read-commit kv-store id opts)))]
+                       (recur (into (pop stack) parents) (conj seen id))))
+                   seen)))))
 
 ;; ============================================================
 ;; Reachability walk — the ship-set (delta-first sync primitive)
@@ -772,6 +750,29 @@
                             (await (kb/k-assoc dst-store addr v opts))
                             (recur (next as) (inc n)))))
                       n)))))))
+
+(defn ship-commits!
+  "Copy the commit-DAG reachable from `tip` — every standalone commit key (`read-commit` →
+   `:parents`) and each commit's `:root` tree — from `src-store` into `dst-store`, skipping what
+   dst already holds. The cross-store transport for lineage now that commits are standalone
+   content-addressed keys (no reserved branch). (async+sync)"
+  ([src-store dst-store tip] (ship-commits! src-store dst-store tip {:sync? true}))
+  ([src-store dst-store tip opts]
+   (async+sync (:sync? opts)
+               (async
+                (loop [stack (if tip [tip] []) seen #{}]
+                  (if-let [id (peek stack)]
+                    (if (contains? seen id)
+                      (recur (pop stack) seen)
+                      (let [v (await (read-commit src-store id opts))]
+                        (when (and v (not (await (read-commit dst-store id opts))))
+                          (await (store-commit! dst-store v opts)))
+                        (loop [as (seq (commit-root-addresses (:root v)))]
+                          (when as
+                            (await (ship! src-store dst-store (first as) opts))
+                            (recur (next as))))
+                        (recur (into (pop stack) (:parents v)) (conj seen id))))
+                    nil))))))
 
 (defn ship-node!
   "Ship a FUSED root NODE's tree from `src-store` to `dst-store`: store the node in `src`
@@ -933,39 +934,26 @@
                  ;; a lazily-seeded root can miss).
                  (loop [bs (seq obranches) ca adds cr removals]
                    (if bs
-                     (let [b (first bs)]
-                       (if (= b commit-graph-branch)
-                         ;; C1: the reserved commit-graph branch is SINGLE-root `{:root node}`
-                         ;; (not two halves) — ship + union it as a grow-set under the id-only
-                         ;; comparator (a shared base commit is an id tie the value comparator
-                         ;; would choke on). Without this a cold peer never receives the lineage.
-                         (let [oh (await (load-head o-store b o-config opts))
-                               _  (await (ship-node! o-store kv-store (:root oh) opts))
-                               gh (await (load-head kv-store b config opts))
-                               u  (await (set-union (restore-fused commit-graph-cmp (:root gh) storage opts)
-                                                    (restore-fused commit-graph-cmp (:root oh) storage opts)
-                                                    commit-graph-cmp opts))
-                               {rn :root-node} (await (flush-set-fused! u storage opts))]
-                           (await (save-head! kv-store b {:root rn :commit (:commit gh)} config opts))
+                     (let [b   (first bs)
+                           oh  (await (load-head o-store b o-config opts))
+                           _   (await (ship-node! o-store kv-store (:adds oh) opts))
+                           _   (await (ship-node! o-store kv-store (:removals oh) opts))
+                           ;; ship the peer branch's LINEAGE (standalone commit keys + root trees)
+                           _   (await (ship-commits! o-store kv-store (:commit oh) opts))
+                           oa  (restore-fused comparator (:adds oh) storage opts)
+                           or* (restore-fused comparator (:removals oh) storage opts)]
+                       (if (= b branch)
+                         (recur (next bs)
+                                (await (set-union ca oa comparator opts))
+                                (await (set-union cr or* comparator opts)))
+                         (let [gh (await (load-head kv-store b config opts))
+                               a' (await (set-union (restore-fused comparator (:adds gh) storage opts) oa comparator opts))
+                               r' (await (set-union (restore-fused comparator (:removals gh) storage opts) or* comparator opts))
+                               {an :root-node} (await (flush-set-fused! a' storage opts))
+                               {rn :root-node} (await (flush-set-fused! r' storage opts))]
+                           (await (save-head! kv-store b {:adds an :removals rn :commit (or (:commit gh) (:commit oh))} config opts))
                            (await (register-branch! kv-store b config opts))
-                           (recur (next bs) ca cr))
-                         (let [oh  (await (load-head o-store b o-config opts))
-                               _   (await (ship-node! o-store kv-store (:adds oh) opts))
-                               _   (await (ship-node! o-store kv-store (:removals oh) opts))
-                               oa  (restore-fused comparator (:adds oh) storage opts)
-                               or* (restore-fused comparator (:removals oh) storage opts)]
-                           (if (= b branch)
-                             (recur (next bs)
-                                    (await (set-union ca oa comparator opts))
-                                    (await (set-union cr or* comparator opts)))
-                             (let [gh (await (load-head kv-store b config opts))
-                                   a' (await (set-union (restore-fused comparator (:adds gh) storage opts) oa comparator opts))
-                                   r' (await (set-union (restore-fused comparator (:removals gh) storage opts) or* comparator opts))
-                                   {an :root-node} (await (flush-set-fused! a' storage opts))
-                                   {rn :root-node} (await (flush-set-fused! r' storage opts))]
-                               (await (save-head! kv-store b {:adds an :removals rn :commit (:commit gh)} config opts))
-                               (await (register-branch! kv-store b config opts))
-                               (recur (next bs) ca cr))))))
+                           (recur (next bs) ca cr))))
                      (let [merged (assoc this :adds ca :removals cr :dirty true)]
                        (if (:flush? opts true) (await (two-half-flush! merged opts)) merged))))))))
 
@@ -1014,10 +1002,7 @@
                      a-addr (str (await (materialize-root! a' storage opts)))
                      r-addr (str (await (materialize-root! r' storage opts)))
                      mc     (make-commit {:adds a-addr :removals r-addr} (disj (into #{} [commit (:commit h)]) nil))
-                     _      (await (save-commit-graph!
-                                    kv-store
-                                    (await (append-commit! (await (load-commit-graph kv-store storage config opts)) mc opts))
-                                    storage config opts))
+                     _      (await (append-commit! kv-store mc opts))
                      merged (assoc this :adds a' :removals r' :dirty true :commit (:id mc))]
                  (if (:flush? opts true) (await (two-half-flush! merged opts)) merged)))))
 
@@ -1051,10 +1036,13 @@
                        ;; datahike-style retention of historical commit root trees (both halves)
                        ;; within the window (epoch cutoff ⇒ keep all → reclaim nothing).
                        commit-roots (await (commit-reachable-roots kv-store storage tips
-                                                                   (t/gc-cutoff opts) config opts))]
+                                                                   (t/gc-cutoff opts) config opts))
+                       ;; retain the live commit KEYS (full chain from tips); orphaned commits
+                       ;; from a deleted branch fall out of the whitelist → reclaimable.
+                       commit-keys  (await (commit-reachable-keys kv-store tips opts))]
                    (await (gc! kv-store roots config
                                (merge opts {:retain-roots (into (vec retain-roots) commit-roots)
-                                            :retain-keys commit-addrs
+                                            :retain-keys (into (vec commit-addrs) commit-keys)
                                             :spare-keys (head-cell-keys config branches)}))))))))
 
 (defn two-half-open
@@ -1091,13 +1079,11 @@
                    ;; a fresh store has no registry — register the current branch.
                    (when-not (seq registry)
                      (await (register-branch! kv-store cur cell-config opts)))
-                   ;; seed the canonical base commit ONCE per store (shared common ancestor).
+                   ;; seed the canonical base commit ONCE per store (shared common ancestor) —
+                   ;; a standalone content-addressed key; store-once if absent.
                    (let [base (base-commit)]
-                     (when-not ((await (load-branches kv-store cell-config opts)) commit-graph-branch)
-                       (await (save-commit-graph!
-                               kv-store
-                               (await (append-commit! (await (load-commit-graph kv-store storage cell-config opts)) base opts))
-                               storage cell-config opts)))
+                     (when-not (await (read-commit kv-store (:id base) opts))
+                       (await (append-commit! kv-store base opts)))
                      ;; each half is a fused root NODE (inlined) — restore-fused cache-seeds it.
                      {:kv-store kv-store :storage storage :store-config store-config
                       :config cell-config :comparator comparator :branch cur

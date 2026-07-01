@@ -25,7 +25,6 @@
             [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
-            [yggdrasil.convergent.dag :as dag]
             [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.kbridge :as kb]
             [yggdrasil.fressian :as yf]
@@ -69,10 +68,7 @@
   ;; structural ops — STORE-BACKED (async+sync): branches live in the store, not the record.
   p/Branchable
   (branches [this] (p/branches this c/default-opts))
-  ;; hide the reserved `:commit-graph` lineage branch from the user-facing branch list.
-  (branches [_ opts]
-    (async+sync (:sync? opts)
-                (async (disj (await (d/load-branches kv-store config opts)) d/commit-graph-branch))))
+  (branches [_ opts] (d/load-branches kv-store config opts))
   (current-branch [_] branch)
   (branch! [this name] (p/branch! this name branch c/default-opts))     ; fork from CURRENT
   (branch! [this name from] (p/branch! this name from c/default-opts))
@@ -125,10 +121,7 @@
                        ;; `into` (not a #{} literal) — the two tips may be EQUAL (e.g. neither
                        ;; branch committed since the fork), which a set literal rejects.
                        mc        (d/make-commit root-addr (disj (into #{} [commit (:commit h)]) nil))
-                       graph'    (await (d/append-commit!
-                                         (await (d/load-commit-graph kv-store storage config opts))
-                                         mc opts))
-                       _         (await (d/save-commit-graph! kv-store graph' storage config opts))
+                       _         (await (d/append-commit! kv-store mc opts))
                        g'        (assoc this :root u :dirty? true :commit (:id mc))]
                    (if (:flush? opts true) (await (flush! g' opts)) g')))))
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
@@ -146,11 +139,8 @@
                 (async
                  (let [root-addr (str (await (d/materialize-root! root storage opts)))
                        root-node (d/root-node-blob root)
-                       mc        (d/make-commit root-addr (if commit #{commit} #{}))
-                       graph'    (await (d/append-commit!
-                                         (await (d/load-commit-graph kv-store storage config opts))
-                                         mc opts))]
-                   (await (d/save-commit-graph! kv-store graph' storage config opts))
+                       mc        (d/make-commit root-addr (if commit #{commit} #{}))]
+                   (await (d/append-commit! kv-store mc opts))    ; standalone content-addressed commit key
                    (await (d/save-head! kv-store branch {:root root-node :commit (:id mc)} config opts))
                    (assoc this :dirty? false :commit (:id mc))))))
 
@@ -198,10 +188,14 @@
                          ;; datahike-style retention: keep historical commit root trees WITHIN
                          ;; the window (epoch cutoff ⇒ keep them all → reclaim nothing).
                          commit-roots (await (d/commit-reachable-roots kv-store storage tips
-                                                                       (t/gc-cutoff gc-opts) config gc-opts))]
+                                                                       (t/gc-cutoff gc-opts) config gc-opts))
+                         ;; retain the live commit KEYS (full chain from tips); orphaned commits
+                         ;; from a deleted branch fall out of the whitelist → reclaimable.
+                         commit-keys  (await (d/commit-reachable-keys kv-store tips gc-opts))]
                      (await (d/gc! kv-store roots config
                                    (merge gc-opts
                                           {:retain-roots (into (mapv #(parse-uuid (str %)) snapshot-ids) commit-roots)
+                                           :retain-keys  commit-keys
                                            :spare-keys   (d/head-cell-keys config branches)}))))))))
 
   p/Overlayable
@@ -216,49 +210,20 @@
       (ovl/convergent-overlay this mode lw)))
 
   p/Graphable
-  ;; the commit-DAG is loaded ON DEMAND (cold — touched only by these explicit ops), via the
-  ;; reserved `:commit-graph` grow-set; `parents-of` slices each commit entry.
+  ;; the commit-DAG (standalone content-addressed commit keys) — all methods delegate to the
+  ;; shared `d/commit-*` helpers (gset + the two-half CRDTs share one implementation).
   (history [this] (p/history this c/default-opts))
-  (history [_ opts]
-    (async+sync (:sync? opts)
-                (async
-                 (await (dag/commit-history
-                         (d/commit-parents-of (await (d/load-commit-graph kv-store storage config opts)) opts)
-                         commit opts)))))
+  (history [_ opts] (d/commit-history kv-store storage config commit opts))
   (ancestors [this s] (p/ancestors this s c/default-opts))
-  (ancestors [_ s opts]
-    (async+sync (:sync? opts)
-                (async
-                 (remove #{s}
-                         (await (dag/commit-history
-                                 (d/commit-parents-of (await (d/load-commit-graph kv-store storage config opts)) opts)
-                                 s opts))))))
+  (ancestors [_ s opts] (d/commit-ancestors kv-store storage config s opts))
   (ancestor? [this a b] (p/ancestor? this a b c/default-opts))
-  (ancestor? [this a b opts]
-    (async+sync (:sync? opts)
-                (async (boolean (some #{a} (await (p/ancestors this b opts)))))))
+  (ancestor? [_ a b opts] (d/commit-ancestor? kv-store storage config a b opts))
   (common-ancestor [this a b] (p/common-ancestor this a b c/default-opts))
-  (common-ancestor [_ a b opts]
-    (async+sync (:sync? opts)
-                (async
-                 (let [pof (d/commit-parents-of (await (d/load-commit-graph kv-store storage config opts)) opts)]
-                   (first (:lcas (await (dag/lowest-common-ancestors pof #{a} pof #{b} opts))))))))
+  (common-ancestor [_ a b opts] (d/commit-common-ancestor kv-store storage config a b opts))
   (commit-graph [this] (p/commit-graph this c/default-opts))
-  (commit-graph [_ opts]
-    (async+sync (:sync? opts)
-                (async
-                 (into {} (map (fn [e] [(first e) {:parent-ids (set (:parents (second e)))}]))
-                       (await (d/slice->clj (await (d/load-commit-graph kv-store storage config opts))
-                                            [""] ["￿"] opts))))))
+  (commit-graph [_ opts] (d/commit-graph-map kv-store storage config opts))
   (commit-info [this id] (p/commit-info this id c/default-opts))
-  (commit-info [_ id opts]
-    (async+sync (:sync? opts)
-                (async
-                 (let [es (await (d/slice->clj (await (d/load-commit-graph kv-store storage config opts))
-                                               [id] [id] opts))]
-                   (when (seq es)
-                     (let [v (second (first es))]
-                       {:parent-ids (set (:parents v)) :root (:root v)})))))))
+  (commit-info [_ id opts] (d/commit-info kv-store storage config id opts)))
 
 ;; ============================================================
 ;; Value ops — each returns a NEW G-Set value (value-semantic)
@@ -310,19 +275,11 @@
                (async (set/difference (await (elements g opts)) (await (elements other opts)))))))
 
 (defn merge-base
-  "The most recent common ancestor commit of branches `a` and `b` (git merge-base) — via
-   `dag/lowest-common-ancestors` over the shared commit-graph, seeded from each branch's tip.
-   nil if the branches share no ancestor. (async+sync)"
+  "The most recent common ancestor commit of branches `a` and `b` (git merge-base) — LCA over
+   the standalone commit keys, seeded from each branch's tip. nil if no shared ancestor.
+   (async+sync)"
   ([g a b] (merge-base g a b c/default-opts))
-  ([g a b opts]
-   (async+sync (:sync? opts)
-               (async
-                (let [ha    (await (d/load-head (:kv-store g) a (:config g) opts))
-                      hb    (await (d/load-head (:kv-store g) b (:config g) opts))
-                      graph (await (d/load-commit-graph (:kv-store g) (:storage g) (:config g) opts))
-                      pof   (d/commit-parents-of graph opts)]
-                  (first (:lcas (await (dag/lowest-common-ancestors
-                                        pof #{(:commit ha)} pof #{(:commit hb)} opts)))))))))
+  ([g a b opts] (d/commit-merge-base (:kv-store g) (:storage g) (:config g) a b opts)))
 
 ;; ============================================================
 ;; Persistence — cross-platform
@@ -366,20 +323,18 @@
                   ;; lazy restore. Ship each peer head's fused NODE tree here directly.
                   (loop [bs (seq obranches) cur (:root g)]
                     (if bs
-                      ;; the reserved commit-graph branch holds `[id value]` entries whose value
-                      ;; maps are NOT Comparable — union it by the id-only comparator (a shared
-                      ;; base across peers is an id tie that full-vector `compare` would choke on).
                       (let [b     (first bs)
-                            bcmp  (if (= b d/commit-graph-branch) d/commit-graph-cmp cmp)
                             oh    (await (d/load-head o-store b o-config opts))
                             _     (await (d/ship-node! o-store g-store (:root oh) opts))
-                            orest (d/restore-fused bcmp (:root oh) g-storage opts)]
+                            ;; ship the peer branch's LINEAGE (standalone commit keys + root trees)
+                            _     (await (d/ship-commits! o-store g-store (:commit oh) opts))
+                            orest (d/restore-fused cmp (:root oh) g-storage opts)]
                         (if (= b (:branch g))
                           (recur (next bs) (await (d/set-union cur orest cmp opts)))
                           (let [gh (await (d/load-head g-store b g-config opts))
-                                u  (await (d/set-union (d/restore-fused bcmp (:root gh) g-storage opts) orest bcmp opts))
+                                u  (await (d/set-union (d/restore-fused cmp (:root gh) g-storage opts) orest cmp opts))
                                 {rn :root-node} (await (d/flush-set-fused! u g-storage opts))]
-                            (await (d/save-head! g-store b {:root rn :commit (:commit gh)} g-config opts))
+                            (await (d/save-head! g-store b {:root rn :commit (or (:commit gh) (:commit oh))} g-config opts))
                             (await (d/register-branch! g-store b g-config opts))
                             (recur (next bs) cur))))
                       (let [g' (assoc g :root cur :dirty? true)]
@@ -432,12 +387,8 @@
                     ;; seed the canonical base commit ONCE per store, so every branch traces to
                     ;; a shared common ancestor (merge-base is never nil for same-origin CRDTs).
                     (let [base (d/base-commit)]
-                      (when-not ((await (d/load-branches kv-store cell-config open-opts))
-                                 d/commit-graph-branch)
-                        (let [g1 (await (d/append-commit!
-                                         (await (d/load-commit-graph kv-store storage cell-config open-opts))
-                                         base open-opts))]
-                          (await (d/save-commit-graph! kv-store g1 storage cell-config open-opts))))
+                      (when-not (await (d/read-commit kv-store (:id base) open-opts))
+                        (await (d/append-commit! kv-store base open-opts)))
                       (->GSet id kv-store store-config storage comparator
                               root cur false (or (:commit h) (:id base)) cell-config))))))))
 
