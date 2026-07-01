@@ -81,6 +81,14 @@ These are the supported namespaces. **Everything else under `yggdrasil.*` is imp
 - `yggdrasil.convergent.gset` (`gset`) · `…orset` (`orset`) · `…twopset` (`twopset`) · `…ormap` (`ormap`/`merging-ormap`) · `…lwwr` (`lwwr`) · `…cdvcs` (`cdvcs`)
 - `yggdrasil.convergent.system` — build your own CRDT-as-system (`conflict-free-system`).
 
+> [!WARNING]
+> **Experimental — the durable convergent CRDT layer is not yet stable.** Its **on-disk
+> storage format** (per-branch head cells, commit lineage, node fusion) is actively evolving
+> and may change between releases **without a migration path** while we stabilize durable
+> branchability. Pin an exact version and expect to rebuild stores until this settles. The
+> in-memory value/`join` semantics are stable; the **durability + branchability substrate is
+> the moving part**.
+
 **Composition & orchestration**
 - `yggdrasil.composite` — pullback of N sub-systems as one logical system (`composite`/`pullback`).
 - `yggdrasil.compose` — mechanical multi-system commit/discard helpers.
