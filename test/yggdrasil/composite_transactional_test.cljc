@@ -22,9 +22,9 @@
   #?(:cljs (:require-macros [yggdrasil.test-async :refer [deftest-async <? <gc]]
                             [is.simm.partial-cps.async :refer [async]])))
 
-;; an opener co-locating a durable G-Set in the composite's store under its own cell
+;; an opener co-locating a durable G-Set in the composite's store under its own cell-ns
 (defn- opener [id]
-  (fn [kv o] (g/gset id {:kv-store kv :roots-key [:crdt/roots id]} {:sync? (:sync? o)})))
+  (fn [kv o] (g/gset id {:kv-store kv :cell-ns id} {:sync? (:sync? o)})))
 
 (defn- future-date []
   #?(:clj  (java.util.Date. (+ (System/currentTimeMillis) 1000))
@@ -33,10 +33,13 @@
 (deftest-async commit-flushes-all-subs-then-root
   (testing "sub-systems are durable only after the composite commits"
     (let [sc-a (file-cfg) sc-b (file-cfg) sc-comp (file-cfg)
+          ;; BATCH the sub edits with `{:flush? false}` (opt out of auto-flush) so they
+          ;; stay in-memory until the composite commits them ATOMICALLY — the transaction
+          ;; boundary is the composite `commit!`, not each `conj`.
           a (<? (g/gset "a" {:store-config sc-a} {:sync? sync?}))
-          a (<? (g/conj a :a1)) a (<? (g/conj a :a2))
+          a (<? (g/conj a :a1 {:sync? sync? :flush? false})) a (<? (g/conj a :a2 {:sync? sync? :flush? false}))
           b (<? (g/gset "b" {:store-config sc-b} {:sync? sync?}))
-          b (<? (g/conj b :b1))
+          b (<? (g/conj b :b1 {:sync? sync? :flush? false}))
           comp (<? (cmp/composite [a b] {:store-config sc-comp} {:sync? sync?}))]
       ;; pre-commit: the sub edits are in-memory only — a fresh reopen sees nothing
       (is (empty? (<? (g/elements (<? (g/gset "a" {:store-config sc-a} {:sync? sync?}))))))
@@ -61,7 +64,7 @@
           comp (<? (p/commit! comp "v1"))
           sid  (<? (p/snapshot-id comp))                ; FREEZE the composite at a:{:x :y}
           comp (<? (p/commit! (<? (cmp/update-subsystem comp "a" #(g/conj % :z))) "v2"))] ; → a:{:x :y :z}
-      (let [frozen (-> comp (p/branch! :iso sid) (p/checkout :iso))
+      (let [frozen (<? (p/checkout (<? (p/branch! comp :iso sid)) :iso))
             fa0    (cmp/get-subsystem frozen "a")]
         (is (= #{:x :y} (<? (g/elements fa0))) "sub a is frozen at the composite snapshot")
         (let [fa (<? (g/conj fa0 :w))]
@@ -88,10 +91,15 @@
   (testing "a co-located composite sweeps ONCE over the union of all roots —
             reclaims the orphaned superseded trees, keeps live state, and resolves"
     (let [comp (<? (cmp/composite [(opener "a")] {:store-config (file-cfg)} {:sync? sync?}))
-          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :x)))
-          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :y)))
+          ;; build a MULTI-node sub — each auto-flushed conj supersedes the prior tree, so
+          ;; internal nodes accumulate as stored orphans (a single-leaf sub inlines its root
+          ;; and orphans nothing under fusion). Integers only (mixed types break the cmp).
+          comp (loop [comp comp es (range 600)]
+                 (if (seq es)
+                   (recur (<? (cmp/update-subsystem comp "a" #(g/conj % (first es)))) (rest es))
+                   comp))
           comp (<? (p/commit! comp "c1"))
-          comp (<? (cmp/update-subsystem comp "a" #(g/conj % :z)))
+          comp (<? (cmp/update-subsystem comp "a" #(g/conj % 600)))
           comp (<? (p/commit! comp "c2"))              ; supersedes c1's index + sub trees
           before (count (<? (ca/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))
           ;; cutoff 1s ahead = "reclaim every orphan up to now" (reachable nodes are
@@ -100,10 +108,10 @@
           after  (count (<? (ca/sync-or-cps (k/keys (:kv-store comp) {:sync? sync?}) {:sync? sync?})))]
       (is (seq (:deleted report)) "reclaimed nodes from the superseded trees")
       (is (< after before) "the shared store shrank")
-      (is (= #{:x :y :z} (<? (g/elements (cmp/get-subsystem comp "a")))) "live sub state intact")
+      (is (= (set (range 601)) (<? (g/elements (cmp/get-subsystem comp "a")))) "live sub state intact")
       (let [sid (<? (p/snapshot-id comp))]
         (is (some? (p/snapshot-meta comp sid)) "history still resolves")
-        (is (= #{:x :y :z} (get (<? (p/as-of comp sid)) "a")) "as-of resolves the live sub")))))
+        (is (= (set (range 601)) (get (<? (p/as-of comp sid)) "a")) "as-of resolves the live sub")))))
 
 (deftest-async merge-commits-transactionally
   (testing "composite merge! delegates to the transactional commit"

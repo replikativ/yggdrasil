@@ -51,12 +51,13 @@
             reopens with ALL branches + current + dirty preserved"
     (let [base     (-> (g/gset "kb" {:store-config (file-cfg)} {:sync? true})
                        (g/conj :x) (g/conj :y) (g/flush!))      ; main = {:x :y}, dirty cleared
-          forked   (-> base (p/branch! :fork) (p/checkout :fork) (g/conj :z))  ; fork = {:x :y :z}, UNFLUSHED
+          forked   (-> base (p/branch! :fork) (p/checkout :fork) (g/conj :z))  ; fork = {:x :y :z}
           reopened (roundtrip forked)]
       (is (= :gset (p/system-type reopened)) "reopened as a live G-Set")
-      (is (= #{:main :fork} (p/branches reopened)) "BOTH branches survive (not just one snapshot)")
+      (is (= #{:main :fork} (p/branches reopened)) "BOTH branches survive in the STORE (registry)")
       (is (= :fork (p/current-branch reopened)) "current branch preserved")
-      (is (= #{:fork} (:dirty reopened)) "dirty set preserved verbatim")
+      ;; conj AUTO-FLUSHES, so a serialized value is always committed (dirty? clean).
+      (is (false? (:dirty? reopened)) "dirty? is clean — the write auto-flushed before serialization")
       (is (= #{:x :y :z} (g/elements (p/checkout reopened :fork))) "fork value reconstructed")
       (is (= #{:x :y}    (g/elements (p/checkout reopened :main))) "main value reconstructed"))))
 
@@ -122,9 +123,9 @@
             OWN ygg/system handler (fressian recurses), so children reconstruct with
             their values automatically — no per-composite child logic"
     (let [sc (file-cfg)
-          a  (-> (g/gset "a" {:store-config sc :roots-key [:crdt/roots "a"]} {:sync? true})
+          a  (-> (g/gset "a" {:store-config sc :cell-ns "a"} {:sync? true})
                  (g/conj :a1) (g/conj :a2) (g/flush!))
-          b  (-> (g/gset "b" {:kv-store (:kv-store a) :roots-key [:crdt/roots "b"]} {:sync? true})
+          b  (-> (g/gset "b" {:kv-store (:kv-store a) :cell-ns "b"} {:sync? true})
                  (g/conj :b1) (g/flush!))
           comp     (cmp/composite [a b] {:store-config sc} {:sync? true})
           reopened (roundtrip comp)]

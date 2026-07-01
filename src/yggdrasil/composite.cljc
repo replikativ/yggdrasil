@@ -50,7 +50,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
-            #?(:clj [yggdrasil.fressian :as yf])
+            [yggdrasil.fressian :as yf]
             [clojure.set :as set]
             [clojure.string :as str]
             [hasch.core :as hasch]
@@ -70,17 +70,16 @@
 (def ^:private composite-subs-key :composite/subs)
 
 (defn- colocated-subs-manifest
-  "The {:roots-key :freed-key} of every sub that co-habits the composite's
-   `kv-store` (a durable CRDT opened on it) — for the konserve-sync walker.
-   Non-co-located subs (own backend — datahike/git) sync via their own stores."
+  "The `{:branches-key :cell-ns}` of every sub that co-habits the composite's `kv-store`
+   (a durable CRDT opened on it) — for the konserve-sync walker to enumerate each sub's
+   branch head cells. Non-co-located subs (own backend — datahike/git) sync via their own
+   stores."
   [kv-store sys-map]
   (->> (vals sys-map)
        (keep (fn [s]
-               (when (and kv-store
-                          (identical? kv-store (:kv-store s))
-                          (get-in s [:config :roots-key]))
-                 {:roots-key (get-in s [:config :roots-key])
-                  :freed-key (get-in s [:config :freed-key])})))
+               (let [cn (get-in s [:config :cell-ns])]
+                 (when (and kv-store (identical? kv-store (:kv-store s)) cn)
+                   {:branches-key (keyword "crdt.branches" (str cn)) :cell-ns cn}))))
        vec))
 
 ;; ============================================================
@@ -202,9 +201,10 @@
                    (await (persist-index! kv-store storage index-atom opts)))))))
 
 (defn- colocated?
-  "Whether `sys` co-habits `kv-store` as a durable CRDT (its own roots cell)."
+  "Whether `sys` co-habits `kv-store` as a durable CRDT (its own `:cell-ns`-namespaced
+   head cells)."
   [kv-store sys]
-  (boolean (and kv-store (identical? kv-store (:kv-store sys)) (get-in sys [:config :roots-key]))))
+  (boolean (and kv-store (identical? kv-store (:kv-store sys)) (get-in sys [:config :cell-ns]))))
 
 (defn- unified-gc!
   "Shared-store composite GC: flush the index + every co-located sub, then ONE
@@ -228,23 +228,29 @@
                        (await (p/commit! (val (first ss)) nil opts)))
                      (recur (next ss))))
                  (await (persist-index! kv-store storage index-atom opts))
-                 (let [manifest  (colocated-subs-manifest kv-store systems)
-                       comp-root (await (kb/k-get kv-store composite-root-key opts))
-                       sub-roots (loop [ss (seq systems) acc []]
-                                   (if ss
-                                     (let [s (val (first ss))]
-                                       (recur (next ss)
-                                              (into acc (vals (await (d/load-roots (:kv-store s) (:config s) opts))))))
-                                     acc))
+                 (let [comp-root (await (kb/k-get kv-store composite-root-key opts))
+                       ;; per sub: enumerate its branch registry → collect every head's roots
+                       ;; (else GC sweeps a sibling branch's live nodes) + spare its cells.
+                       [sub-roots sub-spare]
+                       (loop [ss (seq systems) roots [] spare #{}]
+                         (if ss
+                           (let [s        (val (first ss))
+                                 cfg      (:config s)
+                                 branches (await (d/load-branches (:kv-store s) cfg opts))
+                                 rs       (loop [bs (seq branches) acc []]
+                                            (if bs
+                                              (let [h (await (d/load-head (:kv-store s) (first bs) cfg opts))]
+                                                (recur (next bs) (into acc (d/head-roots h))))
+                                              acc))]
+                             (recur (next ss) (into roots rs)
+                                    (into spare (d/head-cell-keys cfg branches))))
+                           [roots spare]))
                        roots (filterv some? (cons comp-root sub-roots))
-                       spare (into #{composite-subs-key}
-                                   (mapcat (fn [m] [(:roots-key m) (:freed-key m)]))
-                                   manifest)
+                       spare (conj sub-spare composite-subs-key)
                        deleted (await (d/gc! kv-store roots
                                              {:roots-key composite-root-key
                                               :freed-key composite-freed-key}
-                                             (-> opts
-                                                 (assoc :spare-keys spare))))]
+                                             (assoc opts :spare-keys spare)))]
                    {:deleted deleted})))))
 
 ;; ============================================================
@@ -368,28 +374,44 @@
 
   (current-branch [_] current-branch-name)
 
-  (branch! [this name]
-    (assoc this :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/branch! sys name))) {} systems)))
+  ;; branch ops are STORE-BACKED now (subs' branch!/checkout/delete-branch! are
+  ;; async+sync), so the composite awaits each sub. `from` may be a composite SNAPSHOT-ID
+  ;; → branch each sub from ITS recorded sub-snapshot; or a branch keyword, passed through.
+  (branch! [this name] (p/branch! this name current-branch-name c/default-opts))
   (branch! [this name from] (p/branch! this name from c/default-opts))
-  (branch! [this name from _opts]
-    ;; `from` may be a composite SNAPSHOT-ID → branch each sub from ITS recorded
-    ;; sub-snapshot (freeze+isolate the whole composite at a fixed version); or a
-    ;; branch keyword / per-sub ref, passed through unchanged.
-    (let [sub-snaps (resolve-sub-snapshots index-atom from)]
-      (assoc this :systems
-             (reduce-kv (fn [acc sid sys]
-                          (assoc acc sid (p/branch! sys name (if sub-snaps (get sub-snaps sid) from))))
-                        {} systems))))
+  (branch! [this name from opts]
+    (async+sync (:sync? (merge c/default-opts opts))
+                (async
+                 (let [sub-snaps (resolve-sub-snapshots index-atom from)]
+                   (assoc this :systems
+                          (loop [ss (seq systems) acc {}]
+                            (if ss
+                              (let [[sid sys] (first ss)]
+                                (recur (next ss) (assoc acc sid (await (p/branch! sys name (if sub-snaps (get sub-snaps sid) from))))))
+                              acc)))))))
 
   (delete-branch! [this name] (p/delete-branch! this name c/default-opts))
-  (delete-branch! [this name _opts]
-    (assoc this :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/delete-branch! sys name))) {} systems)))
+  (delete-branch! [this name opts]
+    (async+sync (:sync? (merge c/default-opts opts))
+                (async
+                 (assoc this :systems
+                        (loop [ss (seq systems) acc {}]
+                          (if ss
+                            (let [[sid sys] (first ss)]
+                              (recur (next ss) (assoc acc sid (await (p/delete-branch! sys name)))))
+                            acc))))))
 
   (checkout [this name] (p/checkout this name c/default-opts))
-  (checkout [this name _opts]
-    (assoc this
-           :systems (reduce-kv (fn [acc sid sys] (assoc acc sid (p/checkout sys name))) {} systems)
-           :current-branch-name (keyword name)))
+  (checkout [this name opts]
+    (async+sync (:sync? (merge c/default-opts opts))
+                (async
+                 (assoc this
+                        :systems (loop [ss (seq systems) acc {}]
+                                   (if ss
+                                     (let [[sid sys] (first ss)]
+                                       (recur (next ss) (assoc acc sid (await (p/checkout sys name)))))
+                                     acc))
+                        :current-branch-name (keyword name)))))
 
   p/Committable
   (commit! [this] (p/commit! this nil c/default-opts))
@@ -739,16 +761,15 @@
 ;; by its own project/reconstruct automatically; we just place the map and rebuild
 ;; the wrapper. Children are co-located on the composite's store, so they reconstruct
 ;; against the same `resolve-storage`. (index-atom = fresh in-memory history.)
-#?(:clj
-   (yf/register-system!
-    :composite CompositeSystem
-    (fn [{:keys [systems current-branch-name composite-name store-config]}]
-      {:composite-name composite-name :current-branch-name current-branch-name
-       :store-config store-config :systems systems})
-    (fn [blob storage opts]
-      (->CompositeSystem (:systems blob) (:current-branch-name blob) (:composite-name blob)
-                         (atom {}) (when storage (:kv-store storage)) (:store-config blob)
-                         storage))))
+(yf/register-system!
+ :composite CompositeSystem
+ (fn [{:keys [systems current-branch-name composite-name store-config]}]
+   {:composite-name composite-name :current-branch-name current-branch-name
+    :store-config store-config :systems systems})
+ (fn [blob storage opts]
+   (->CompositeSystem (:systems blob) (:current-branch-name blob) (:composite-name blob)
+                      (atom {}) (when storage (:kv-store storage)) (:store-config blob)
+                      storage)))
 
 ;; ============================================================
 ;; CompositeSystem as a CONVERGENT system (peer-mergeable)

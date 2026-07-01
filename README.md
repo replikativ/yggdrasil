@@ -70,7 +70,7 @@ Add to your dependencies: [![Clojars](https://img.shields.io/clojars/v/org.repli
 
 ## Public API
 
-These are the supported namespaces. **Everything else under `yggdrasil.*` is implementation detail and may change between releases** (marked `^:no-doc`): the storage/serialization plumbing (`storage`, `fressian`, `kbridge`, `fn-registry`, `macros`) and the durable backing (`convergent.durable`, `convergent.overlay`, `convergent.cdvcs.{commit,graph-store}`).
+These are the supported namespaces. **Everything else under `yggdrasil.*` is implementation detail and may change between releases** (marked `^:no-doc`): the storage/serialization plumbing (`storage`, `fressian`, `kbridge`, `fn-registry`, `macros`) and the durable backing (`convergent.durable`, `convergent.overlay`, `convergent.cdvcs.commit`, `convergent.dag`).
 
 **Core**
 - `yggdrasil.protocols` — the CoW memory-model protocols every system implements (Snapshotable, Branchable, Graphable, Mergeable, Overlayable, Watchable, GarbageCollectable, …).

@@ -113,12 +113,12 @@
           "merge-down! unions adds+removals — the overlay's remove of :a propagates"))))
 
 (deftest-async orset-store-layout-is-crdt-walkable
-  (testing "both halves live under :crdt/roots — the shape konserve-sync's crdt walker syncs"
+  (testing "both halves live in the :main head cell — the shape konserve-sync's crdt walker syncs"
     (let [s (<? (o/orset "reg" {:store-config (file-cfg)} {:sync? sync?}))
           s (<? (o/conj s :a)) s (<? (o/conj s :b)) s (<? (o/disj s :a)) s (<? (o/flush! s))
-          roots (<? (d/load-roots (:kv-store s) {} {:sync? sync?}))]
-      (is (contains? roots :adds))
-      (is (contains? roots :removals)))))
+          head (<? (d/load-head (:kv-store s) :main {} {:sync? sync?}))]
+      (is (contains? head :adds))
+      (is (contains? head :removals)))))
 
 (deftest-async twopset-delta-op-perspective
   (testing "2P-Set δ: add/remove-elem record {:adds}/{:removals} ops; apply-delta ≡ -join"

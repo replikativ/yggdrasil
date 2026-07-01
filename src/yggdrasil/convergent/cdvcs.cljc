@@ -9,7 +9,7 @@
    carries `:parents`), the convergent source of truth. Its roots cell merges as a
    grow-map, so mutually-merged peers converge on the same content-addressed root,
    exactly like a G-Set. A commit's parents are read ON THE FLY (`parents-of` slices
-   the entry's value) by the store-backed algebra in `cdvcs.graph-store`; the full
+   the entry's value) by the store-backed algebra in `convergent.dag`; the full
    graph is never resident. `:heads` (the DERIVED frontier, `#{id}`) + `:version`
    live in a small cache cell — heads can't be convergent (a commit removes its
    parents from heads), so `-join` recomputes them via `remove-ancestors` over the
@@ -40,10 +40,10 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.cdvcs.builder :as builder]
-            [yggdrasil.convergent.cdvcs.graph-store :as gs]
+            [yggdrasil.convergent.dag :as gs]
             [yggdrasil.kbridge :as kb]
             [clojure.set :as set]
-            #?(:clj [yggdrasil.fressian :as yf])
+            [yggdrasil.fressian :as yf]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -52,20 +52,20 @@
 
 (declare ->CDVCS flush! cdvcs parents-of apply-delta)
 
-;; cells (DOMAIN — overridable via `config`)
-(def ^:private graph-cell :cdvcs/graph)
-(def ^:private graph-freed-cell :cdvcs/graph-freed)
+;; cells (DOMAIN — overridable via `config`). CDVCS is single-branch (`:main`); its
+;; commit-graph rides one HEAD cell (`:crdt.head/<cell-ns>::main` + `:crdt.branches/…`
+;; registry via `head-config`), and the {:heads :version} cache rides `state-key`.
 (def ^:private state-cell :cdvcs/state)
-(defn- gk  [config] (:graph-key config graph-cell))
-(defn- gfk [config] (:graph-freed-key config graph-freed-cell))
-(defn- sk  [config] (:state-key config state-cell))
-(defn- graph-config [config] {:roots-key (gk config) :freed-key (gfk config)})
+(defn- sk [config] (:state-key config state-cell))
+;; the head-cell DOMAIN for the graph: a per-instance `:cell-ns` (default "cdvcs";
+;; co-located composite subs override it) keeps the head/registry cells distinct.
+(defn- head-config [config] {:cell-ns (or (:cell-ns config) "cdvcs")})
 
 ;; commit-graph entries `[id value]` (the commit value inlined beside its id),
 ;; ordered by id only — so a partial `[id]` vector is a valid slice bound (the
 ;; comparator ignores the rest). Same id ⟺ same content-addressed value, so the
 ;; id-only order is a true set (conj of an equal entry is a no-op).
-(def ^:private graph-cmp (fn [a b] (compare (first a) (first b))))
+(def ^:private graph-cmp d/commit-graph-cmp)          ; the shared id-only commit-graph order
 
 ;; ============================================================
 ;; Graph PSS persistence (commit values ride inline in the entries)
@@ -76,10 +76,11 @@
   [kv-store storage config opts]
   (async+sync (:sync? opts)
               (async
-               (let [root (:main (await (d/load-roots kv-store (graph-config config) opts)))]
-                 (if root
-                   (d/restore-set graph-cmp root storage opts)
-                   (d/empty-set storage graph-cmp))))))
+               ;; the graph rides the `:main` head cell — restore-fused cache-seeds the
+               ;; inlined root node (or nil-empty).
+               (d/restore-fused graph-cmp
+                                (:root (await (d/load-head kv-store :main (head-config config) opts)))
+                                storage opts))))
 
 (defn- save-graph!
   "Persist the graph PSS (nodes + roots cell + freed), returning its root. The roots
@@ -87,10 +88,12 @@
   [kv-store graph storage config opts]
   (async+sync (:sync? opts)
               (async
-               (let [root (await (d/store-set! graph storage opts))]
-                 (await (d/save-roots! kv-store {:main root} (graph-config config) opts))
-                 (await (d/save-freed! kv-store storage (graph-config config) opts))
-                 root))))
+               ;; ROOT FUSION: inline the graph's root NODE into the :main head cell
+               ;; (children written, root skipped); NO save-freed! (GC uses konserve :last-write).
+               (let [{root-node :root-node} (await (d/flush-set-fused! graph storage opts))]
+                 (await (d/save-head! kv-store :main {:root root-node} (head-config config) opts))
+                 (await (d/register-branch! kv-store :main (head-config config) opts))
+                 root-node))))
 
 (defn- save-state!
   "Write the {:heads :version} CACHE cell (LWW — the graph PSS is the convergent
@@ -100,15 +103,10 @@
               (async (await (kb/k-assoc kv-store (sk config) state opts)))))
 
 (defn parents-of
-  "An accessor `id -> (async parents-or-nil)` over a graph PSS `graph` (read through
-   `storage`), for the store-backed algebra: slices the `[id value]` entry and
-   yields the value's `:parents`, or nil when the commit is absent. (async+sync)"
-  [graph storage opts]
-  (fn [id]
-    (async+sync (:sync? opts)
-                (async
-                 (let [es (await (d/slice->clj graph [id] [id] opts))]
-                   (when (seq es) (:parents (second (first es)))))))))
+  "The shared `d/commit-parents-of` accessor (`id -> async parents-or-nil` over the commit
+   graph). A thin cdvcs-local alias that drops the `storage` arg its call sites still pass."
+  [graph _storage opts]
+  (d/commit-parents-of graph opts))
 
 ;; ============================================================
 ;; Functional verbs — each returns a NEW record (value-semantic)
@@ -132,10 +130,11 @@
                     ;; accrue the OP δ — the FULL self-contained commit {:id :value}
                     ;; (the value carries :parents), so a peer applies it directly
                     ;; (set-conj into its graph; content-addressing dedups).
-                    (c/with-delta (assoc cd :graph graph'
-                                         :state {:heads #{id} :version (inc (:version (:state cd)))}
-                                         :dirty true)
-                      set/union #{{:id id :value value}})))))))
+                    (let [cd' (c/with-delta (assoc cd :graph graph'
+                                                   :state {:heads #{id} :version (inc (:version (:state cd)))}
+                                                   :dirty true)
+                                set/union #{{:id id :value value}})]
+                      (if (:flush? opts true) (await (flush! cd' opts)) cd'))))))))
 
 (defn merge
   "Reconcile this CDVCS with `remote` (a CDVCS record), or its OWN multiple heads
@@ -154,12 +153,13 @@
                   ;; the δ carries BOTH the merge commit AND the remote's commits we
                   ;; just unioned in (so a peer that has neither converges from the δ
                   ;; alone); the remote's δ — if any — is folded in too.
-                  (let [remote-delta (or (c/delta-of remote) #{})]
-                    (c/with-delta (assoc cd :graph graph'
-                                         :state {:heads #{id}
-                                                 :version (inc (max (:version (:state cd)) (:version (:state remote))))}
-                                         :dirty true)
-                      set/union (set/union remote-delta #{{:id id :value value}}))))))))
+                  (let [remote-delta (or (c/delta-of remote) #{})
+                        cd' (c/with-delta (assoc cd :graph graph'
+                                                 :state {:heads #{id}
+                                                         :version (inc (max (:version (:state cd)) (:version (:state remote))))}
+                                                 :dirty true)
+                              set/union (set/union remote-delta #{{:id id :value value}}))]
+                    (if (:flush? opts true) (await (flush! cd' opts)) cd')))))))
 
 (defn pull
   "Fast-forward to `remote-tip` from `remote`'s graph. Throws if the remote is not a
@@ -285,7 +285,8 @@
    (let [src (:kv-store cd) storage (:storage cd)]
      (async+sync (:sync? opts)
                  (async
-                  (let [graph-root (await (d/store-set! (:graph cd) storage opts))]
+                  ;; EXPORT (cross-store): materialize the graph root before ship!.
+                  (let [graph-root (await (d/materialize-root! (:graph cd) storage opts))]
                     (await (d/ship! src dst-store graph-root opts))))))))
 
 ;; ============================================================
@@ -297,7 +298,7 @@
             graph     ; grow-only PSS of [id value] (commit value inlined) — the convergent commit-graph
             state     ; {:heads #{id} :version n} — the DERIVED frontier cache
             dirty     ; unflushed graph/state?
-            config]   ; DOMAIN: {:graph-key :state-key …}
+            config]   ; DOMAIN: {:cell-ns :state-key …}
 
   p/SystemIdentity
   (system-id [_] id)
@@ -313,7 +314,8 @@
   (snapshot-id [_]
     (async+sync (:sync? c/default-opts)
                 (async
-                 (let [root (await (d/store-set! graph storage c/default-opts))]
+                 ;; EXPORT: the snapshot-id references the graph root by address.
+                 (let [root (await (d/materialize-root! graph storage c/default-opts))]
                    (str (await (d/store-commit! kv-store {:graph root
                                                           :heads (:heads state)
                                                           :version (:version state)} c/default-opts)))))))
@@ -395,10 +397,12 @@
                                         (let [snap (await (d/read-commit kv-store (first as) gc-opts))]
                                           (recur (next as) (conj roots (:graph snap))))
                                         roots))
-                         graph-root (await (d/store-set! graph storage gc-opts))]
-                     (await (d/gc! kv-store (cons graph-root snap-roots) (graph-config config)
+                         ;; EXPORT: materialize the live graph root so GC retains it.
+                         graph-root (await (d/materialize-root! graph storage gc-opts))]
+                     (await (d/gc! kv-store (cons graph-root snap-roots) (head-config config)
                                    (clojure.core/merge gc-opts
-                                                       {:spare-keys [(gk config) (gfk config) (sk config)]
+                                                       {:spare-keys (conj (vec (d/head-cell-keys (head-config config) #{:main}))
+                                                                          (sk config))
                                                         :retain-keys (vec snap-addrs)})))))))))
 
 (defn flush!
@@ -408,9 +412,14 @@
   ([cd opts]
    (async+sync (:sync? opts)
                (async
-                (await (save-graph! (:kv-store cd) (:graph cd) (:storage cd) (:config cd) opts))
-                (await (save-state! (:kv-store cd) (:state cd) (:config cd) opts))
-                (assoc cd :dirty false)))))
+                ;; only write if necessary (a no-op when clean) — so auto-flush-per-commit
+                ;; doesn't re-save an unchanged graph/state.
+                (if (:dirty cd)
+                  (do
+                    (await (save-graph! (:kv-store cd) (:graph cd) (:storage cd) (:config cd) opts))
+                    (await (save-state! (:kv-store cd) (:state cd) (:config cd) opts))
+                    (assoc cd :dirty false))
+                  cd)))))
 
 ;; ============================================================
 ;; Factory
@@ -421,25 +430,19 @@
    commit-graph PSS if present; otherwise seeds a fresh single-base-commit CDVCS for
    `:author` and persists it. (async+sync)
 
-   config (DOMAIN): :store-config | :kv-store, :author, :state-key / :graph-key
-           (cell keys; defaults :cdvcs/state / :cdvcs/graph).
+   config (DOMAIN): :store-config | :kv-store, :author, :state-key / :cell-ns
+           (cell keys; :cell-ns default cdvcs).
    opts (RUNTIME): :sync? (default true). The mode opens the store; it is NOT stamped
         on the record — each op picks its own `:sync?` (default `c/default-opts`)."
   ([id] (cdvcs id {} {:sync? true}))
   ([id config] (cdvcs id config {:sync? true}))
-  ([id {:keys [author store-config kv-store state-key graph-key]}
+  ([id {:keys [author store-config kv-store state-key cell-ns]}
     {:keys [sync?] :or {sync? true}}]
    (let [open-opts {:sync? sync?}
+         ;; co-located instances (sharing ONE store) pass a distinct `:cell-ns` (which
+         ;; namespaces the graph head + registry cells) and a distinct `:state-key`.
          cell-config (cond-> {} state-key (assoc :state-key state-key)
-                             graph-key (assoc :graph-key graph-key))
-         ;; co-located instances (a vector :state-key like [:cdvcs/state id] sharing
-         ;; ONE store) need DISTINCT graph cells too — derive them from the state-key
-         ;; suffix, just as the two-half CRDTs derive :freed-key from :roots-key.
-         cell-config (if (and (vector? state-key) (not graph-key))
-                       (assoc cell-config
-                              :graph-key (assoc state-key 0 :cdvcs/graph)
-                              :graph-freed-key (assoc state-key 0 :cdvcs/graph-freed))
-                       cell-config)
+                             cell-ns (assoc :cell-ns cell-ns))
          open-config (cond-> {} kv-store (assoc :kv-store kv-store))]
      (async+sync sync?
                  (async
@@ -458,18 +461,18 @@
 ;; Register CDVCS with the system value codec (JVM). The record IS a value: the
 ;; commit-graph rides as its content-addressed root (dedup via the store's nodes);
 ;; `state` ({:heads :version}) + config ride verbatim; storage/kv-store re-derived.
-#?(:clj
-   (yf/register-system!
-    :cdvcs CDVCS
-    ;; project: flush the graph → its root address; value fields verbatim.
-    (fn [{:keys [id store-config storage graph state dirty config]}]
-      {:id id :store-config store-config
-       :graph (str (d/store-set! graph storage c/default-opts))
-       :state state :dirty dirty :config config})
-    ;; reconstruct: restore the graph with `graph-cmp` — `slice` (parents-of) reads
-    ;; the set's OWN comparator, so it MUST be graph-cmp, not a default; derive
-    ;; storage/kv-store from the read context.
-    (fn [blob storage opts]
-      (->CDVCS (:id blob) (:kv-store storage) (:store-config blob) storage
-               (d/restore-set graph-cmp (parse-uuid (str (:graph blob))) storage opts)
-               (:state blob) (or (:dirty blob) false) (:config blob)))))
+(yf/register-system!
+ :cdvcs CDVCS
+ ;; project: read the graph's ALREADY-FLUSHED root address (sync; flush async upstream);
+ ;; value fields verbatim.
+ (fn [{:keys [id store-config graph state dirty config]}]
+   {:id id :store-config store-config
+    :graph (d/root-node-blob graph)
+    :state state :dirty dirty :config config})
+ ;; reconstruct: restore the graph with `graph-cmp` — `slice` (parents-of) reads
+ ;; the set's OWN comparator, so it MUST be graph-cmp, not a default; a nil graph
+ ;; root (no commits) rebuilds an empty graph. storage/kv-store from the read context.
+ (fn [blob storage opts]
+   (->CDVCS (:id blob) (:kv-store storage) (:store-config blob) storage
+            (d/restore-fused graph-cmp (:graph blob) storage opts)
+            (:state blob) (or (:dirty blob) false) (:config blob))))

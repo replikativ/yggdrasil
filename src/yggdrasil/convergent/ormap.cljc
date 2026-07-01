@@ -39,7 +39,7 @@
             [yggdrasil.convergent.overlay :as ovl]
             [hasch.core :as hasch]
             [yggdrasil.fn-registry :as fr]
-            #?(:clj [yggdrasil.fressian :as yf])
+            [yggdrasil.fressian :as yf]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -100,21 +100,23 @@
 
 (defrecord ORMap
            [id kv-store store-config storage comparator merge-fn
-            adds        ; immutable PSS set of [hk uid k v]
-            removals    ; immutable PSS set of [hk uid k v]
+            adds        ; CURRENT branch's immutable PSS set of [hk uid k v]
+            removals    ; CURRENT branch's immutable PSS set of [hk uid k v]
             dirty
-            config]     ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            branch      ; current branch keyword
+            commit      ; branch TIP commit-id (string) in the commit-DAG; nil before base seed
+            config]     ; DOMAIN: cell-keys (:branches-key/:cell-ns); {} ⇒ store defaults
 
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] (if merge-fn :merging-ormap :ormap))
-  (capabilities [_] {:snapshotable true :branchable false :mergeable false
-                     :garbage-collectable true :overlayable true :graphable false})
+  (capabilities [_] {:snapshotable true :branchable true :mergeable true
+                     :garbage-collectable true :overlayable true :graphable true})
 
   p/Snapshotable
   ;; shared two-half snapshot; `as-of` projects the FROZEN map {k value-or-set}.
   (snapshot-id [this] (d/two-half-snapshot-id this c/default-opts))
-  (parent-ids [_] #{})
+  (parent-ids [_] (if commit #{commit} #{}))
   (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
   (as-of [this snap-id opts]
     (async+sync (:sync? opts)
@@ -128,21 +130,29 @@
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
   p/Branchable
-  (branches [_] #{:main}) (branches [_ _] #{:main})
-  (current-branch [_] :main)
-  (branch! [this _] this) (branch! [this _ _] this) (branch! [this _ _ _] this)
-  (delete-branch! [this _] this) (delete-branch! [this _ _] this)
-  (checkout [this _] this) (checkout [this _ _] this)
+  ;; store-backed per-branch head cells (shared two-half machinery).
+  (branches [this] (d/two-half-branches this c/default-opts))
+  (branches [this opts] (d/two-half-branches this opts))
+  (current-branch [_] branch)
+  (branch! [this name] (d/two-half-branch! this name branch c/default-opts))
+  (branch! [this name from] (d/two-half-branch! this name from c/default-opts))
+  (branch! [this name from opts] (d/two-half-branch! this name from opts))
+  (delete-branch! [this name] (d/two-half-delete-branch! this name c/default-opts))
+  (delete-branch! [this name opts] (d/two-half-delete-branch! this name opts))
+  (checkout [this name] (d/two-half-checkout this name c/default-opts))
+  (checkout [this name opts] (d/two-half-checkout this name opts))
 
   p/Mergeable
-  (merge! [this _] this) (merge! [this _ _] this)
+  (merge! [this source] (d/two-half-merge! this source c/default-opts))
+  (merge! [this source opts] (d/two-half-merge! this source opts))
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
   p/Committable
-  (commit! [this] (flush! this))
-  (commit! [this _message] (flush! this))
-  (commit! [this _message opts] (flush! this opts))
+  ;; commit! DECOUPLED from flush!: materialize both halves + append a commit + advance the tip.
+  (commit! [this] (d/two-half-commit! this c/default-opts))
+  (commit! [this _message] (d/two-half-commit! this c/default-opts))
+  (commit! [this _message opts] (d/two-half-commit! this opts))
 
   c/PConvergent
   (-join [this other] (c/-join this other c/default-opts))
@@ -166,7 +176,22 @@
                  (clojure.core/assoc this :adds (d/empty-set storage comparator)
                                      :removals (d/empty-set storage comparator) :dirty false)
                  (clojure.core/assoc this :dirty false))]
-      (ovl/convergent-overlay this mode lw))))
+      (ovl/convergent-overlay this mode lw)))
+
+  p/Graphable
+  ;; commit-DAG methods all delegate to the shared `d/commit-*` helpers.
+  (history [this] (p/history this c/default-opts))
+  (history [_ opts] (d/commit-history kv-store storage config commit opts))
+  (ancestors [this s] (p/ancestors this s c/default-opts))
+  (ancestors [_ s opts] (d/commit-ancestors kv-store storage config s opts))
+  (ancestor? [this a b] (p/ancestor? this a b c/default-opts))
+  (ancestor? [_ a b opts] (d/commit-ancestor? kv-store storage config a b opts))
+  (common-ancestor [this a b] (p/common-ancestor this a b c/default-opts))
+  (common-ancestor [_ a b opts] (d/commit-common-ancestor kv-store storage config a b opts))
+  (commit-graph [this] (p/commit-graph this c/default-opts))
+  (commit-graph [_ opts] (d/commit-graph-map kv-store storage config opts))
+  (commit-info [this id] (p/commit-info this id c/default-opts))
+  (commit-info [_ id opts] (d/commit-info kv-store storage config id opts)))
 
 ;; ============================================================
 ;; Value ops — each returns a NEW record (value-semantic)
@@ -181,9 +206,10 @@
    (async+sync (:sync? opts)
                (async
                 (let [entry [(hk k) (str (random-uuid)) k v]
-                      s'    (await (d/set-conj (:adds o) entry (:comparator o) opts))]
-                  (c/with-delta (clojure.core/assoc o :adds s' :dirty true)
-                    half-accrue {:adds #{entry}}))))))
+                      s'    (await (d/set-conj (:adds o) entry (:comparator o) opts))
+                      o'    (c/with-delta (clojure.core/assoc o :adds s' :dirty true)
+                              half-accrue {:adds #{entry}})]
+                  (if (:flush? opts true) (await (flush! o' opts)) o'))))))
 
 (defn dissoc
   "Observed-remove `k`: tombstone exactly the entries currently live for it
@@ -197,8 +223,9 @@
                                    (if ts
                                      (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
                                      r))]
-                  (c/with-delta (clojure.core/assoc o :removals removals' :dirty true)
-                    half-accrue {:removals (set tombstones)}))))))
+                  (let [o' (c/with-delta (clojure.core/assoc o :removals removals' :dirty true)
+                             half-accrue {:removals (set tombstones)})]
+                    (if (:flush? opts true) (await (flush! o' opts)) o')))))))
 
 (defn apply-delta
   "Consume a peer's δ ({:adds #{entries} :removals #{entries}}) — union each half
@@ -211,7 +238,9 @@
                              (if ps (recur (await (d/set-conj a (first ps) (:comparator o) opts)) (next ps)) a))
                       rems (loop [r (:removals o) ps (seq (:removals delta))]
                              (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
-                  (c/clear-delta (clojure.core/assoc o :adds adds :removals rems :dirty true)))))))
+                  (let [o' (c/clear-delta (clojure.core/assoc o :adds adds :removals rems :dirty true))]
+                    ;; AUTO-FLUSH the receive side — durable-after-apply.
+                    (if (:flush? opts true) (await (flush! o' opts)) o')))))))
 
 (defn get
   "The value for `k`: a SET of live values (plain) or the merge-fn FOLD of them
@@ -252,6 +281,11 @@
   ([o] (p/gc-sweep! o nil nil))
   ([o opts] (p/gc-sweep! o nil opts)))
 
+(defn merge-base
+  "The most recent common ancestor commit of branches `a` and `b` (git merge-base). (async+sync)"
+  ([o a b] (merge-base o a b c/default-opts))
+  ([o a b opts] (d/commit-merge-base (:kv-store o) (:storage o) (:config o) a b opts)))
+
 ;; ============================================================
 ;; Factories
 ;; ============================================================
@@ -260,22 +294,22 @@
   ;; `merge-fn` is a FUNCTION (not serializable) OR a registered ID (keyword,
   ;; `fn-registry/register-fn!`) → the fold survives a round-trip (stored as
   ;; `:merge-fn-id` in config; resolved on read). nil = plain multi-value OR-Map.
-  [id merge-fn {:keys [store-config comparator kv-store roots-key freed-key]
-                :or {comparator compare}}
+  [id merge-fn {:keys [store-config comparator kv-store cell-ns branches-key branch]
+                :or {comparator compare branch :main}}
    {:keys [sync?] :or {sync? true}}]
   (let [open-opts   {:sync? sync?}
         merge-fn-id (when (keyword? merge-fn) merge-fn)
         mfn         (if (keyword? merge-fn) (fr/resolve-fn merge-fn) merge-fn)]
     (async+sync sync?
                 (async
-                 (let [{:keys [kv-store storage store-config config adds removals]}
+                 (let [{:keys [kv-store storage store-config config adds removals branch commit]}
                        (await (d/two-half-open store-config
                                                {:comparator comparator :kv-store kv-store
-                                                :roots-key roots-key :freed-key freed-key}
+                                                :cell-ns cell-ns :branches-key branches-key :branch branch}
                                                open-opts))
                        config (cond-> config merge-fn-id (clojure.core/assoc :merge-fn-id merge-fn-id))]
                    (->ORMap id kv-store store-config storage comparator (wrap mfn)
-                            adds removals false config))))))
+                            adds removals false branch commit config))))))
 
 (defn ormap
   "Open (or create) a durable OR-Map (multi-value: `get` returns the live value-set)."
@@ -297,17 +331,16 @@
 ;; read. ONE project/reconstruct serves BOTH stypes — `:ormap` (no id → merge-fn nil
 ;; → multi-value) and `:merging-ormap` (id → the resolved fold). The entries
 ;; (adds/removals) are preserved regardless; only the read-time fold is recovered.
-#?(:clj
-   (let [project     (fn [{:keys [id store-config storage adds removals dirty config]}]
-                       {:id id :store-config store-config
-                        :adds     (str (d/store-set! adds storage c/default-opts))
-                        :removals (str (d/store-set! removals storage c/default-opts))
-                        :dirty dirty :config config})
-         reconstruct (fn [blob storage opts]
-                       (->ORMap (:id blob) (:kv-store storage) (:store-config blob) storage compare
-                                (wrap (fr/resolve-fn (:merge-fn-id (:config blob))))   ; nil id → plain
-                                (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
-                                (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
-                                (or (:dirty blob) false) (:config blob)))]
-     (yf/register-system! :ormap ORMap project reconstruct)
-     (yf/register-system! :merging-ormap ORMap project reconstruct)))
+(let [project     (fn [{:keys [id store-config adds removals dirty branch commit config]}]
+                    {:id id :store-config store-config
+                     :adds     (d/root-node-blob adds)
+                     :removals (d/root-node-blob removals)
+                     :dirty dirty :branch branch :commit commit :config config})
+      reconstruct (fn [blob storage opts]
+                    (->ORMap (:id blob) (:kv-store storage) (:store-config blob) storage compare
+                             (wrap (fr/resolve-fn (:merge-fn-id (:config blob))))   ; nil id → plain
+                             (d/restore-fused compare (:adds blob) storage opts)
+                             (d/restore-fused compare (:removals blob) storage opts)
+                             (or (:dirty blob) false) (:branch blob) (:commit blob) (:config blob)))]
+  (yf/register-system! :ormap ORMap project reconstruct)
+  (yf/register-system! :merging-ormap ORMap project reconstruct))

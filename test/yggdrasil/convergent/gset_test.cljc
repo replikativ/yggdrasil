@@ -36,7 +36,7 @@
       (is (= #{:x :y :z} (<? (g/elements g))))
       (is (= #{:x :y} (<? (p/as-of g sid))) "as-of re-opens the frozen value")
       ;; branch FROM the snapshot-id → an isolated head at the frozen value
-      (let [iso0 (-> g (p/branch! :iso sid) (p/checkout :iso))
+      (let [iso0 (<? (p/checkout (<? (p/branch! g :iso sid)) :iso))
             iso  (<? (g/conj iso0 :w))]
         (is (= #{:x :y :w} (<? (g/elements iso))) "isolated branch evolves independently")
         (is (= #{:x :y :z} (<? (g/elements g))) "original main untouched"))))
@@ -110,7 +110,7 @@
           pa (<? (g/conj pa :a1)) pa (<? (g/conj pa :a2)) pa (<? (g/flush! pa))
           pb (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           pb (<? (g/conj pb :b1)) pb (<? (g/conj pb :b2)) pb (<? (g/flush! pb))
-          broot (<? (d/store-set! (get (:roots pb) (:current pb)) (:storage pb) {:sync? sync?}))]
+          broot (<? (d/materialize-root! (:root pb) (:storage pb) {:sync? sync?}))]
       (is (pos? (<? (d/ship! (:kv-store pb) (:kv-store pa) broot {:sync? sync?}))) "first ship transfers nodes")
       (is (zero? (<? (d/ship! (:kv-store pb) (:kv-store pa) broot {:sync? sync?}))) "re-ship is a no-op (incremental)")
       (let [pa (<? (g/merge-peer! pa pb)) pa (<? (g/flush! pa))
@@ -123,7 +123,7 @@
   (testing "reachable-addresses = root + transitive child node addresses"
     (let [a (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           a (<? (g/conj a :x)) a (<? (g/conj a :y)) a (<? (g/conj a :z)) a (<? (g/flush! a))
-          root  (<? (d/store-set! (get (:roots a) (:current a)) (:storage a) {:sync? sync?}))
+          root  (<? (d/materialize-root! (:root a) (:storage a) {:sync? sync?}))
           addrs (<? (d/reachable-addresses (:kv-store a) root {:sync? sync?}))]
       (is (contains? addrs root) "root is in the ship-set")
       (is (pos? (count addrs)) "ship-set is non-empty"))))
@@ -134,8 +134,8 @@
           a (<? (g/conj a :x)) a (<? (g/conj a :y)) a (<? (g/conj a :z))
           b (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           b (<? (g/conj b :x)) b (<? (g/conj b :y)) b (<? (g/conj b :z))
-          ra (<? (d/store-set! (get (:roots a) (:current a)) (:storage a) {:sync? sync?}))
-          rb (<? (d/store-set! (get (:roots b) (:current b)) (:storage b) {:sync? sync?}))]
+          ra (<? (d/materialize-root! (:root a) (:storage a) {:sync? sync?}))
+          rb (<? (d/materialize-root! (:root b) (:storage b) {:sync? sync?}))]
       (is (= ra rb) "identical content → identical content-addressed root")
       (is (zero? (<? (d/ship! (:kv-store b) (:kv-store a) rb {:sync? sync?})))
           "content-addressed → cross-peer dedup, ship is a no-op"))))
@@ -144,19 +144,20 @@
   (testing "branch diverges locally; merge reconverges cleanly (conflict-free)"
     (let [base   (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           base   (<? (g/conj base :seed))
-          forked (-> base (p/branch! :fork) (p/checkout :fork))
+          forked (<? (p/checkout (<? (p/branch! base :fork)) :fork))
           forked (<? (g/conj forked :only-fork))]
-      (is (= #{:seed :only-fork} (<? (g/elements (p/checkout forked :fork)))) "fork has its own head")
-      (is (= #{:seed} (<? (g/elements (p/checkout forked :main)))) "main is unchanged")
-      (let [merged (<? (p/merge! (p/checkout forked :main) :fork))]
+      (is (= #{:seed :only-fork} (<? (g/elements (<? (p/checkout forked :fork))))) "fork has its own head")
+      (is (= #{:seed} (<? (g/elements (<? (p/checkout forked :main))))) "main is unchanged")
+      (let [merged (<? (p/merge! (<? (p/checkout forked :main)) :fork))]
         (is (= #{:seed :only-fork} (<? (g/elements merged))) "branch-merge is union — no conflict")))))
 
 (deftest-async restore-lazy-set-reads-the-same-elements
   (testing "receive→restore→read: a freshly-restored LAZY storage-backed set drains equal"
     (let [g     (<? (g/gset "kb" {:store-config (file-cfg)} {:sync? sync?}))
           g     (<? (g/conj g :x)) g (<? (g/conj g :y)) g (<? (g/flush! g))
-          roots (<? (d/load-roots (:kv-store g) {} {:sync? sync?}))
-          restored (d/restore-set compare (:main roots) (:storage g) {:sync? sync?})]
+          head  (<? (d/load-head (:kv-store g) :main {} {:sync? sync?}))
+          ;; the head cell holds a fused root NODE (inlined) — restore-fused cache-seeds it.
+          restored (d/restore-fused compare (:root head) (:storage g) {:sync? sync?})]
       (is (= #{:x :y} (<? (d/set->clj restored {:sync? sync?}))) "lazy restore reads the same elements"))))
 
 (deftest-async delta-state-op-perspective
@@ -187,18 +188,18 @@
             restores prove the cells don't clobber each other)"
     (let [sc (file-cfg)
           a0 (<? (g/gset "a" {:store-config sc
-                              :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"]} {:sync? sync?}))
+                              :cell-ns "a"} {:sync? sync?}))
           a1 (<? (g/conj a0 :a1))
           a  (<? (g/conj a1 :a2))
           b0 (<? (g/gset "b" {:kv-store (:kv-store a)
-                              :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"]} {:sync? sync?}))
+                              :cell-ns "b"} {:sync? sync?}))
           b  (<? (g/conj b0 :b1))]
       (<? (g/flush! a))
       (<? (g/flush! b))
       (let [a' (<? (g/gset "a" {:store-config sc
-                                :roots-key [:crdt/roots "a"] :freed-key [:crdt/freed "a"]} {:sync? sync?}))
+                                :cell-ns "a"} {:sync? sync?}))
             b' (<? (g/gset "b" {:kv-store (:kv-store a')
-                                :roots-key [:crdt/roots "b"] :freed-key [:crdt/freed "b"]} {:sync? sync?}))]
+                                :cell-ns "b"} {:sync? sync?}))]
         (is (= #{:a1 :a2} (<? (g/elements a'))) "a restores only its own elements")
         (is (= #{:b1} (<? (g/elements b'))) "b restores only its own elements")))))
 

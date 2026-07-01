@@ -11,6 +11,12 @@
 (defn k-get [store key opts]
   (ca/sync-or-cps (k/get store key nil opts) opts))
 
+(defn k-get-meta
+  "The konserve per-key metadata map (carries `:last-write`, a Date) — nil if absent.
+   Used by commit-DAG GC to date a content-addressed root by when it was first stored."
+  [store key opts]
+  (ca/sync-or-cps (k/get-meta store key nil opts) opts))
+
 (def immutable-meta
   "The metadata map marking a content-addressed, WRITE-ONCE value (a PSS node, a
    commit, an addressable snapshot). Pass as `k-assoc`'s `meta` arg at such call

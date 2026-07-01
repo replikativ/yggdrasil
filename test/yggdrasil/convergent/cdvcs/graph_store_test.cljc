@@ -9,7 +9,7 @@
   (:require [clojure.test :refer [is testing]]
             [yggdrasil.test-async :refer [deftest-async <? sync?]]
             [yggdrasil.convergent.cdvcs.graph :as graph]
-            [yggdrasil.convergent.cdvcs.graph-store :as gs]
+            [yggdrasil.convergent.dag :as gs]
             #?(:clj  [is.simm.partial-cps.async :refer [async]])
             #?(:clj  [yggdrasil.macros :refer [async+sync]])
             #?(:cljs [is.simm.partial-cps.async])

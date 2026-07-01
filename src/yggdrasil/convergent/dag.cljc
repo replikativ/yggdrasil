@@ -1,10 +1,12 @@
-(ns ^:no-doc yggdrasil.convergent.cdvcs.graph-store
-  "Store-backed (`async+sync`) commit-graph algebra — the SAME LCA / frontier /
-   history algorithms as the pure `cdvcs.graph`, but a commit's parents are read
-   through an injected accessor `parents-of : id -> (async parents-or-nil)` instead
-   of an in-memory map. This lets the commit-graph live in a PSS (read on the fly,
-   bounded resident heap) while the pure `cdvcs.graph` stays as the correctness
-   ORACLE (the property test asserts the two agree on random DAGs).
+(ns ^:no-doc yggdrasil.convergent.dag
+  "Store-backed (`async+sync`) commit-DAG algebra — LCA / frontier / history over a
+   set of commits, each carrying parent pointers. PAYLOAD-GENERIC: a commit's parents
+   are read through an injected accessor `parents-of : id -> (async parents-or-nil)`,
+   so the algebra knows nothing about the commit payload (CDVCS transactions, a flat
+   CRDT's root, …) or the storage (a PSS, standalone records). CDVCS is the reference
+   consumer; flat-CRDT lineage reuses it verbatim. The pure in-memory `cdvcs.graph`
+   (test tree) stays the correctness ORACLE — the property test asserts the two agree
+   on random DAGs.
 
    `parents-of` yields the commit's parent-id vector (possibly `[]` for a base
    commit) when the commit is present, or `nil` when absent. Each public fn mirrors
