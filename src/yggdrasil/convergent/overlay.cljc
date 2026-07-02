@@ -121,7 +121,11 @@
   (advance!
     ([ov] (p/advance! ov c/default-opts))
     ([ov opts]
-     (let [parent (:parent ov)]
+     ;; a caller may pass a MERGE-OPTIONS map (`:strategy`/`:message`…) with no
+     ;; `:sync?`; default it to the platform mode so `async+sync` returns a VALUE
+     ;; (not a CPS fn) on the JVM instead of silently seating a continuation.
+     (let [opts   (merge c/default-opts opts)
+           parent (:parent ov)]
        (async+sync (:sync? opts)
                    (async
                     (reset! (:local-writes ov) (await (c/-join @(:local-writes ov) parent opts)))
@@ -132,7 +136,11 @@
   (merge-down!
     ([ov] (p/merge-down! ov c/default-opts))
     ([ov opts]
-     (let [parent (:parent ov)]
+     ;; default `:sync?` (see `advance!`) — the bridge's `merge-to-parent!` calls
+     ;; this with a merge-options map lacking `:sync?`; without the default the JVM
+     ;; async branch returns a CPS fn that gets seated as the parent's value.
+     (let [opts   (merge c/default-opts opts)
+           parent (:parent ov)]
        (async+sync (:sync? opts)
                    (async (await (c/-join parent @(:local-writes ov) opts)))))))
 
