@@ -24,6 +24,7 @@
             [hasch.core :as hasch]
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [org.replikativ.persistent-sorted-set.boundary :as pss-bnd]
+            [yggdrasil.hashref :as hashref]
             [yggdrasil.kbridge :as kb]
             [is.simm.partial-cps.core-async :as ca]
             [yggdrasil.types :as t]
@@ -135,14 +136,21 @@
 ;; content-derived from `pss-fress/node->map` (the node's canonical projection — a
 ;; Merkle hash over level/keys/addresses, so identical subtrees share an address and
 ;; sync incrementally), or a random UUID when `content-addressed?` is false.
-(defrecord KonserveStorage [kv-store settings cache freed-atom content-addressed?]
+;; `pending` (atom, default nil = IMMEDIATE): when the flush activates BUFFERING (resets
+;; it to []), `store` accumulates `[address node]` here instead of writing — so the flush
+;; can drain everything EXCEPT the fused root in one batch (root fusion). It still caches,
+;; so reads-back during the flush hit the cache. Per-storage + single-writer-per-cell, so
+;; no cross-op race; the flush scopes it with try/finally.
+(defrecord KonserveStorage [kv-store settings cache freed-atom content-addressed? pending]
   IStorage
   #?@(:clj
       [(store [_ node]
               (let [address (if content-addressed? (hasch/uuid (pss-fress/node->map node)) (random-uuid))]
                 ;; a stored node is WRITE-ONCE (its address never re-binds) → mark it
                 ;; immutable so a sync peer can skip a node it already holds.
-                (kb/k-assoc kv-store address node kb/immutable-meta {:sync? true})
+                (if (some? @pending)
+                  (swap! pending conj [address node])
+                  (kb/k-assoc kv-store address node kb/immutable-meta {:sync? true}))
                 (cache-put! cache address node)
                 address))
 
@@ -162,8 +170,10 @@
               (async+sync (:sync? opts)
                           (async
                            (let [address (if content-addressed? (hasch/uuid (pss-fress/node->map node)) (random-uuid))]
-                             ;; write-once node → mark immutable (see clj branch).
-                             (await (kb/k-assoc kv-store address node kb/immutable-meta opts))
+                             ;; write-once node → mark immutable (see clj branch); BUFFER when active.
+                             (if (some? @pending)
+                               (swap! pending conj [address node])
+                               (await (kb/k-assoc kv-store address node kb/immutable-meta opts)))
                              (cache-put! cache address node)
                              address))))
 
@@ -228,7 +238,24 @@
   ([kv-store {:keys [settings content-addressed?]
               :or {content-addressed? true}}]
    (->KonserveStorage kv-store (or settings (default-settings))
-                      (atom empty-cache) (atom {}) content-addressed?)))
+                      (atom empty-cache) (atom {}) content-addressed? (atom nil))))
+
+(defn node-address
+  "The content-address of a PSS node — the hasch of its canonical projection, i.e. the
+   key it is (or would be) stored under (content-addressed stores only)."
+  [node]
+  (hasch/uuid (pss-fress/node->map node)))
+
+(defn seed-node!
+  "Pin `node` in `storage`'s cache under its content-address and return that address, so a
+   subsequent `restore` resolves it WITHOUT a store read — the seed for a FUSED root
+   (inlined in the head cell, not written to the store). The cache is bounded, so a lazily-
+   restored set retained past eviction would miss it; a pinned-root restore is the robust
+   form (hardening follow-up)."
+  [storage node]
+  (let [addr (node-address node)]
+    (cache-put! (:cache storage) addr node)
+    addr))
 
 (defn attach-pss-serializer!
   "Return `kv-store` with a FressianSerializer carrying the canonical PSS node AND root
@@ -277,50 +304,12 @@
         (merge (pss-fress/read-handlers {:default-bf default-bf})
                {pss-fress/set-tag (pss-fress/root-read-handler {:resolve-storage resolve-storage
                                                                 :default-bf      default-bf})}
+               hashref/read-handlers      ; hasch HashRef pointers (content-address refs)
                el-read)
         (merge pss-fress/write-handlers
                pss-fress/root-write-handlers
+               hashref/write-handlers
                element-write-handlers))}))))
-
-;; ============================================================
-;; Index root + freed persistence — async+sync (sync on JVM, async on cljs)
-;; ============================================================
-
-(defn save-roots!
-  ([kv-store roots] (save-roots! kv-store roots {:sync? true}))
-  ([kv-store roots opts]
-   (async+sync (:sync? opts)
-               (async (await (kb/k-assoc kv-store :registry/roots roots opts))))))
-
-(defn load-roots
-  ([kv-store] (load-roots kv-store {:sync? true}))
-  ([kv-store opts]
-   (async+sync (:sync? opts)
-               (async (await (kb/k-get kv-store :registry/roots opts))))))
-
-(defn save-freed!
-  ([kv-store freed] (save-freed! kv-store freed {:sync? true}))
-  ([kv-store freed opts]
-   (async+sync (:sync? opts)
-               (async (await (kb/k-assoc kv-store :registry/freed freed opts))))))
-
-(defn load-freed
-  ([kv-store] (load-freed kv-store {:sync? true}))
-  ([kv-store opts]
-   (async+sync (:sync? opts)
-               (async (or (await (kb/k-get kv-store :registry/freed opts)) {})))))
-
-(defn sweep-freed!
-  "Delete freed nodes older than grace-period-ms. JVM/sync only (GC is a
-   server-side concern)."
-  [kv-store freed-atom grace-period-ms]
-  (let [now (t/now-ms)
-        cutoff (- now grace-period-ms)
-        to-sweep (filter (fn [[_ ts]] (< ts cutoff)) @freed-atom)]
-    (doseq [[address _] to-sweep]
-      (kb/k-dissoc kv-store address {:sync? true}))
-    (swap! freed-atom #(apply dissoc % (map first to-sweep)))
-    (count to-sweep)))
 
 ;; ============================================================
 ;; Store cleanup

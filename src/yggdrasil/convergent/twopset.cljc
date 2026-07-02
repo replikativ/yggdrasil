@@ -33,7 +33,7 @@
             [yggdrasil.convergent :as c]
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
-            #?(:clj [yggdrasil.fressian :as yf])
+            [yggdrasil.fressian :as yf]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -49,28 +49,27 @@
 
 (defrecord TwoPSet
            [id kv-store store-config storage comparator
-            adds         ; immutable PSS set of elements
-            removals     ; immutable PSS set of tombstoned elements
+            adds         ; CURRENT branch's immutable PSS set of elements
+            removals     ; CURRENT branch's immutable PSS set of tombstoned elements
             dirty        ; boolean — content changed since last flush
-            config]      ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            branch       ; current branch keyword
+            commit       ; branch TIP commit-id (string) in the commit-DAG; nil before base seed
+            config]      ; DOMAIN: cell-keys (:branches-key/:cell-ns); {} ⇒ store defaults
 
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] :2p-set)
-  ;; single logical branch (replicas are separate stores synced by konserve-sync):
-  ;; isolation is via Overlayable, peer-merge via -join (PConvergent). branch!/
-  ;; merge! (the hierarchical tier) are no-ops here, so we do NOT advertise them —
-  ;; else composite cap-aggregation / compliance would treat a no-op as working.
-  (capabilities [_] {:snapshotable true :branchable false :mergeable false
+  ;; genuinely branchable (per-branch head cells; shared two-half machinery).
+  (capabilities [_] {:snapshotable true :branchable true :mergeable true
                      :garbage-collectable true :overlayable true
-                     :graphable false})
+                     :graphable true})
 
   p/Snapshotable
   ;; addressable snapshot = a content-addressed COMMIT {:adds :removals} over the
   ;; two halves' roots (shared two-half machinery); `as-of` projects the FROZEN
   ;; value (adds − removals).
   (snapshot-id [this] (d/two-half-snapshot-id this c/default-opts))
-  (parent-ids [_] #{})
+  (parent-ids [_] (if commit #{commit} #{}))
   (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
   (as-of [this snap-id opts]
     (async+sync (:sync? opts)
@@ -80,23 +79,29 @@
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
   p/Branchable
-  ;; replicas are separate stores synced by konserve-sync; one logical branch.
-  (branches [_] #{:main}) (branches [_ _] #{:main})
-  (current-branch [_] :main)
-  (branch! [this _] this) (branch! [this _ _] this) (branch! [this _ _ _] this)
-  (delete-branch! [this _] this) (delete-branch! [this _ _] this)
-  (checkout [this _] this) (checkout [this _ _] this)
+  ;; store-backed per-branch head cells (shared two-half machinery).
+  (branches [this] (d/two-half-branches this c/default-opts))
+  (branches [this opts] (d/two-half-branches this opts))
+  (current-branch [_] branch)
+  (branch! [this name] (d/two-half-branch! this name branch c/default-opts))
+  (branch! [this name from] (d/two-half-branch! this name from c/default-opts))
+  (branch! [this name from opts] (d/two-half-branch! this name from opts))
+  (delete-branch! [this name] (d/two-half-delete-branch! this name c/default-opts))
+  (delete-branch! [this name opts] (d/two-half-delete-branch! this name opts))
+  (checkout [this name] (d/two-half-checkout this name c/default-opts))
+  (checkout [this name opts] (d/two-half-checkout this name opts))
 
   p/Mergeable
-  (merge! [this _] this) (merge! [this _ _] this)
+  (merge! [this source] (d/two-half-merge! this source c/default-opts))
+  (merge! [this source opts] (d/two-half-merge! this source opts))
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
   p/Committable
-  ;; "commit" = make current state durable (flush); identity is content-addressed.
-  (commit! [this] (flush! this))
-  (commit! [this _message] (flush! this))
-  (commit! [this _message opts] (flush! this opts))
+  ;; commit! DECOUPLED from flush!: materialize both halves + append a commit + advance the tip.
+  (commit! [this] (d/two-half-commit! this c/default-opts))
+  (commit! [this _message] (d/two-half-commit! this c/default-opts))
+  (commit! [this _message opts] (d/two-half-commit! this opts))
 
   c/PConvergent
   ;; PURE same-store join: union both halves with the peer (shared). (async+sync)
@@ -124,7 +129,22 @@
                  (assoc this :adds (d/empty-set storage comparator)
                         :removals (d/empty-set storage comparator) :dirty false)
                  (assoc this :dirty false))]
-      (ovl/convergent-overlay this mode lw))))
+      (ovl/convergent-overlay this mode lw)))
+
+  p/Graphable
+  ;; commit-DAG methods all delegate to the shared `d/commit-*` helpers.
+  (history [this] (p/history this c/default-opts))
+  (history [_ opts] (d/commit-history kv-store storage config commit opts))
+  (ancestors [this s] (p/ancestors this s c/default-opts))
+  (ancestors [_ s opts] (d/commit-ancestors kv-store storage config s opts))
+  (ancestor? [this a b] (p/ancestor? this a b c/default-opts))
+  (ancestor? [_ a b opts] (d/commit-ancestor? kv-store storage config a b opts))
+  (common-ancestor [this a b] (p/common-ancestor this a b c/default-opts))
+  (common-ancestor [_ a b opts] (d/commit-common-ancestor kv-store storage config a b opts))
+  (commit-graph [this] (p/commit-graph this c/default-opts))
+  (commit-graph [_ opts] (d/commit-graph-map kv-store storage config opts))
+  (commit-info [this id] (p/commit-info this id c/default-opts))
+  (commit-info [_ id opts] (d/commit-info kv-store storage config id opts)))
 
 ;; ============================================================
 ;; Value ops — each returns a NEW 2P-Set value (value-semantic)
@@ -138,10 +158,12 @@
   [s field elem opts]
   (async+sync (:sync? opts)
               (async
-               (let [s' (await (d/set-conj (get s field) elem (:comparator s) opts))]
-                 (c/with-delta (assoc s field s' :dirty true)
-                   half-accrue
-                   (if (= field :adds) {:adds #{elem}} {:removals #{elem}}))))))
+               (let [s'  (await (d/set-conj (get s field) elem (:comparator s) opts))
+                     s'' (c/with-delta (assoc s field s' :dirty true)
+                           half-accrue
+                           (if (= field :adds) {:adds #{elem}} {:removals #{elem}}))]
+                 ;; AUTO-FLUSH (default true; `into` passes `{:flush? false}` to batch).
+                 (if (:flush? opts true) (await (flush! s'' opts)) s'')))))
 
 (defn conj
   "Add `elem`. (async+sync) Returns a NEW s."
@@ -154,10 +176,12 @@
   ([s elems opts]
    (async+sync (:sync? opts)
                (async
-                (loop [s s es (seq elems)]
-                  (if es
-                    (recur (await (conj-into! s :adds (first es) opts)) (next es))
-                    s))))))
+                ;; batch: conj each element WITHOUT flushing, then flush once at the end.
+                (let [batched (loop [s s es (seq elems)]
+                                (if es
+                                  (recur (await (conj-into! s :adds (first es) (assoc opts :flush? false))) (next es))
+                                  s))]
+                  (if (:flush? opts true) (await (flush! batched opts)) batched))))))
 
 (defn disj
   "Tombstone `elem` (permanent — 2P-Set semantics). (async+sync) Returns a NEW s."
@@ -177,7 +201,9 @@
                       rems (loop [r (:removals s) es (seq (:removals delta))]
                              (if es (recur (await (d/set-conj r (first es) (:comparator s) opts)) (next es)) r))]
                   ;; clear δ: a remote-integrated value re-propagates nothing.
-                  (c/clear-delta (assoc s :adds adds :removals rems :dirty true)))))))
+                  (let [s' (c/clear-delta (assoc s :adds adds :removals rems :dirty true))]
+                    ;; AUTO-FLUSH the receive side — durable-after-apply.
+                    (if (:flush? opts true) (await (flush! s' opts)) s')))))))
 
 (defn elements
   "Live elements: adds − removals. (async+sync)"
@@ -214,6 +240,11 @@
   ([s] (p/gc-sweep! s nil nil))
   ([s opts] (p/gc-sweep! s nil opts)))
 
+(defn merge-base
+  "The most recent common ancestor commit of branches `a` and `b` (git merge-base). (async+sync)"
+  ([s a b] (merge-base s a b c/default-opts))
+  ([s a b opts] (d/commit-merge-base (:kv-store s) (:storage s) (:config s) a b opts)))
+
 ;; ============================================================
 ;; Factory
 ;; ============================================================
@@ -231,34 +262,34 @@
    record — each op picks its own `:sync?` (default `c/default-opts`)."
   ([id] (twopset id {} {:sync? true}))
   ([id config] (twopset id config {:sync? true}))
-  ([id {:keys [comparator element-read-handlers element-write-handlers store-config kv-store roots-key freed-key]
-        :or {comparator compare}}
+  ([id {:keys [comparator element-read-handlers element-write-handlers store-config kv-store cell-ns branches-key branch]
+        :or {comparator compare branch :main}}
     {:keys [sync?] :or {sync? true}}]
    (let [open-opts {:sync? sync?}]
      (async+sync sync?
                  (async
-                  (let [{:keys [kv-store storage store-config config adds removals]}
+                  (let [{:keys [kv-store storage store-config config adds removals branch commit]}
                         (await (d/two-half-open store-config
                                                 {:comparator comparator :kv-store kv-store
-                                                 :roots-key roots-key :freed-key freed-key
+                                                 :cell-ns cell-ns :branches-key branches-key :branch branch
                                                  :element-read-handlers element-read-handlers
                                                  :element-write-handlers element-write-handlers}
                                                 open-opts))]
-                    (->TwoPSet id kv-store store-config storage comparator adds removals false config)))))))
+                    (->TwoPSet id kv-store store-config storage comparator adds removals false branch commit config)))))))
 
 ;; Register the 2P-Set with the system value codec (JVM). Both halves ride as their
 ;; content-addressed root addresses; `compare` is the right comparator (and what
 ;; slice would read). storage/kv-store re-derived on read.
-#?(:clj
-   (yf/register-system!
-    :2p-set TwoPSet
-    (fn [{:keys [id store-config storage adds removals dirty config]}]
-      {:id id :store-config store-config
-       :adds     (str (d/store-set! adds storage c/default-opts))
-       :removals (str (d/store-set! removals storage c/default-opts))
-       :dirty dirty :config config})
-    (fn [blob storage opts]
-      (->TwoPSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
-                 (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
-                 (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
-                 (or (:dirty blob) false) (:config blob)))))
+(yf/register-system!
+ :2p-set TwoPSet
+ ;; project reads the ALREADY-COMMITTED roots (assert-committed; auto-flush guarantees it).
+ (fn [{:keys [id store-config adds removals dirty branch commit config]}]
+   {:id id :store-config store-config
+    :adds     (d/root-node-blob adds)
+    :removals (d/root-node-blob removals)
+    :dirty dirty :branch branch :commit commit :config config})
+ (fn [blob storage opts]
+   (->TwoPSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
+              (d/restore-fused compare (:adds blob) storage opts)
+              (d/restore-fused compare (:removals blob) storage opts)
+              (or (:dirty blob) false) (:branch blob) (:commit blob) (:config blob))))

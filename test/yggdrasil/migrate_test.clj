@@ -30,7 +30,7 @@
               systems (set (map :system-id (registry/all-entries reg)))]
           (is (= #{"sysA" "sysB"} systems) "both entries carried over")
           (is (= 2 (registry/entry-count reg)))
-          (is (some? (kb/k-get (:kv-store reg) :crdt/roots sync)) "0.3 :crdt/roots written")))
+          (is (some? (kb/k-get (:kv-store reg) :crdt.head/main sync)) "0.3 head cell written")))
       (testing "reopening at 0.3 (fresh registry) sees the migrated entries durably"
         (let [reg2 (registry/create-registry {:store-config sc})]
           (is (= #{"sysA" "sysB"} (set (map :system-id (registry/all-entries reg2))))))))))
@@ -62,4 +62,4 @@
       (let [reg     (migrate/migrate-registry-0.2->0.3! sc)
             systems (set (map :system-id (registry/all-entries reg)))]
         (is (= #{"sysA" "sysB" "sysC" "sysD"} systems) "all leaves' entries migrated through the branch")
-        (is (some? (kb/k-get (:kv-store reg) :crdt/roots sync)) "0.3 :crdt/roots written")))))
+        (is (some? (kb/k-get (:kv-store reg) :crdt.head/main sync)) "0.3 head cell written")))))

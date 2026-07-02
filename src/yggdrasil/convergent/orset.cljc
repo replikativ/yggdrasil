@@ -38,7 +38,7 @@
             [yggdrasil.convergent.durable :as d]
             [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.fn-registry :as fr]
-            #?(:clj [yggdrasil.fressian :as yf])
+            [yggdrasil.fressian :as yf]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
             #?(:clj [yggdrasil.macros :refer [async+sync]]))
@@ -54,27 +54,28 @@
 
 (defrecord ORSet
            [id kv-store store-config storage comparator tag-fn
-            adds        ; immutable PSS set of [element tag]
-            removals    ; immutable PSS set of [element tag]
+            adds        ; CURRENT branch's immutable PSS set of [element tag]
+            removals    ; CURRENT branch's immutable PSS set of [element tag]
             dirty       ; boolean — content changed since last flush
-            config]     ; DOMAIN: cell-keys (:roots-key/:freed-key); {} ⇒ store defaults
+            branch      ; current branch keyword
+            commit      ; branch TIP commit-id (string) in the commit-DAG; nil before base seed
+            config]     ; DOMAIN: cell-keys (:branches-key/:cell-ns); {} ⇒ store defaults
 
   p/SystemIdentity
   (system-id [_] id)
   (system-type [_] :orset)
-  ;; single logical branch (replicas are separate stores synced by konserve-sync):
-  ;; isolation is via Overlayable, peer-merge via -join (PConvergent). branch!/
-  ;; merge! (the hierarchical tier) are no-ops here, so we do NOT advertise them.
-  (capabilities [_] {:snapshotable true :branchable false :mergeable false
+  ;; genuinely branchable (per-branch head cells): branch!/checkout/merge! are the
+  ;; durable hierarchical tier; peer-merge via -join (PConvergent) + merge-peer!.
+  (capabilities [_] {:snapshotable true :branchable true :mergeable true
                      :garbage-collectable true :overlayable true
-                     :graphable false})
+                     :graphable true})
 
   p/Snapshotable
   ;; addressable snapshot = a content-addressed COMMIT {:adds :removals} over the
   ;; two halves' roots (shared two-half machinery); `as-of` projects the FROZEN
   ;; live elements (add-wins: adds − removals, by first).
   (snapshot-id [this] (d/two-half-snapshot-id this c/default-opts))
-  (parent-ids [_] #{})
+  (parent-ids [_] (if commit #{commit} #{}))
   (as-of [this snap-id] (p/as-of this snap-id c/default-opts))
   (as-of [this snap-id opts]
     (async+sync (:sync? opts)
@@ -84,26 +85,30 @@
   (snapshot-meta [_ _] {}) (snapshot-meta [_ _ _] {})
 
   p/Branchable
-  ;; OR-Set replicas are separate stores synced by konserve-sync; the system
-  ;; itself has one logical branch. branch! returns this (no-op replica handle).
-  (branches [_] #{:main})
-  (branches [_ _] #{:main})
-  (current-branch [_] :main)
-  (branch! [this _] this) (branch! [this _ _] this) (branch! [this _ _ _] this)
-  (delete-branch! [this _] this) (delete-branch! [this _ _] this)
-  (checkout [this _] this) (checkout [this _ _] this)
+  ;; store-backed per-branch head cells (shared two-half machinery).
+  (branches [this] (d/two-half-branches this c/default-opts))
+  (branches [this opts] (d/two-half-branches this opts))
+  (current-branch [_] branch)
+  (branch! [this name] (d/two-half-branch! this name branch c/default-opts))
+  (branch! [this name from] (d/two-half-branch! this name from c/default-opts))
+  (branch! [this name from opts] (d/two-half-branch! this name from opts))
+  (delete-branch! [this name] (d/two-half-delete-branch! this name c/default-opts))
+  (delete-branch! [this name opts] (d/two-half-delete-branch! this name opts))
+  (checkout [this name] (d/two-half-checkout this name c/default-opts))
+  (checkout [this name opts] (d/two-half-checkout this name opts))
 
   p/Mergeable
-  (merge! [this _] this)
-  (merge! [this _ _] this)
+  (merge! [this source] (d/two-half-merge! this source c/default-opts))
+  (merge! [this source opts] (d/two-half-merge! this source opts))
   (conflicts [_ _ _] []) (conflicts [_ _ _ _] [])
   (diff [_ _ _] {}) (diff [_ _ _ _] {})
 
   p/Committable
-  ;; "commit" = make current state durable (flush); identity is content-addressed.
-  (commit! [this] (flush! this))
-  (commit! [this _message] (flush! this))
-  (commit! [this _message opts] (flush! this opts))
+  ;; commit! is DECOUPLED from flush!: it materializes both halves + appends a commit
+  ;; `{:root {:adds :removals} :parents #{prev-tip}}` to the shared DAG + advances the tip.
+  (commit! [this] (d/two-half-commit! this c/default-opts))
+  (commit! [this _message] (d/two-half-commit! this c/default-opts))
+  (commit! [this _message opts] (d/two-half-commit! this opts))
 
   c/PConvergent
   ;; PURE same-store join: union both grow-only halves with the peer (shared). (async+sync)
@@ -131,7 +136,23 @@
                  (assoc this :adds (d/empty-set storage comparator)
                         :removals (d/empty-set storage comparator) :dirty false)
                  (assoc this :dirty false))]
-      (ovl/convergent-overlay this mode lw))))
+      (ovl/convergent-overlay this mode lw)))
+
+  p/Graphable
+  ;; the commit-DAG (a shared reserved-branch grow-set) — all methods delegate to the shared
+  ;; `d/commit-*` helpers (gset + the two-half CRDTs share one implementation).
+  (history [this] (p/history this c/default-opts))
+  (history [_ opts] (d/commit-history kv-store storage config commit opts))
+  (ancestors [this s] (p/ancestors this s c/default-opts))
+  (ancestors [_ s opts] (d/commit-ancestors kv-store storage config s opts))
+  (ancestor? [this a b] (p/ancestor? this a b c/default-opts))
+  (ancestor? [_ a b opts] (d/commit-ancestor? kv-store storage config a b opts))
+  (common-ancestor [this a b] (p/common-ancestor this a b c/default-opts))
+  (common-ancestor [_ a b opts] (d/commit-common-ancestor kv-store storage config a b opts))
+  (commit-graph [this] (p/commit-graph this c/default-opts))
+  (commit-graph [_ opts] (d/commit-graph-map kv-store storage config opts))
+  (commit-info [this id] (p/commit-info this id c/default-opts))
+  (commit-info [_ id opts] (d/commit-info kv-store storage config id opts)))
 
 ;; ============================================================
 ;; Value ops — each returns a NEW OR-Set value (value-semantic)
@@ -146,8 +167,9 @@
    (async+sync (:sync? opts)
                (async
                 (let [pair [elem ((:tag-fn o) elem)]
-                      s'   (await (d/set-conj (:adds o) pair (:comparator o) opts))]
-                  (c/with-delta (assoc o :adds s' :dirty true) half-accrue {:adds #{pair}}))))))
+                      s'   (await (d/set-conj (:adds o) pair (:comparator o) opts))
+                      o'   (c/with-delta (assoc o :adds s' :dirty true) half-accrue {:adds #{pair}})]
+                  (if (:flush? opts true) (await (flush! o' opts)) o'))))))
 
 (defn- live-pairs
   "async+sync: the live [elem tag] add-pairs (in adds, not removals)."
@@ -170,8 +192,9 @@
                                    (if ts
                                      (recur (await (d/set-conj r (first ts) (:comparator o) opts)) (next ts))
                                      r))]
-                  (c/with-delta (assoc o :removals removals' :dirty true)
-                    half-accrue {:removals (set tombstones)}))))))
+                  (let [o' (c/with-delta (assoc o :removals removals' :dirty true)
+                             half-accrue {:removals (set tombstones)})]
+                    (if (:flush? opts true) (await (flush! o' opts)) o')))))))
 
 (defn apply-delta
   "Consume a peer's OR-Set δ ({:adds #{[e tag]..} :removals #{[e tag]..}}) by
@@ -186,7 +209,9 @@
                       rems (loop [r (:removals o) ps (seq (:removals delta))]
                              (if ps (recur (await (d/set-conj r (first ps) (:comparator o) opts)) (next ps)) r))]
                   ;; clear δ: a remote-integrated value re-propagates nothing.
-                  (c/clear-delta (assoc o :adds adds :removals rems :dirty true)))))))
+                  (let [o' (c/clear-delta (assoc o :adds adds :removals rems :dirty true))]
+                    ;; AUTO-FLUSH the receive side — durable-after-apply.
+                    (if (:flush? opts true) (await (flush! o' opts)) o')))))))
 
 (defn elements
   "Live elements: those with ≥1 add-tag not tombstoned. (async+sync)"
@@ -223,6 +248,12 @@
   ([o] (p/gc-sweep! o nil nil))
   ([o opts] (p/gc-sweep! o nil opts)))
 
+(defn merge-base
+  "The most recent common ancestor commit of branches `a` and `b` (git merge-base) — LCA over
+   the shared commit-graph, seeded from each branch's tip. (async+sync)"
+  ([o a b] (merge-base o a b c/default-opts))
+  ([o a b opts] (d/commit-merge-base (:kv-store o) (:storage o) (:config o) a b opts)))
+
 ;; ============================================================
 ;; Factory
 ;; ============================================================
@@ -241,8 +272,8 @@
    record — each op picks its own `:sync?` (default `c/default-opts`)."
   ([id] (orset id {} {:sync? true}))
   ([id config] (orset id config {:sync? true}))
-  ([id {:keys [comparator tag-fn store-config kv-store roots-key freed-key]
-        :or {comparator compare}}
+  ([id {:keys [comparator tag-fn store-config kv-store cell-ns branches-key branch]
+        :or {comparator compare branch :main}}
     {:keys [sync?] :or {sync? true}}]
    (let [open-opts {:sync? sync?}
          tag-fn-id (when (keyword? tag-fn) tag-fn)             ; a registered id → serializable
@@ -251,29 +282,31 @@
                          :else             (fn [_] (random-uuid)))]
      (async+sync sync?
                  (async
-                  (let [{:keys [kv-store storage store-config config adds removals]}
+                  (let [{:keys [kv-store storage store-config config adds removals branch commit]}
                         (await (d/two-half-open store-config
                                                 {:comparator comparator :kv-store kv-store
-                                                 :roots-key roots-key :freed-key freed-key}
+                                                 :cell-ns cell-ns :branches-key branches-key :branch branch}
                                                 open-opts))]
                     (->ORSet id kv-store store-config storage comparator tagger adds removals false
-                             (cond-> config tag-fn-id (assoc :tag-fn-id tag-fn-id)))))))))
+                             branch commit (cond-> config tag-fn-id (assoc :tag-fn-id tag-fn-id)))))))))
 
 ;; Register the OR-Set with the system value codec (JVM). Both [element tag] halves
 ;; ride as content addresses. The tagger is recovered from `:tag-fn-id` (a registered
 ;; id) when present, else the default true-OR-Set tagger — the tag-fn only affects
 ;; FUTURE adds, so the stored value is preserved either way.
-#?(:clj
-   (yf/register-system!
-    :orset ORSet
-    (fn [{:keys [id store-config storage adds removals dirty config]}]
-      {:id id :store-config store-config
-       :adds     (str (d/store-set! adds storage c/default-opts))
-       :removals (str (d/store-set! removals storage c/default-opts))
-       :dirty dirty :config config})
-    (fn [blob storage opts]
-      (->ORSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
-               (or (fr/resolve-fn (:tag-fn-id (:config blob))) (fn [_] (random-uuid)))
-               (d/restore-set compare (parse-uuid (str (:adds blob))) storage opts)
-               (d/restore-set compare (parse-uuid (str (:removals blob))) storage opts)
-               (or (:dirty blob) false) (:config blob)))))
+(yf/register-system!
+ :orset ORSet
+ ;; project reads the ALREADY-COMMITTED roots (assert-committed, uniform both platforms;
+ ;; auto-flush guarantees it). nil = an empty half.
+ (fn [{:keys [id store-config adds removals dirty branch commit config]}]
+   {:id id :store-config store-config
+    ;; ship the CURRENT branch's halves inline (fused); nil = empty half.
+    :adds     (d/root-node-blob adds)
+    :removals (d/root-node-blob removals)
+    :dirty dirty :branch branch :commit commit :config config})
+ (fn [blob storage opts]
+   (->ORSet (:id blob) (:kv-store storage) (:store-config blob) storage compare
+            (or (fr/resolve-fn (:tag-fn-id (:config blob))) (fn [_] (random-uuid)))
+            (d/restore-fused compare (:adds blob) storage opts)
+            (d/restore-fused compare (:removals blob) storage opts)
+            (or (:dirty blob) false) (:branch blob) (:commit blob) (:config blob))))

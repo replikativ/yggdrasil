@@ -35,15 +35,23 @@
 (deftest-async gc-safe-default-reclaims-nothing
   (testing "gc! with NO window reclaims NOTHING (never sweeps a node an in-flight
             lazy read might hold); a `:grace-period-ms 0` / `now` cutoff reclaims orphans"
-    (let [gs (<? (g/gset "t" {:store-config (file-cfg)} {:sync? sync?}))
-          gs (<? (g/conj gs :a)) gs (<? (g/flush! gs))
-          gs (<? (g/conj gs :b)) gs (<? (g/flush! gs))
+    ;; MULTI-NODE set: a single-leaf set stores no nodes under root fusion (leaf = inlined
+    ;; root), so there'd be no orphans to reclaim. Build ~200 elements (batched, one flush)
+    ;; so the tree has stored leaves, then a further flush supersedes some → real orphans.
+    (let [gs0 (<? (g/gset "t" {:store-config (file-cfg)} {:sync? sync?}))
+          gs1 (loop [gs gs0 xs (range 1000)]   ; ~1000 ⇒ a reliably MULTI-node MST tree
+                (if (seq xs)
+                  (recur (<? (g/conj gs (first xs) {:sync? sync? :flush? false})) (rest xs))
+                  gs))
+          gs2 (<? (g/flush! gs1))
+          gs3 (<? (g/conj gs2 1000)) gs (<? (g/flush! gs3))
           kv (:kv-store gs)
-          roots (vals (<? (d/load-roots kv {} {:sync? sync?})))]
-      (is (empty? (<gc (d/gc! kv roots {} {}))) "default (epoch cutoff) ⇒ reclaim nothing")
-      (is (empty? (<gc (d/gc! kv roots {} {:grace-period-ms 600000})))
+          roots (d/head-roots (<? (d/load-head kv :main {} {:sync? sync?})))
+          spare {:spare-keys (d/head-cell-keys {} #{:main})}]
+      (is (empty? (<gc (d/gc! kv roots {} spare))) "default (epoch cutoff) ⇒ reclaim nothing")
+      (is (empty? (<gc (d/gc! kv roots {} (merge spare {:grace-period-ms 600000}))))
           "a 10-min grace still spares the just-written orphans")
-      (is (pos? (count (<gc (d/gc! kv roots {} {:grace-period-ms 0}))))
+      (is (pos? (count (<gc (d/gc! kv roots {} (merge spare {:grace-period-ms 0})))))
           ":grace-period-ms 0 reclaims orphans older than now"))))
 
 (deftest-async gc-retains-held-snapshot
@@ -87,15 +95,20 @@
              (testing "GC is idempotent — a second sweep on the quiescent store deletes nothing"
                (is (empty? (<gc (g/gc! gs {:remove-before (now)})))))
              (testing "every node reachable from the current root survived"
-               (let [root (get (d/load-roots kv) :main)]
+               ;; the head is a fused root NODE now → reachable-of walks its CHILDREN
+               ;; (the root itself is inlined in the cell, not a store object).
+               (let [root (:root (d/load-head kv :main))]
                  (is (every? #(some? (k/get kv % {:sync? true}))
-                             (d/reachable-addresses kv root)))))))))
+                             (d/reachable-of kv root {:sync? true})))))))))
 
      (clojure.test/deftest two-pset-gc-keeps-both-halves
        (testing "2P-Set GC keeps adds + removals roots (tombstones are live members)"
+         ;; ~1000 elements ⇒ the adds half is a reliably MULTI-node tree, so re-flush across
+         ;; generations supersedes stored children → real orphans to reclaim (a single-leaf
+         ;; half stores no nodes under fusion).
          (let [s0 (reduce (fn [s batch] (d2p/flush! (reduce d2p/conj s batch)))
                           (d2p/twopset "t" {:store-config (file-cfg) :comparator compare})
-                          (partition-all 30 (range 150)))
+                          (partition-all 200 (range 1000)))
                s  (d2p/flush! (-> s0 (d2p/disj 7) (d2p/disj 42)))]
            (let [live-before (d2p/elements s)
                  deleted (<gc (d2p/gc! s {:remove-before (now)}))]

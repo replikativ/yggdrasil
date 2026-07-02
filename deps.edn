@@ -7,9 +7,9 @@
         ;; + MST content-defined boundary. 0.4.127 carries partial-cps 0.1.59
         ;; (the cljs-1.12 await-clash fix) so the shadow suite runs on cljs 1.12.
         org.replikativ/persistent-sorted-set {:mvn/version "0.4.130"}
-        ;; PSS's boundary requires `hasch.fast` (added in hasch 0.3.97), but PSS
-        ;; still transitively pins the stale 0.3.96 — pin 0.3.97 explicitly.
-        org.replikativ/hasch {:mvn/version "0.3.97"}
+        ;; TEMPORARY local pin: the CAS break-out work needs hasch/ref->uuid (unreleased).
+        ;; Revert to `{:mvn/version "0.3.97"}` on the bottom-up release.
+        org.replikativ/hasch {:mvn/version "0.4.99"}
         ;; 0.1.60 ships the optional core.async adapter (is.simm.partial-cps.core-async)
         ;; that kbridge + the storage layer delegate to.
         is.simm/partial-cps {:mvn/version "0.1.60"}
