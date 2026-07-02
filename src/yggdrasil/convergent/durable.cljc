@@ -918,11 +918,56 @@
                    (assoc this :dirty false))
                  this))))
 
+(defn- fold-peer-branch-head!
+  "Fold a peer branch's already-restored halves `poa`/`por` into b's LOCAL head cell:
+   union with b's existing local halves, flush both, then save + register the head.
+   Used by merge-peer-branch! for NON-current peer branches; `o-commit` is the peer
+   head's commit (the fallback tip). Split out to keep merge-peer-branch!'s CPS nesting
+   shallow (see it). (async+sync)"
+  [{:keys [comparator storage kv-store config]} b poa por o-commit opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [gh (await (load-head kv-store b config opts))
+                     a' (await (set-union (restore-fused comparator (:adds gh) storage opts) poa comparator opts))
+                     r' (await (set-union (restore-fused comparator (:removals gh) storage opts) por comparator opts))
+                     {an :root-node} (await (flush-set-fused! a' storage opts))
+                     {rn :root-node} (await (flush-set-fused! r' storage opts))]
+                 (await (save-head! kv-store b {:adds an :removals rn :commit (or (:commit gh) o-commit)} config opts))
+                 (await (register-branch! kv-store b config opts))))))
+
+(defn- merge-peer-branch!
+  "Reconcile ONE peer branch `b` into the local store during a whole-tree
+   `two-half-merge-peer!`: ship its halves' nodes + lineage here, then either UNION
+   into the caller's accumulators `[ca cr]` (when `b` is the local current `branch`)
+   or fold into b's own local head cell. Returns `[adds removals]` — the (possibly
+   updated) accumulators.
+
+   Extracted from the merge loop on purpose: with ~8 awaits inlined in a loop, the
+   partial-cps CPS expansion nested one continuation class per await deep enough that
+   the generated `.class` name blew past the filesystem's 255-byte limit under AOT.
+   Splitting the per-branch body into its own fn keeps BOTH fns' continuation nesting
+   shallow. (async+sync)"
+  [{:keys [comparator storage kv-store branch] :as this} o-store o-config b ca cr opts]
+  (async+sync (:sync? opts)
+              (async
+               (let [oh  (await (load-head o-store b o-config opts))
+                     _   (await (ship-node! o-store kv-store (:adds oh) opts))
+                     _   (await (ship-node! o-store kv-store (:removals oh) opts))
+                     ;; ship the peer branch's LINEAGE (standalone commit keys + root trees)
+                     _   (await (ship-commits! o-store kv-store (:commit oh) opts))
+                     oa  (restore-fused comparator (:adds oh) storage opts)
+                     or* (restore-fused comparator (:removals oh) storage opts)]
+                 (if (= b branch)
+                   [(await (set-union ca oa comparator opts))
+                    (await (set-union cr or* comparator opts))]
+                   (do (await (fold-peer-branch-head! this b oa or* (:commit oh) opts))
+                       [ca cr]))))))
+
 (defn two-half-merge-peer!
   "Cross-STORE reconcile over the WHOLE tree (holds both stores): for every branch the
    peer has, ship both halves' nodes here and union into the same-named local branch's
    head cell. Returns a NEW record on its (possibly-merged) current branch. (async+sync)"
-  [{:keys [adds removals comparator storage kv-store branch config] :as this} other opts]
+  [{:keys [adds removals] :as this} other opts]
   (async+sync (:sync? opts)
               (async
                (let [this      (await (two-half-flush! this opts))
@@ -931,29 +976,12 @@
                  ;; merge each peer branch; the CURRENT branch accumulates into this's
                  ;; in-memory (resident, non-lazy) halves, OTHER branches into head cells —
                  ;; so the returned value's halves are never a lazy restore (a cljs slice on
-                 ;; a lazily-seeded root can miss).
+                 ;; a lazily-seeded root can miss). Per-branch work lives in merge-peer-branch!
+                 ;; (one await here) to keep this fn's CPS nesting shallow (see that fn).
                  (loop [bs (seq obranches) ca adds cr removals]
                    (if bs
-                     (let [b   (first bs)
-                           oh  (await (load-head o-store b o-config opts))
-                           _   (await (ship-node! o-store kv-store (:adds oh) opts))
-                           _   (await (ship-node! o-store kv-store (:removals oh) opts))
-                           ;; ship the peer branch's LINEAGE (standalone commit keys + root trees)
-                           _   (await (ship-commits! o-store kv-store (:commit oh) opts))
-                           oa  (restore-fused comparator (:adds oh) storage opts)
-                           or* (restore-fused comparator (:removals oh) storage opts)]
-                       (if (= b branch)
-                         (recur (next bs)
-                                (await (set-union ca oa comparator opts))
-                                (await (set-union cr or* comparator opts)))
-                         (let [gh (await (load-head kv-store b config opts))
-                               a' (await (set-union (restore-fused comparator (:adds gh) storage opts) oa comparator opts))
-                               r' (await (set-union (restore-fused comparator (:removals gh) storage opts) or* comparator opts))
-                               {an :root-node} (await (flush-set-fused! a' storage opts))
-                               {rn :root-node} (await (flush-set-fused! r' storage opts))]
-                           (await (save-head! kv-store b {:adds an :removals rn :commit (or (:commit gh) (:commit oh))} config opts))
-                           (await (register-branch! kv-store b config opts))
-                           (recur (next bs) ca cr))))
+                     (let [[ca' cr'] (await (merge-peer-branch! this o-store o-config (first bs) ca cr opts))]
+                       (recur (next bs) ca' cr'))
                      (let [merged (assoc this :adds ca :removals cr :dirty true)]
                        (if (:flush? opts true) (await (two-half-flush! merged opts)) merged))))))))
 
