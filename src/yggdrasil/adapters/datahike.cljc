@@ -254,6 +254,40 @@
                :let  [val (if (and (ref a) (integer? v)) (addr v) v)]]
            [:db/add subj a val]))))
 
+(defn- compute-merge-retractions
+  "3-way retraction tx-data: datoms present in BASE and still in TARGET but
+   ABSENT from SOURCE — the branch deleted them, so the merge must too.
+   Inherently delete-vs-edit safe by construction: if TARGET changed the
+   datom since base (edited value, re-parented ref, …), the base datom is
+   no longer 'still in target' and nothing is retracted — the edit wins
+   and the divergence surfaces via `conflicts`, not silent data loss.
+   Subjects and ref values are addressed by :db.unique/identity lookup in
+   TARGET (concrete eids in the emitted retracts); datoms whose subject or
+   ref value carries no identity are skipped (unaddressable cross-db)."
+  [base-db source-db target-db]
+  (let [{:keys [unique ref]} (schema-attrs base-db)
+        ident-of (fn [db e]
+                   (let [ent (d/entity db e)]
+                     (some (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
+        find-e   (fn [db [ua uv]]
+                   (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
+        deleted  (->> (d/q '[:find ?e ?a ?v :in $ $2 :where
+                             [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
+                           base-db source-db)
+                      (remove (fn [[_ a _]] (= "db" (namespace a)))))]
+    (vec (for [[e a v] deleted
+               :let  [subj-id (ident-of base-db e)
+                      te      (some->> subj-id (find-e target-db))]
+               :when te
+               :let  [tv (if (and (ref a) (integer? v))
+                           (some->> (ident-of base-db v) (find-e target-db))
+                           v)]
+               :when (some? tv)
+               ;; still present in TARGET? (else nothing to retract — covers
+               ;; the target-edited-since-base case)
+               :when (some #(= tv (:v %)) (d/datoms target-db :eavt te a))]
+           [:db/retract te a tv]))))
+
 ;; ============================================================
 ;; History traversal (synchronous, bounded)
 ;; ============================================================
@@ -415,38 +449,53 @@
           branch (branch-of conn)]
       (walk-history store [branch] opts)))
 
+  ;; Ref normalization for ancestry ops: branch KEYWORDS pass through
+  ;; (walk-history and branch-as-db take them directly — parse-uuid'ing a
+  ;; keyword yields nil and silently broke every keyword-ref call);
+  ;; uuid-strings parse; uuids pass.
   (ancestors [this snap-id] (p/ancestors this snap-id nil))
   (ancestors [_ snap-id _opts]
     (let [store (store-of conn)
-          uuid (if (uuid? snap-id) snap-id (parse-uuid (str snap-id)))]
-      (walk-history store [uuid] {:limit nil})))
+          ref (cond (keyword? snap-id) snap-id
+                    (uuid? snap-id) snap-id
+                    :else (parse-uuid (str snap-id)))]
+      (walk-history store [ref] {:limit nil})))
 
   (ancestor? [this a b] (p/ancestor? this a b nil))
-  (ancestor? [_ a b _opts]
-    (let [store (store-of conn)
-          uuid-a (if (uuid? a) a (parse-uuid (str a)))
-          uuid-b (if (uuid? b) b (parse-uuid (str b)))
-          ancestors-of-b (set (walk-history store [uuid-b] {:limit nil}))]
-      (contains? ancestors-of-b (str uuid-a))))
+  (ancestor? [this a b _opts]
+    (let [norm (fn [x] (cond (keyword? x) x (uuid? x) x
+                             :else (or (parse-uuid (str x)) x)))
+          ancestors-of-b (set (p/ancestors this (norm b)))]
+      (contains? ancestors-of-b (str (norm a)))))
 
   (common-ancestor [this a b] (p/common-ancestor this a b nil))
   (common-ancestor [_ a b _opts]
     (let [store (store-of conn)
-          uuid-a (if (uuid? a) a (parse-uuid (str a)))
-          uuid-b (if (uuid? b) b (parse-uuid (str b)))
-          ancestors-a (set (walk-history store [uuid-a] {:limit nil}))]
-      (loop [queue [uuid-b]
+          norm (fn [x] (cond (keyword? x) x (uuid? x) x
+                             :else (or (parse-uuid (str x)) x)))
+          load-db (fn [r]
+                    (try (cond (keyword? r) (dv/branch-as-db store r)
+                               (uuid? r)    (dv/commit-as-db store r)
+                               :else (some->> r str parse-uuid
+                                              (dv/commit-as-db store)))
+                         (catch #?(:clj Exception :cljs :default) _ nil)))
+          ancestors-a (set (walk-history store [(norm a)] {:limit nil}))]
+      (loop [queue [(norm b)]
              visited #{}]
         (when (seq queue)
           (let [[current & rest] queue]
             (if (visited current)
               (recur (vec rest) visited)
-              (if (ancestors-a (str current))
-                (str current)
-                (if-let [db (dv/commit-as-db (store-of conn) current)]
-                  (recur (into (vec rest) (parent-ids-of db))
-                         (conj visited current))
-                  (recur (vec rest) (conj visited current))))))))))
+              (if-let [db (load-db current)]
+                ;; test the COMMIT of the loaded ref itself (a branch head or
+                ;; parent commit) — the old loop only tested raw queue entries,
+                ;; so a fast-forward base (b's own head) was never found.
+                (let [cid (str (commit-id-of db))]
+                  (if (ancestors-a cid)
+                    cid
+                    (recur (into (vec rest) (parent-ids-of db))
+                           (conj visited current))))
+                (recur (vec rest) (conj visited current)))))))))
 
   (commit-graph [this] (p/commit-graph this nil))
   (commit-graph [this _opts]
@@ -520,9 +569,22 @@
           tx-data (or (:tx-data opts)
                       (when source-branch
                         (let [source-db (dv/branch-as-db store source-branch)
-                              target-db (db-of conn)]
+                              target-db (db-of conn)
+                              ;; 3-way: merge-base enables RETRACTION propagation
+                              ;; (branch deletions land on target). Base
+                              ;; unavailable (GC'd / no common ancestor) →
+                              ;; additions-only, as before — logged upstream by
+                              ;; consumers via conflicts' baseless fallback.
+                              base-id (try (p/common-ancestor this source-branch
+                                                              (p/current-branch this))
+                                           (catch #?(:clj Exception :cljs :default) _ nil))
+                              ;; snapshot-ids are STRINGS (walk-history); resolve-db
+                              ;; wants the UUID
+                              base-db (some->> base-id str parse-uuid (resolve-db store))]
                           ;; identity-keyed (sibling-safe), not raw [:db/add e a v]
-                          (compute-merge-tx source-db target-db)))
+                          (into (compute-merge-tx source-db target-db)
+                                (when base-db
+                                  (compute-merge-retractions base-db source-db target-db)))))
                       [])]
       ;; merge routes through the datahike WRITER (genuinely async — a go-loop
       ;; transactor). On the JVM datahike's OWN sync API derefs the writer's
