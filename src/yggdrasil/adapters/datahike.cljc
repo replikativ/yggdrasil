@@ -225,9 +225,14 @@
    (`Conflicting upsert … resolves both to 300 and 320`)."
   [source-db target-db]
   (let [{:keys [unique ref]} (schema-attrs source-db)
-        in-target? (fn [ua uv] (seq (d/q '[:find ?t :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv)))
+        tgt-eid    (memoize
+                    (fn [[ua uv]]
+                      (d/q '[:find ?t . :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv)))
+        in-target? (fn [ua uv] (some? (tgt-eid [ua uv])))
         idents     (fn [e] (let [ent (d/entity source-db e)]
                              (keep (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
+        ;; the TARGET entity a source entity denotes, via shared identity
+        tgt-of     (memoize (fn [e] (some tgt-eid (idents e))))
         addr       (fn [e]
                      ;; prefer an identity that ALREADY exists in target (→ that
                      ;; entity); else a fresh tempid (new/anonymous)
@@ -235,16 +240,44 @@
                        (if-let [ex (first (filter (fn [[ua uv]] (in-target? ua uv)) ids))]
                          (vec ex)
                          (str "ygg-tmp-" e))))
-        diff       (->> (d/q '[:find ?e ?a ?v :in $ $2 :where
-                               [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
-                             source-db target-db)
-                        ;; NEVER merge SCHEMA as data: a `:db/*` datom is an
-                        ;; attribute/enum definition (`:db/ident`, `:db/valueType`,
-                        ;; `:db/cardinality` …). Re-transacting it as flat data
-                        ;; upserts a schema entity to two existing ones and aborts
-                        ;; the whole merge. Schema is installed at startup and is
-                        ;; shared by parent + fork — leave it alone.
-                        (remove (fn [[_ a _]] (= "db" (namespace a)))))]
+        ;; SELECTION IS BY IDENTITY, NOT ENTITY ID.
+        ;;
+        ;; This used to ask datalog for datoms in source `(not [$target ?e ?a ?v])`
+        ;; — comparing the raw ?e across two DIVERGED dbs. Entities that predate
+        ;; the fork do share an id, but both sides then allocate new ids from the
+        ;; same counter, so `new entity 8` on the fork and `new entity 8` on trunk
+        ;; are different things. Whenever those numbers coincided AND the value was
+        ;; low-cardinality (`:block/order "a0"`, a ref to eid 7, an amount of 42),
+        ;; the fork's datom was judged "already in target" and silently dropped —
+        ;; `merge!` still returning :ok, the row left orphaned and invisible to
+        ;; every join-based read. The ADDRESSING below was always identity-based;
+        ;; only this selection was not, so it addressed a wrongly-chosen set.
+        ;;
+        ;; A source datom is already in target iff target holds the same attribute
+        ;; and value on the entity carrying the SAME IDENTITY — with ref values
+        ;; mapped through identity too, since a raw referent id is equally
+        ;; meaningless across the pair. An entity with no identity can never be
+        ;; matched, so it is always new: duplicating an anonymous row on a repeat
+        ;; merge is recoverable, dropping one is not.
+        present?   (fn [e a v]
+                     (when-let [te (tgt-of e)]
+                       (let [tv (if (and (ref a) (integer? v)) (tgt-of v) v)]
+                         (and (some? tv)
+                              (boolean (seq (d/datoms target-db :eavt te a tv)))))))
+        diff       (->> (d/datoms source-db :eavt)
+                        (keep (fn [dt]
+                                (let [e (:e dt) a (:a dt) v (:v dt)]
+                                  (when (and (not= :db/txInstant a)
+                                             ;; NEVER merge SCHEMA as data: a `:db/*`
+                                             ;; datom is an attribute/enum definition.
+                                             ;; Re-transacting it as flat data upserts a
+                                             ;; schema entity to two existing ones and
+                                             ;; aborts the whole merge. Schema is
+                                             ;; installed at startup and shared by parent
+                                             ;; + fork — leave it alone.
+                                             (not= "db" (namespace a))
+                                             (not (present? e a v)))
+                                    [e a v])))))]
     (vec (for [[e a v] diff
                :let  [subj (addr e)]
                ;; on an EXISTING (lookup-ref) subject, never re-assign a unique
