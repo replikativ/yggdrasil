@@ -243,3 +243,53 @@
           (is (= #{"n1" "n2"} (ids (:conn merged)))
               "merge-down! 3-way-merged the fork's n2 into the parent branch"))
         (is (true? (:overlayable (p/capabilities sys))) "datahike advertises :overlayable")))))
+
+(deftest merge-selects-by-identity-not-entity-id
+  (testing "a fork's datom must not be dropped because the TARGET happens to hold
+            the byte-identical datom for an UNRELATED entity.
+
+            Two branches diverging from one base allocate new entity-ids from the
+            SAME counter, so `new entity 8` on the fork and `new entity 8` on
+            trunk are different things. Selecting the merge set with
+            `(not [$target ?e ?a ?v])` compares those ids across the two dbs, so a
+            fork datom silently vanishes whenever the numbers coincide and the
+            value is low-cardinality — `:block/order \"a0\"`, a ref to eid 7, an
+            amount of 42. merge! still reports :ok.
+
+            The addressing was already identity-based; only the SELECTION was not."
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :leg/id     :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :leg/parent :db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :leg/order  :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :tx/id      :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}])
+      (d/transact *conn* [{:tx/id "base"}])
+      (p/branch! sys :fork)
+      (let [fsys (p/checkout sys :fork)]
+        ;; FORK: a parent row and two legs under it, both with the same order key
+        (d/transact (:conn fsys) [{:tx/id "F"}])
+        (d/transact (:conn fsys) [{:leg/id "F-1" :leg/parent [:tx/id "F"] :leg/order "a0"}
+                                  {:leg/id "F-2" :leg/parent [:tx/id "F"] :leg/order "a0"}])
+        ;; TRUNK advances concurrently, allocating eids from the same counter and
+        ;; writing the same low-cardinality values
+        (d/transact *conn* [{:tx/id "T"}])
+        (d/transact *conn* [{:leg/id "T-1" :leg/parent [:tx/id "T"] :leg/order "a0"}
+                            {:leg/id "T-2" :leg/parent [:tx/id "T"] :leg/order "a0"}])
+        (p/merge! sys :fork)
+        (let [db  @*conn*
+              legs (fn [tx] (set (d/q '[:find [?lid ...] :in $ ?tx :where
+                                        [?t :tx/id ?tx] [?l :leg/parent ?t] [?l :leg/id ?lid]]
+                                      db tx)))]
+          (is (= #{"F" "T" "base"} (set (d/q '[:find [?id ...] :where [_ :tx/id ?id]] db)))
+              "both parents present")
+          (is (= #{"F-1" "F-2"} (legs "F"))
+              "BOTH fork legs kept their parent link — neither dropped by an eid collision")
+          (is (= #{"T-1" "T-2"} (legs "T"))
+              "trunk's own legs untouched")
+          (is (empty? (d/q '[:find [?lid ...] :where
+                             [?l :leg/id ?lid] (not [?l :leg/parent _])] db))
+              "no orphan legs — a dropped :leg/parent leaves the row unreachable
+               from its transaction, invisible to any join-based report"))))))
