@@ -162,6 +162,19 @@
             patch           ; String - unified diff (-p) output
             files])         ; [{:status :added|:modified|:deleted, :path "..."}]
 
+;; Geschichte is Datahike-backed, but a Geschichte diff is a FILE diff, not a
+;; datom diff: decoding a DatahikeDiff of Geschichte's internal commit/tree/blob
+;; schema would duplicate that schema knowledge in every consumer. The leading
+;; five fields are deliberately GitDiff's, so a consumer that renders `files`
+;; needs no per-system special case.
+(defrecord GeschichteDiff
+           [snapshot-a      ; String - from commit id
+            snapshot-b      ; String - to commit id
+            stat            ; String - git-shaped --stat summary
+            patch           ; String - concatenated unified patches
+            files           ; [{:status :added|:modified|:deleted, :path "..."}]
+            summary])       ; {:files-changed n, :insertions n, :deletions n}
+
 (defrecord DatahikeDiff
            [from            ; keyword/UUID - source branch/commit
             to              ; keyword/UUID - target branch/commit
