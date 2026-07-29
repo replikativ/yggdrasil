@@ -194,7 +194,24 @@
                      {})
          ours-tree (await (repo/tree-at conn ours-commit))
          theirs-tree (await (repo/tree-at conn theirs-commit))]
-     (assoc (graph/plan-trees base-id ours theirs base-tree ours-tree theirs-tree)
+     (assoc (graph/plan-trees base-id ours theirs base-tree ours-tree theirs-tree
+                              ;; Content-level merge: geschichte resolves a path
+                              ;; from its tree entries, and where both sides
+                              ;; changed it, this merges the two blobs line by
+                              ;; line rather than declaring a conflict. Without
+                              ;; it every path both sides touched conflicts,
+                              ;; overlapping or not — which for concurrent
+                              ;; writers is most of them.
+                              ;;
+                              ;; JVM ONLY, and that is structural rather than an
+                              ;; omission: `plan-trees` is a synchronous pure
+                              ;; function, while on ClojureScript reading and
+                              ;; storing content are partial-cps computations. A
+                              ;; resolver cannot be awaited from inside a sync
+                              ;; planner, so cljs keeps the file-level behaviour
+                              ;; — conservative, never wrong, just coarser.
+                              #?(:clj {:resolve-content (repo/content-merger conn)}
+                                 :cljs nil))
             :baseless? (nil? base-id)))))
 
 (declare ->GeschichteSystem)
