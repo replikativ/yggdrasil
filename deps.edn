@@ -26,7 +26,7 @@
                       org.replikativ/datahike {:mvn/version "0.8.1743"}
                       ;; geschichte is likewise an OPTIONAL adapter dep, for
                       ;; yggdrasil.adapters.geschichte-test.
-                      org.replikativ/geschichte {:mvn/version "0.1.10"}}
+                      org.replikativ/geschichte {:mvn/version "0.1.14"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
@@ -51,7 +51,7 @@
                         org.replikativ/datahike {:mvn/version "0.8.1743"}
                         ;; same for the (optional) geschichte adapter — the whole
                         ;; adapter is .cljc, so cljs exercises the same code.
-                        org.replikativ/geschichte {:mvn/version "0.1.10"}}}
+                        org.replikativ/geschichte {:mvn/version "0.1.14"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}

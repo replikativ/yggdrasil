@@ -299,3 +299,55 @@
         (is (:mergeable caps)
             "the adapter now implements Mergeable — consumers gate on this flag")
         (is (satisfies? p/Mergeable (gy/create conn {})))))))
+
+(deftest disjoint-line-edits-merge-through-the-adapter
+  ;; geschichte resolves a path from its tree ENTRIES, so two branches that both
+  ;; touched one file used to conflict whether or not the changes overlapped.
+  ;; With the content merge wired into `merge-plan`, only real overlaps reach
+  ;; `conflicts` — which is what a consumer builds a review surface on.
+  (with-repo
+    (fn [conn]
+      (repo/write! conn "f.txt" (gbytes/utf8 "one\ntwo\nthree\nfour\n"))
+      (repo/stage-all! conn)
+      (repo/commit! conn {:message "base" :author "t"})
+      (let [sys (gy/create conn {:system-name "adapter-merge"})]
+        (p/branch! sys :side :main)
+        ;; main edits the first line
+        (repo/write! conn "f.txt" (gbytes/utf8 "ONE\ntwo\nthree\nfour\n"))
+        (repo/stage-all! conn)
+        (repo/commit! conn {:message "main" :author "t"})
+        ;; side edits the last
+        (p/checkout sys :side)
+        (repo/write! conn "f.txt" (gbytes/utf8 "one\ntwo\nthree\nFOUR\n"))
+        (repo/stage-all! conn)
+        (repo/commit! conn {:message "side" :author "t"})
+        (p/checkout sys :main)
+
+        (testing "no conflict is reported for edits that do not overlap"
+          (is (empty? (p/conflicts sys :main :side))))
+
+        (testing "and the merge lands BOTH edits"
+          (p/merge! sys :side)
+          (is (= "ONE\ntwo\nthree\nFOUR\n"
+                 (String. (repo/read conn "f.txt")))))))))
+
+(deftest competing-edits-to-one-line-still-conflict-through-the-adapter
+  (with-repo
+    (fn [conn]
+      (repo/write! conn "g.txt" (gbytes/utf8 "a\nold\nc\n"))
+      (repo/stage-all! conn)
+      (repo/commit! conn {:message "base" :author "t"})
+      (let [sys (gy/create conn {:system-name "adapter-conflict"})]
+        (p/branch! sys :side :main)
+        (repo/write! conn "g.txt" (gbytes/utf8 "a\nMAIN\nc\n"))
+        (repo/stage-all! conn)
+        (repo/commit! conn {:message "main" :author "t"})
+        (p/checkout sys :side)
+        (repo/write! conn "g.txt" (gbytes/utf8 "a\nSIDE\nc\n"))
+        (repo/stage-all! conn)
+        (repo/commit! conn {:message "side" :author "t"})
+        (p/checkout sys :main)
+
+        (is (seq (p/conflicts sys :main :side))
+            "a real overlap must still reach a person")
+        (is (thrown? clojure.lang.ExceptionInfo (p/merge! sys :side)))))))
