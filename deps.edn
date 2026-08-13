@@ -6,7 +6,7 @@
         ;; canonical node handlers (org.replikativ.persistent-sorted-set.fressian)
         ;; + MST content-defined boundary. 0.4.127 carries partial-cps 0.1.59
         ;; (the cljs-1.12 await-clash fix) so the shadow suite runs on cljs 1.12.
-        org.replikativ/persistent-sorted-set {:mvn/version "0.4.130"}
+        org.replikativ/persistent-sorted-set {:mvn/version "0.5.140"}
         ;; TEMPORARY local pin: the CAS break-out work needs hasch/ref->uuid (unreleased).
         ;; Revert to `{:mvn/version "0.3.97"}` on the bottom-up release.
         org.replikativ/hasch {:mvn/version "0.4.101"}
