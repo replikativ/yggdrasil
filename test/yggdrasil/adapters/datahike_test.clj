@@ -8,6 +8,7 @@
    returned nil — silently breaking fork merge-base derivation."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
+            [datahike.writing :as dw]
             [yggdrasil.adapters.datahike :as dha]
             [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.protocols :as p]))
@@ -35,6 +36,22 @@
         (is (seq hist) "history is non-empty")
         (is (every? string? hist) "every history entry is a string snapshot-id")
         (is (string? (p/snapshot-id sys)))))))
+
+(deftest graph-metadata-does-not-materialize-writable-dbs
+  (testing "history and branch heads are read directly from stored metadata"
+    (let [sys (dha/create *conn* {:system-name "test-db"})]
+      (d/transact *conn* [{:note/text "a"}])
+      (d/transact *conn* [{:note/text "b"}])
+      ;; Historical snapshots may carry secondary indexes whose live writer is
+      ;; already open on the connection. Reconstructing them through stored->db
+      ;; tries to open a second writer and fails on its lock; graph operations
+      ;; only need :meta and must never materialize those snapshots at all.
+      (with-redefs [dw/stored->db
+                    (fn [& _]
+                      (throw (ex-info "writable DB reconstruction is forbidden" {})))]
+        (is (seq (p/history sys)))
+        (is (= #{(p/snapshot-id sys)} (p/gc-roots sys)))
+        (is (= (p/snapshot-id sys) (get-in (p/commit-graph sys) [:branches :db])))))))
 
 (deftest sibling-merge-unions-by-identity
   (testing "two SIBLING branches each add an entity from the same base; merging

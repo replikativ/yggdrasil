@@ -26,7 +26,6 @@
             #?(:clj [yggdrasil.macros :refer [async+sync]])
             [datahike.api :as d]
             [datahike.versioning :as dv]
-            [datahike.writing :as dw]
             ;; fressian is the JVM-only value codec (org.fressian); the
             ;; register-system! call at the bottom is the only user, gated :clj.
             #?@(:clj [[yggdrasil.fressian :as yf]]))
@@ -68,6 +67,12 @@
 
 (defn- parent-ids-of [db]
   (get-in db [:meta :datahike/parents]))
+
+(defn- snapshot-meta-of-stored [raw-db]
+  {:snapshot-id (str (commit-id-of raw-db))
+   :parent-ids (set (map str (parent-ids-of raw-db)))
+   :timestamp (get-in raw-db [:meta :datahike/updated-at])
+   :branch (get-in raw-db [:config :branch])})
 
 ;; ============================================================
 ;; Branch diff computation
@@ -347,11 +352,10 @@
         (if (visited current)
           (recur (vec rest) visited result)
           (if-let [raw-db (k/get store current nil {:sync? true})]
-            (let [db (dw/stored->db raw-db store)
-                  parents (parent-ids-of db)]
+            (let [parents (parent-ids-of raw-db)]
               (recur (into (vec rest) parents)
                      (conj visited current)
-                     (conj result (str (commit-id-of db)))))
+                     (conj result (str (commit-id-of raw-db)))))
             (recur (vec rest) (conj visited current) result)))))))
 
 ;; ============================================================
@@ -430,11 +434,8 @@
   (snapshot-meta [_ snap-id _opts]
     (let [store (store-of conn)
           uuid (if (uuid? snap-id) snap-id (parse-uuid (str snap-id)))]
-      (when-let [db (dv/commit-as-db store uuid)]
-        {:snapshot-id (str (commit-id-of db))
-         :parent-ids (set (map str (parent-ids-of db)))
-         :timestamp (get-in db [:meta :datahike/updated-at])
-         :branch (get-in db [:config :branch])})))
+      (when-let [raw-db (k/get store uuid nil {:sync? true})]
+        (snapshot-meta-of-stored raw-db))))
 
   p/Branchable
   (branches [this] (p/branches this nil))
@@ -506,12 +507,12 @@
     (let [store (store-of conn)
           norm (fn [x] (cond (keyword? x) x (uuid? x) x
                              :else (or (parse-uuid (str x)) x)))
-          load-db (fn [r]
-                    (try (cond (keyword? r) (dv/branch-as-db store r)
-                               (uuid? r)    (dv/commit-as-db store r)
-                               :else (some->> r str parse-uuid
-                                              (dv/commit-as-db store)))
-                         (catch #?(:clj Exception :cljs :default) _ nil)))
+          load-stored (fn [r]
+                        (try (let [ref (cond (keyword? r) r
+                                             (uuid? r) r
+                                             :else (some->> r str parse-uuid))]
+                               (when ref (k/get store ref nil {:sync? true})))
+                             (catch #?(:clj Exception :cljs :default) _ nil)))
           ancestors-a (set (walk-history store [(norm a)] {:limit nil}))]
       (loop [queue [(norm b)]
              visited #{}]
@@ -519,14 +520,14 @@
           (let [[current & rest] queue]
             (if (visited current)
               (recur (vec rest) visited)
-              (if-let [db (load-db current)]
+              (if-let [raw-db (load-stored current)]
                 ;; test the COMMIT of the loaded ref itself (a branch head or
                 ;; parent commit) — the old loop only tested raw queue entries,
                 ;; so a fast-forward base (b's own head) was never found.
-                (let [cid (str (commit-id-of db))]
+                (let [cid (str (commit-id-of raw-db))]
                   (if (ancestors-a cid)
                     cid
-                    (recur (into (vec rest) (parent-ids-of db))
+                    (recur (into (vec rest) (parent-ids-of raw-db))
                            (conj visited current))))
                 (recur (vec rest) (conj visited current)))))))))
 
@@ -538,19 +539,19 @@
       {:nodes (into {}
                     (for [id all-ids
                           :let [uuid (parse-uuid id)
-                                db (when uuid (dv/commit-as-db store uuid))]
-                          :when db]
-                      [id {:parent-ids (set (map str (parent-ids-of db)))
-                           :meta (p/snapshot-meta this id)}]))
+                                raw-db (when uuid (k/get store uuid nil {:sync? true}))]
+                          :when raw-db]
+                      [id {:parent-ids (set (map str (parent-ids-of raw-db)))
+                           :meta (snapshot-meta-of-stored raw-db)}]))
        :branches (into {}
                        (for [b branches]
-                         [b (when-let [db (k/get store b nil {:sync? true})]
-                              (str (commit-id-of (dw/stored->db db store))))]))
+                         [b (when-let [raw-db (k/get store b nil {:sync? true})]
+                              (str (commit-id-of raw-db)))]))
        :roots (set (filter
                     (fn [id]
                       (let [uuid (parse-uuid id)
-                            db (when uuid (dv/commit-as-db store uuid))]
-                        (or (nil? db) (empty? (parent-ids-of db)))))
+                            raw-db (when uuid (k/get store uuid nil {:sync? true}))]
+                        (or (nil? raw-db) (empty? (parent-ids-of raw-db)))))
                     all-ids))}))
 
   (commit-info [this snap-id] (p/commit-info this snap-id nil))
@@ -564,7 +565,7 @@
       (->> branches
            (map (fn [branch]
                   (when-let [raw-db (k/get store branch nil {:sync? true})]
-                    (str (commit-id-of (dw/stored->db raw-db store))))))
+                    (str (commit-id-of raw-db)))))
            (remove nil?)
            set)))
 
