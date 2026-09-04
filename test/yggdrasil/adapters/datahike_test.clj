@@ -137,6 +137,68 @@
          [?line :line/text ?text]]
        db document-id text))
 
+(deftest merge-does-not-replay-inherited-anonymous-audit-rows
+  (testing "an unchanged child cannot append fresh copies of sealed parent history"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact
+       *conn*
+       [{:db/ident :audit.transaction/id
+         :db/valueType :db.type/uuid
+         :db/cardinality :db.cardinality/one
+         :db/unique :db.unique/identity}
+        {:db/ident :audit.posting/transaction
+         :db/valueType :db.type/ref
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :audit.posting/amount
+         :db/valueType :db.type/bigdec
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :note/id
+         :db/valueType :db.type/string
+         :db/cardinality :db.cardinality/one
+         :db/unique :db.unique/identity}])
+      (let [transaction-id (random-uuid)]
+        ;; Like Kontor, the transaction is identified while its balanced
+        ;; postings are deliberately anonymous immutable history.
+        (d/transact *conn*
+                    [{:audit.transaction/id transaction-id}
+                     {:audit.posting/transaction
+                      [:audit.transaction/id transaction-id]
+                      :audit.posting/amount 1M}
+                     {:audit.posting/transaction
+                      [:audit.transaction/id transaction-id]
+                      :audit.posting/amount -1M}])
+        (let [base-postings
+              (set (d/q '[:find [?posting ...]
+                          :in $ ?transaction-id
+                          :where
+                          [?tx :audit.transaction/id ?transaction-id]
+                          [?posting :audit.posting/transaction ?tx]]
+                        @*conn* transaction-id))]
+          (p/branch! sys :child)
+          (let [child (p/checkout sys :child)]
+            ;; Exercise a real merge transaction while leaving the inherited
+            ;; audit rows untouched in the source.
+            (d/transact (:conn child) [{:note/id "child-output"}])
+            (p/merge! sys :child)
+            (let [merged-postings
+                  (set (d/q '[:find [?posting ...]
+                              :in $ ?transaction-id
+                              :where
+                              [?tx :audit.transaction/id ?transaction-id]
+                              [?posting :audit.posting/transaction ?tx]]
+                            @*conn* transaction-id))]
+              (is (= base-postings merged-postings)
+                  "merge preserves the exact inherited anonymous posting identities")
+              (is (= #{1M -1M}
+                     (set (d/q '[:find [?amount ...]
+                                 :in $ ?transaction-id
+                                 :where
+                                 [?tx :audit.transaction/id ?transaction-id]
+                                 [?posting :audit.posting/transaction ?tx]
+                                 [?posting :audit.posting/amount ?amount]]
+                               @*conn* transaction-id)))
+                  "no duplicate posting history is appended"))))))))
+
 (deftest merge-preserves-and-retracts-base-anonymous-components
   (testing "inherited anonymous components use their shared base eid"
     (let [sys (dha/create *conn* {:system-name "t"})]
