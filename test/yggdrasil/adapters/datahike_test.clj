@@ -103,6 +103,47 @@
           (is (= "b1" (ffirst (d/q '[:find ?bid :where [?i :item/id "i1"] [?i :item/box ?b] [?b :box/id ?bid]] db)))
               "item's ref resolved to the co-created box"))))))
 
+(deftest merge-does-not-duplicate-base-anonymous-components
+  (testing "anonymous component entities inherited from the merge base are
+            addressed by their shared pre-fork eid, not copied as new tempids"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :document/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :document/lines
+                           :db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/many
+                           :db/isComponent true}
+                          {:db/ident :line/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:document/id "sealed"
+                           :document/lines [{:line/text "debit"}
+                                            {:line/text "credit"}]}])
+      (p/branch! sys :feature)
+      (let [fsys (p/checkout sys :feature)]
+        ;; Make both heads diverge while leaving the inherited components alone.
+        (d/transact (:conn fsys) [{:document/id "fork"}])
+        (d/transact *conn* [{:document/id "trunk"}])
+        (p/merge! sys :feature)
+        (let [db @*conn*
+              lines (d/q '[:find [?line ...]
+                           :where
+                           [?d :document/id "sealed"]
+                           [?d :document/lines ?line]] db)]
+          (is (= 2 (count lines))
+              "the no-op component history is not replayed as fresh entities")
+          (is (= #{"debit" "credit"}
+                 (set (d/q '[:find [?text ...]
+                             :where
+                             [?d :document/id "sealed"]
+                             [?d :document/lines ?line]
+                             [?line :line/text ?text]] db))))
+          (is (= #{"sealed" "fork" "trunk"}
+                 (set (d/q '[:find [?id ...]
+                             :where [_ :document/id ?id]] db)))))))))
+
 (deftest merge-ignores-schema-attrs-added-in-fork
   (testing "a fork that registers a new SCHEMA attribute (a tool input schema) must
             not abort the merge — :db/* datoms are schema, not data, and upserting

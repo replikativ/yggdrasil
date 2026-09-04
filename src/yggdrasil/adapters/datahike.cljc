@@ -212,15 +212,12 @@
   "Merge tx-data for datoms in source not in target, addressed by SEMANTIC
    identity so concurrent branches union instead of colliding on entity-id.
 
-   Every entity — as a datom's SUBJECT and as a ref VALUE — is addressed by EITHER
-   its `:db.unique/identity` lookup-ref (when it already exists in target: a
-   sibling-safe union / an edit to an existing entity) OR a fresh tempid (when it
-   is new-in-target or anonymous). Co-created new entities therefore link via the
-   SAME tempid and resolve in one transaction — e.g. a fork's new chat-context and
-   the ledger rows that point at it merge together, instead of the ledger's
-   `[:chat/id …]` lookup-ref failing because datahike can't resolve a ref to an
-   entity being upserted in the same tx. Components ride along as ordinary
-   tempid-addressed entities linked from their parent.
+   Every entity — as a datom's SUBJECT and as a ref VALUE — is addressed by its
+   `:db.unique/identity` lookup-ref when it exists in the target, by its shared
+   raw eid when an anonymous entity predates the fork, or by a fresh tempid when
+   it is new to the source branch. Co-created new entities therefore link via
+   the SAME tempid and resolve in one transaction. Inherited anonymous
+   components are not replayed as fresh entities on every merge.
 
    An entity may carry SEVERAL unique-identity attrs (dvergr fuses `:chat/id` and
    `:room/slug` on one entity). We address it by an ALREADY-EXISTING one when any
@@ -228,7 +225,7 @@
    attrs on an existing subject — otherwise a divergence where the two unique
    values point at DIFFERENT target entities would upsert the tempid to both
    (`Conflicting upsert … resolves both to 300 and 320`)."
-  [source-db target-db]
+  [source-db target-db base-db]
   (let [{:keys [unique ref]} (schema-attrs source-db)
         tgt-eid    (memoize
                     (fn [[ua uv]]
@@ -238,13 +235,25 @@
                              (keep (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
         ;; the TARGET entity a source entity denotes, via shared identity
         tgt-of     (memoize (fn [e] (some tgt-eid (idents e))))
+        ;; Entity ids allocated before the fork denote the same anonymous
+        ;; component on both descendants. New anonymous entities cannot be
+        ;; addressed by raw eid because sibling branches may reuse that number.
+        base-e?    (memoize
+                    (fn [e]
+                      (and base-db
+                           (boolean (seq (d/datoms base-db :eavt e))))))
+        target-e?  (memoize
+                    (fn [e]
+                      (boolean (seq (d/datoms target-db :eavt e)))))
         addr       (fn [e]
                      ;; prefer an identity that ALREADY exists in target (→ that
                      ;; entity); else a fresh tempid (new/anonymous)
                      (let [ids (idents e)]
                        (if-let [ex (first (filter (fn [[ua uv]] (in-target? ua uv)) ids))]
                          (vec ex)
-                         (str "ygg-tmp-" e))))
+                         (if (and (base-e? e) (target-e? e))
+                           e
+                           (str "ygg-tmp-" e)))))
         ;; SELECTION IS BY IDENTITY, NOT ENTITY ID.
         ;;
         ;; This used to ask datalog for datoms in source `(not [$target ?e ?a ?v])`
@@ -260,13 +269,17 @@
         ;;
         ;; A source datom is already in target iff target holds the same attribute
         ;; and value on the entity carrying the SAME IDENTITY — with ref values
-        ;; mapped through identity too, since a raw referent id is equally
-        ;; meaningless across the pair. An entity with no identity can never be
-        ;; matched, so it is always new: duplicating an anonymous row on a repeat
-        ;; merge is recoverable, dropping one is not.
+        ;; mapped through identity too, since a raw referent id is meaningless
+        ;; for branch-created entities. An anonymous entity inherited from the
+        ;; merge base is safely matched by its shared pre-fork eid; only newly
+        ;; created anonymous entities remain deliberately unmatchable.
         present?   (fn [e a v]
-                     (when-let [te (tgt-of e)]
-                       (let [tv (if (and (ref a) (integer? v)) (tgt-of v) v)]
+                     (when-let [te (or (tgt-of e)
+                                       (when (and (base-e? e) (target-e? e)) e))]
+                       (let [tv (if (and (ref a) (integer? v))
+                                  (or (tgt-of v)
+                                      (when (and (base-e? v) (target-e? v)) v))
+                                  v)]
                          (and (some? tv)
                               (boolean (seq (d/datoms target-db :eavt te a tv)))))))
         diff       (->> (d/datoms source-db :eavt)
@@ -616,7 +629,7 @@
                               ;; wants the UUID
                               base-db (some->> base-id str parse-uuid (resolve-db store))]
                           ;; identity-keyed (sibling-safe), not raw [:db/add e a v]
-                          (into (compute-merge-tx source-db target-db)
+                          (into (compute-merge-tx source-db target-db base-db)
                                 (when base-db
                                   (compute-merge-retractions base-db source-db target-db)))))
                       [])]
