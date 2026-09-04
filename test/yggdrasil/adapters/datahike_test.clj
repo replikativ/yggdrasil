@@ -353,6 +353,93 @@
                         (p/conflicts deleting (p/snapshot-id deleting)
                                      (p/snapshot-id editing)))))))))
 
+(deftest identified-entity-recreation-is-a-semantic-update
+  (testing "recreating one identity at a new eid does not retract that identity"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :note/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "n" :note/text "base"}])
+      (p/branch! sys :recreate)
+      (let [source (p/checkout sys :recreate)
+            old-eid (d/q '[:find ?e . :where [?e :note/id "n"]]
+                         @(:conn source))]
+        (d/transact (:conn source) [[:db/retractEntity old-eid]])
+        (d/transact (:conn source) [{:note/id "n" :note/text "recreated"}])
+        (p/merge! sys :recreate)
+        (is (= #{["n" "recreated"]}
+               (d/q '[:find ?id ?text
+                      :where
+                      [?e :note/id ?id]
+                      [?e :note/text ?text]] @*conn*))
+            "semantic lookup remains intact after merge")))))
+
+(deftest entity-deletion-conflicts-with-cardinality-many-edit
+  (testing "delete-vs-many modification cannot leave an orphaned remainder"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :note/tags
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/many}])
+      (d/transact *conn* [{:note/id "n" :note/tags #{"base"}}])
+      (p/branch! sys :delete-note)
+      (p/branch! sys :edit-tags)
+      (let [deleting (p/checkout sys :delete-note)
+            editing (p/checkout sys :edit-tags)
+            eid (d/q '[:find ?e . :where [?e :note/id "n"]]
+                     @(:conn deleting))]
+        (d/transact (:conn deleting) [[:db/retractEntity eid]])
+        (d/transact (:conn editing) [[:db/add [:note/id "n"]
+                                      :note/tags "added"]])
+        (is (= [{:entity [:note/id "n"]
+                 :attr :note/tags
+                 :base #{"base"}
+                 :ours nil
+                 :theirs #{"base" "added"}}]
+               (filterv #(= :note/tags (:attr %))
+                        (p/conflicts deleting (p/snapshot-id deleting)
+                                     (p/snapshot-id editing)))))))))
+
+(deftest identity-acquisition-does-not-change-an-inherited-ref
+  (testing "base identity wins over a unique identity added in one descendant"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :doc/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :doc/link
+                           :db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :line/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :line/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (let [tx (d/transact *conn* [{:db/id "b" :line/text "b"}
+                                   {:db/id "c" :line/text "c"}
+                                   {:doc/id "d" :doc/link "b"}])
+            b (get (:tempids tx) "b")
+            c (get (:tempids tx) "c")]
+        (p/branch! sys :gain-identity)
+        (p/branch! sys :change-ref)
+        (let [ours (p/checkout sys :gain-identity)
+              theirs (p/checkout sys :change-ref)]
+          (d/transact (:conn ours) [[:db/add b :line/id "B"]])
+          (d/transact (:conn theirs) [[:db/add [:doc/id "d"] :doc/link c]])
+          (is (empty? (filter #(= :doc/link (:attr %))
+                              (p/conflicts ours (p/snapshot-id ours)
+                                           (p/snapshot-id theirs))))
+              "only the ref-changing branch differs from base"))))))
+
 (deftest common-ancestor-resolves-merge-base
   (testing "common-ancestor finds the fork point across a branch + divergence"
     (let [sys (dha/create *conn* {:system-name "test-db"})]

@@ -140,6 +140,16 @@
               (not [?a :db/unique :db.unique/identity])]
             db)))
 
+(defn- card-many-attrs
+  "Cardinality-many attrs. They normally merge by union, but are relevant to
+   conflict detection when the entity itself was deleted on the other side."
+  [db]
+  (set (d/q '[:find [?id ...]
+              :where
+              [?a :db/ident ?id]
+              [?a :db/cardinality :db.cardinality/many]]
+            db)))
+
 (defn- compute-conflicts
   "Precise 3-way conflicts for semantic entities and anonymous entities inherited
    from BASE. A cardinality-one attr conflicts when both descendants changed it
@@ -159,6 +169,9 @@
         cattrs   (into (card-one-attrs base-db)
                        (concat (card-one-attrs ours-db)
                                (card-one-attrs theirs-db)))
+        mattrs   (into (card-many-attrs base-db)
+                       (concat (card-many-attrs ours-db)
+                               (card-many-attrs theirs-db)))
         exists?  (fn [db e] (and e (seq (d/datoms db :eavt e))))
         find-e   (fn [db [ua uv]]
                    (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
@@ -197,21 +210,37 @@
         ;; base eids, or side-qualified branch-local eids.
         canonical-ref
         (fn [db side e]
-          (or (entity-ident db unique e)
+          ;; The identity an inherited anonymous entity gains in only one
+          ;; descendant does not change the semantic identity of references
+          ;; that already pointed at it in BASE. Prefer BASE's classification.
+          (or (entity-ident base-db unique e)
               (when (exists? base-db e) [:yggdrasil/base-eid e])
+              (entity-ident db unique e)
               [:yggdrasil/branch-eid side e]))
         valof    (fn [db side e a]
                    (when e
-                     (let [v (get (d/entity db e) a)]
-                       (if (and v (ref a))
-                         (canonical-ref db side (:db/id v))
-                         v))))]
+                     (let [values (map (fn [dt]
+                                         (let [v (:v dt)]
+                                           (if (and (ref a) (integer? v))
+                                             (canonical-ref db side v)
+                                             v)))
+                                       (d/datoms db :eavt e a))]
+                       (if (mattrs a)
+                         (set values)
+                         (first values)))))]
     (vec
      (for [spec specs
            :let  [eb (:base-e spec)
                   eo (branch-e ours-db spec)
-                  et (branch-e theirs-db spec)]
-           a     cattrs
+                  et (branch-e theirs-db spec)
+                  ;; Cardinality-many values union unless deletion of the
+                  ;; containing entity competes with a modification. In that
+                  ;; case silently preserving only the added datom would create
+                  ;; an orphan, so include many attrs in the conflict test.
+                  attrs (if (and eb (or (nil? eo) (nil? et)))
+                          (into cattrs mattrs)
+                          cattrs)]
+           a     attrs
            :let  [bv (valof base-db :base eb a)
                   ov (valof ours-db :ours eo a)
                   tv (valof theirs-db :theirs et a)]
@@ -376,11 +405,26 @@
                      (some (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
         find-e   (fn [db [ua uv]]
                    (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
+        source-e? (fn [e] (boolean (seq (d/datoms source-db :eavt e))))
         target-e? (fn [e] (boolean (seq (d/datoms target-db :eavt e))))
-        deleted  (->> (d/q '[:find ?e ?a ?v :in $ $2 :where
-                             [$ ?e ?a ?v] [(not= :db/txInstant ?a)] (not [$2 ?e ?a ?v])]
-                           base-db source-db)
-                      (remove (fn [[_ a _]] (= "db" (namespace a)))))]
+        source-address (fn [e]
+                         (or (some->> (ident-of base-db e) (find-e source-db))
+                             (when (source-e? e) e)))
+        source-present?
+        (fn [e a v]
+          (when-let [se (source-address e)]
+            (let [sv (if (and (ref a) (integer? v))
+                       (source-address v)
+                       v)]
+              (and (some? sv)
+                   (seq (d/datoms source-db :eavt se a sv))))))
+        deleted  (->> (d/datoms base-db :eavt)
+                      (keep (fn [dt]
+                              (let [e (:e dt) a (:a dt) v (:v dt)]
+                                (when (and (not= :db/txInstant a)
+                                           (not= "db" (namespace a))
+                                           (not (source-present? e a v)))
+                                  [e a v])))))]
     (vec (for [[e a v] deleted
                :let  [subj-id (ident-of base-db e)
                       te      (or (some->> subj-id (find-e target-db))
