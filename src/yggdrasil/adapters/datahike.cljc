@@ -153,8 +153,12 @@
 (defn- compute-conflicts
   "Precise 3-way conflicts for semantic entities and anonymous entities inherited
    from BASE. A cardinality-one attr conflicts when both descendants changed it
-   from BASE to different values. Missing entities/attrs have value nil, so this
-   also detects delete-vs-edit and create-vs-create conflicts.
+   from BASE to different values. Deleting a BASE entity is an existence change:
+   if the surviving side changes any attribute (including adding one that was
+   absent in BASE), that attribute conflicts with the tombstone. This prevents a
+   blind merge from leaving only the new attribute behind as an orphan. A pure
+   deletion against an unchanged entity and an ordinary one-sided attribute add
+   remain conflict-free.
 
    Identity-bearing entities are addressed by a lookup ref. An anonymous base
    entity is addressed by the opaque descriptor [:yggdrasil/base-eid e]. Newly
@@ -244,8 +248,18 @@
            :let  [bv (valof base-db :base eb a)
                   ov (valof ours-db :ours eo a)
                   tv (valof theirs-db :theirs et a)]
-           ;; both sides changed it to different values …
-           :when (and (not= ov bv) (not= tv bv) (not= ov tv)
+           :let  [attribute-conflict?
+                  (and (not= ov bv) (not= tv bv) (not= ov tv))
+                  tombstone-conflict?
+                  (and eb
+                       ;; Exactly one descendant deleted the BASE entity. The
+                       ;; survivor's value differing from BASE is a concurrent
+                       ;; modification even when BASE had no value for `a`.
+                       (not= (some? eo) (some? et))
+                       (not= (if eo ov tv) bv))]
+           ;; both sides changed the attribute differently, or one deleted the
+           ;; entity while the survivor changed this attribute …
+           :when (and (or attribute-conflict? tombstone-conflict?)
                       ;; … but a temporal attr both sides merely advanced
                       ;; (updated-at, last-seen) is churn, not a semantic clash —
                       ;; the union takes the later value, no reconciliation needed.

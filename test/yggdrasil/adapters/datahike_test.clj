@@ -117,6 +117,9 @@
     :db/cardinality :db.cardinality/one}
    {:db/ident :line/next
     :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :line/tag
+    :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}])
 
 (defn- line-texts [db document-id]
@@ -283,6 +286,65 @@
             (is (= #{["base-edit" "ours" "theirs"]
                      ["base-delete" nil "theirs-edit"]}
                    (set (map (juxt :base :ours :theirs) conflicts))))))))))
+
+(deftest entity-tombstone-conflicts-with-new-attributes
+  (testing "delete-vs-add conflicts for identified and inherited anonymous entities"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn*
+                  (into document-schema
+                        [{:db/ident :note/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :note/text
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :note/tag
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one}]))
+      (d/transact *conn*
+                  [{:note/id "conflict" :note/text "base"}
+                   {:note/id "one-sided-add" :note/text "base"}
+                   {:note/id "pure-delete" :note/text "base"}
+                   {:document/id "doc"
+                    :document/lines [{:line/text "conflict"}
+                                     {:line/text "one-sided-add"}
+                                     {:line/text "pure-delete"}]}])
+      (let [identified-conflict
+            (d/q '[:find ?e . :where [?e :note/id "conflict"]] @*conn*)
+            identified-delete
+            (d/q '[:find ?e . :where [?e :note/id "pure-delete"]] @*conn*)
+            anonymous-conflict (line-eid @*conn* "doc" "conflict")
+            anonymous-delete (line-eid @*conn* "doc" "pure-delete")]
+        (p/branch! sys :deleting)
+        (p/branch! sys :modifying)
+        (let [deleting (p/checkout sys :deleting)
+              modifying (p/checkout sys :modifying)]
+          (d/transact (:conn deleting)
+                      [[:db/retractEntity identified-conflict]
+                       [:db/retractEntity identified-delete]
+                       [:db/retractEntity anonymous-conflict]
+                       [:db/retractEntity anonymous-delete]
+                       {:note/id "one-sided-add" :note/tag "ours-only"}
+                       [:db/add (line-eid @(:conn deleting) "doc" "one-sided-add")
+                        :line/tag "ours-only"]])
+          (d/transact (:conn modifying)
+                      [{:note/id "conflict" :note/tag "theirs"}
+                       [:db/add anonymous-conflict :line/tag "theirs"]])
+          (let [conflicts (p/conflicts deleting (p/snapshot-id deleting)
+                                       (p/snapshot-id modifying))]
+            (is (= #{[[:note/id "conflict"] :note/tag nil nil "theirs"]
+                     [[:yggdrasil/base-eid anonymous-conflict]
+                      :line/tag nil nil "theirs"]}
+                   (set (map (juxt :entity :attr :base :ours :theirs)
+                             conflicts)))
+                "new survivor attributes conflict with identified and anonymous tombstones")
+            (is (not-any? #(contains? #{[:note/id "one-sided-add"]
+                                        [:note/id "pure-delete"]
+                                        [:yggdrasil/base-eid anonymous-delete]}
+                                      (:entity %))
+                          conflicts)
+                "ordinary one-sided additions and pure deletions stay conflict-free")))))))
 
 (deftest conflicts-normalize-refs-between-base-anonymous-entities
   (testing "anonymous ref values compare by shared base identity, not Entity object"
