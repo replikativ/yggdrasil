@@ -112,6 +112,9 @@
     :db/valueType :db.type/ref
     :db/cardinality :db.cardinality/many
     :db/isComponent true}
+   {:db/ident :document/link
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one}
    {:db/ident :line/text
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}
@@ -373,6 +376,42 @@
             (is (= [:yggdrasil/base-eid c] (:ours conflict)))
             (is (nil? (:theirs conflict)))))))))
 
+(deftest new-reference-conflicts-with-concurrent-referent-deletion
+  (testing "an incoming edge cannot resurrect its deleted base referent as an empty entity"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "doc"
+                           :document/lines [{:line/text "target"}]}])
+      (let [target (line-eid @*conn* "doc" "target")]
+        (p/branch! sys :add-reference)
+        (p/branch! sys :delete-referent)
+        (let [adding (p/checkout sys :add-reference)
+              deleting (p/checkout sys :delete-referent)]
+          (d/transact (:conn adding)
+                      [[:db/add [:document/id "doc"] :document/link target]])
+          (d/transact (:conn deleting) [[:db/retractEntity target]])
+          (let [forward (p/conflicts adding (p/snapshot-id adding)
+                                     (p/snapshot-id deleting))
+                reverse (p/conflicts deleting (p/snapshot-id deleting)
+                                     (p/snapshot-id adding))
+                expected-referent [:yggdrasil/base-eid target]]
+            (is (= [{:entity [:document/id "doc"]
+                     :attr :document/link
+                     :base nil
+                     :ours expected-referent
+                     :theirs nil
+                     :reason :deleted-referent
+                     :referent expected-referent}]
+                   (filterv #(= :deleted-referent (:reason %)) forward)))
+            (is (= [{:entity [:document/id "doc"]
+                     :attr :document/link
+                     :base nil
+                     :ours nil
+                     :theirs expected-referent
+                     :reason :deleted-referent
+                     :referent expected-referent}]
+                   (filterv #(= :deleted-referent (:reason %)) reverse)))))))))
+
 (deftest sibling-created-anonymous-components-do-not-collide
   (testing "equal branch-local numeric eids never identify new anonymous values"
     (let [sys (dha/create *conn* {:system-name "t"})]
@@ -501,6 +540,44 @@
                       [?e :note/id ?id]
                       [?e :note/text ?text]] @*conn*))
             "semantic lookup remains intact after merge")))))
+
+(deftest split-unique-identities-are-a-structural-conflict
+  (testing "one source entity cannot silently merge into two target entities"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :item/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/slug
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (p/branch! sys :unified)
+      (p/branch! sys :split)
+      (let [unified (p/checkout sys :unified)
+            split (p/checkout sys :split)]
+        (d/transact (:conn unified)
+                    [{:item/id "i" :item/slug "s" :item/text "source"}])
+        (d/transact (:conn split)
+                    [{:item/id "i"} {:item/slug "s"}])
+        (let [forward (p/conflicts unified (p/snapshot-id unified)
+                                   (p/snapshot-id split))
+              reverse (p/conflicts split (p/snapshot-id split)
+                                   (p/snapshot-id unified))
+              identity-set #{[:item/id "i"] [:item/slug "s"]}]
+          (is (= 1 (count (filter #(= :split-identity (:reason %)) forward))))
+          (is (= identity-set
+                 (set (:identities
+                       (first (filter #(= :split-identity (:reason %))
+                                      forward))))))
+          (is (= 1 (count (filter #(= :split-identity (:reason %)) reverse))))
+          (is (= [identity-set]
+                 (:theirs
+                  (first (filter #(= :split-identity (:reason %))
+                                 reverse))))))))))
 
 (deftest entity-deletion-conflicts-with-cardinality-many-edit
   (testing "delete-vs-many modification cannot leave an orphaned remainder"

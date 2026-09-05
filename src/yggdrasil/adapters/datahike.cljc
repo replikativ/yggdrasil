@@ -231,40 +231,145 @@
                                        (d/datoms db :eavt e a))]
                        (if (mattrs a)
                          (set values)
-                         (first values)))))]
-    (vec
-     (for [spec specs
-           :let  [eb (:base-e spec)
-                  eo (branch-e ours-db spec)
-                  et (branch-e theirs-db spec)
-                  ;; Cardinality-many values union unless deletion of the
-                  ;; containing entity competes with a modification. In that
-                  ;; case silently preserving only the added datom would create
-                  ;; an orphan, so include many attrs in the conflict test.
-                  attrs (if (and eb (or (nil? eo) (nil? et)))
-                          (into cattrs mattrs)
-                          cattrs)]
-           a     attrs
-           :let  [bv (valof base-db :base eb a)
-                  ov (valof ours-db :ours eo a)
-                  tv (valof theirs-db :theirs et a)]
-           :let  [attribute-conflict?
-                  (and (not= ov bv) (not= tv bv) (not= ov tv))
-                  tombstone-conflict?
-                  (and eb
-                       ;; Exactly one descendant deleted the BASE entity. The
-                       ;; survivor's value differing from BASE is a concurrent
-                       ;; modification even when BASE had no value for `a`.
-                       (not= (some? eo) (some? et))
-                       (not= (if eo ov tv) bv))]
-           ;; both sides changed the attribute differently, or one deleted the
-           ;; entity while the survivor changed this attribute …
-           :when (and (or attribute-conflict? tombstone-conflict?)
-                      ;; … but a temporal attr both sides merely advanced
-                      ;; (updated-at, last-seen) is churn, not a semantic clash —
-                      ;; the union takes the later value, no reconciliation needed.
-                      (not (and (inst? ov) (inst? tv))))]
-       {:entity (:descriptor spec) :attr a :base bv :ours ov :theirs tv}))))
+                         (first values)))))
+        spec-of   (fn [db side e]
+                    ;; Prefer the BASE classification. An inherited anonymous
+                    ;; entity may acquire a unique identity on one branch, but
+                    ;; it is still the same pre-fork object for this merge.
+                    (if-let [ident (entity-ident base-db unique e)]
+                      {:descriptor ident :base-e e}
+                      (if (exists? base-db e)
+                        {:descriptor [:yggdrasil/base-eid e]
+                         :base-e e :anonymous? true}
+                        (if-let [ident (entity-ident db unique e)]
+                          {:descriptor ident :base-e (find-e base-db ident)}
+                          {:descriptor [:yggdrasil/branch-eid side e]}))))
+        descriptor-e
+        (fn [db descriptor]
+          (case (first descriptor)
+            :yggdrasil/base-eid
+            (let [e (second descriptor)] (when (exists? db e) e))
+            :yggdrasil/branch-eid nil
+            (find-e db descriptor)))
+        ordinary
+        (for [spec specs
+              :let  [eb (:base-e spec)
+                     eo (branch-e ours-db spec)
+                     et (branch-e theirs-db spec)
+                     ;; Cardinality-many values union unless deletion of the
+                     ;; containing entity competes with a modification. In that
+                     ;; case silently preserving only the added datom would create
+                     ;; an orphan, so include many attrs in the conflict test.
+                     attrs (if (and eb (or (nil? eo) (nil? et)))
+                             (into cattrs mattrs)
+                             cattrs)]
+              a     attrs
+              :let  [bv (valof base-db :base eb a)
+                     ov (valof ours-db :ours eo a)
+                     tv (valof theirs-db :theirs et a)]
+              :let  [attribute-conflict?
+                     (and (not= ov bv) (not= tv bv) (not= ov tv))
+                     tombstone-conflict?
+                     (and eb
+                          ;; Exactly one descendant deleted the BASE entity. The
+                          ;; survivor's value differing from BASE is a concurrent
+                          ;; modification even when BASE had no value for `a`.
+                          (not= (some? eo) (some? et))
+                          (not= (if eo ov tv) bv))]
+              ;; both sides changed the attribute differently, or one deleted the
+              ;; entity while the survivor changed this attribute …
+              :when (and (or attribute-conflict? tombstone-conflict?)
+                         ;; … but a temporal attr both sides merely advanced
+                         ;; (updated-at, last-seen) is churn, not a semantic clash —
+                         ;; the union takes the later value, no reconciliation needed.
+                         (not (and (inst? ov) (inst? tv))))]
+          {:entity (:descriptor spec) :attr a :base bv :ours ov :theirs tv})
+        incoming-ref-conflicts
+        (fn [source-db source-side deleted-db]
+          (for [dt (d/datoms source-db :eavt)
+                :let [e (:e dt) a (:a dt) v (:v dt)]
+                :when (and (ref a) (integer? v)
+                           (not= "db" (namespace a)))
+                :let [subject (spec-of source-db source-side e)
+                      referent (canonical-ref source-db source-side v)
+                      base-referent (descriptor-e base-db referent)
+                      base-value (valof base-db :base (:base-e subject) a)
+                      source-value (valof source-db source-side e a)
+                      added? (if (mattrs a)
+                               (and (contains? source-value referent)
+                                    (not (contains? (or base-value #{}) referent)))
+                               (and (= referent source-value)
+                                    (not= referent base-value)))]
+                ;; Adding an incoming edge and deleting its inherited referent
+                ;; are changes to different subjects, so the ordinary per-entity
+                ;; tombstone test cannot see their interaction. Never translate
+                ;; that missing referent to a fresh, empty tempid.
+                :when (and base-referent added?
+                           (nil? (descriptor-e deleted-db referent)))]
+            {:entity (:descriptor subject)
+             :attr a
+             :base base-value
+             :source source-value
+             :deleted-referent referent}))
+        ref-conflicts
+        (concat
+         (map (fn [{:keys [entity attr base source deleted-referent]}]
+                {:entity entity :attr attr :base base
+                 :ours source :theirs nil
+                 :reason :deleted-referent :referent deleted-referent})
+              (incoming-ref-conflicts ours-db :ours theirs-db))
+         (map (fn [{:keys [entity attr base source deleted-referent]}]
+                {:entity entity :attr attr :base base
+                 :ours nil :theirs source
+                 :reason :deleted-referent :referent deleted-referent})
+              (incoming-ref-conflicts theirs-db :theirs ours-db)))
+        identity-groups
+        (fn [db]
+          (->> unique
+               (mapcat (fn [ua]
+                         (d/q '[:find ?e ?ua ?uv
+                                :in $ ?ua
+                                :where [?e ?ua ?uv]]
+                              db ua)))
+               (group-by first)
+               vals
+               (mapv (fn [rows]
+                       (set (map (fn [[_ ua uv]] [ua uv]) rows))))))
+        base-groups (identity-groups base-db)
+        ours-groups (identity-groups ours-db)
+        theirs-groups (identity-groups theirs-db)
+        partition-view
+        (fn [groups identities]
+          (->> groups
+               (map #(set (filter identities %)))
+               (remove empty?)
+               distinct
+               (sort-by pr-str)
+               vec))
+        split-conflicts
+        (fn [source-groups target-groups source-key target-key]
+          (for [identities source-groups
+                :when (> (count identities) 1)
+                :let [target-view (partition-view target-groups identities)]
+                ;; A missing identity is an ordinary one-sided addition. The
+                ;; structural conflict is specifically that TARGET already
+                ;; resolves every identity, but to several distinct entities.
+                :when (and (= identities (reduce into #{} target-view))
+                           (> (count target-view) 1))
+                :let [source-view [(set identities)]
+                      base-view (partition-view base-groups identities)]]
+            (merge {:entity (first (sort-by pr-str identities))
+                    :attr :db.unique/identity
+                    :base base-view
+                    :reason :split-identity
+                    :identities (vec (sort-by pr-str identities))}
+                   {source-key source-view target-key target-view})))
+        structural-conflicts
+        (concat (split-conflicts ours-groups theirs-groups :ours :theirs)
+                (split-conflicts theirs-groups ours-groups :theirs :ours))]
+    (->> (concat ordinary ref-conflicts structural-conflicts)
+         distinct
+         vec)))
 
 (defn- compute-conflicts-baseless
   "Conservative 2-way conflict set, used when the merge-base is UNAVAILABLE — e.g.
