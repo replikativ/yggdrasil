@@ -11,6 +11,7 @@
             [datahike.writing :as dw]
             [yggdrasil.adapters.datahike :as dha]
             [yggdrasil.convergent.overlay :as ovl]
+            [yggdrasil.hooks :as hooks]
             [yggdrasil.protocols :as p]))
 
 (def ^:dynamic *conn* nil)
@@ -26,6 +27,28 @@
            (finally (d/release *conn*) (d/delete-database cfg))))))
 
 (use-fixtures :each with-mem-db)
+
+(deftest durable-commit-hook-emits-a-complete-dag-event
+  (let [sys    (dha/create *conn* {:system-name "event-test"})
+        events (atom [])
+        hook   (hooks/install-commit-hook! nil sys #(swap! events conj %))]
+    (try
+      (d/transact *conn* [{:note/text "one durable commit"}])
+      (let [event (first @events)]
+        (is (= 1 (count @events)))
+        (is (= :commit (:type event)))
+        (is (= (p/system-id sys) (:system-id event)))
+        (is (= :datahike (:system-type event)))
+        (is (= "db" (:branch event)))
+        (is (= "db" (:ref event)))
+        (is (= (p/snapshot-id sys) (:snapshot-id event)))
+        (is (= (p/parent-ids sys) (:parent-ids event)))
+        (is (uuid? (:store-id event)))
+        (is (integer? (:max-tx event)))
+        (is (= 1 (:tx-count event)))
+        (is (true? (:durable? event))))
+      (finally
+        (hooks/remove-commit-hook! nil sys hook)))))
 
 (deftest history-returns-string-snapshot-ids
   (testing "history/ancestors return STRING snapshot-ids (the protocol type)"

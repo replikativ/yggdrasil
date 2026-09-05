@@ -251,14 +251,23 @@
 (defprotocol Watchable
   "Observe state changes via polling or event notification.
    Supports both orchestrator mode (yggdrasil drives changes)
-   and observer mode (external changes detected automatically)."
+   and observer mode (external changes detected automatically).
+
+   Commit events used for versioned-DAG dissemination should be self-contained:
+   include the exact `:snapshot-id`, `:parent-ids`, and mutable `:branch`/`:ref`
+   observed after durability. Delivery is at-least-once; consumers deduplicate
+   by system, ref, and snapshot rather than arrival time. `:ordering` is an
+   optional opaque coordinator fence, not a wall-clock ordering claim."
 
   (watch! [this callback] [this callback opts]
     "Register callback for state change events. Returns watch-id string.
      callback: (fn [{:type :commit|:branch-created|:branch-deleted|:checkout
                      :snapshot-id \"...\"
+                     :parent-ids #{\"...\"}
                      :branch \"...\"
-                     :timestamp <millis>}])
+                     :ref \"...\"
+                     :timestamp <millis>
+                     :ordering {...}}])
      opts: {:poll-interval-ms 1000, :sync? true}")
 
   (unwatch! [this watch-id] [this watch-id opts]

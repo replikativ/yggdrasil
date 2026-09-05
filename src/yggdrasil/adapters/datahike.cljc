@@ -4,8 +4,8 @@
   Wraps a Datahike connection (atom of db state) and exposes
   Snapshotable, Branchable, Graphable, Mergeable, and GarbageCollectable.
 
-  Also extends the yggdrasil.hooks multimethod to use datahike's native
-  d/listen for immediate commit notification (no polling needed).
+  Also extends the yggdrasil.hooks multimethod to use Datahike's durable
+  commit listener (one event per persisted writer batch, no polling needed).
 
   Requires datahike on the classpath. Only load this namespace when
   datahike is available as a dependency."
@@ -702,28 +702,31 @@
    (->DatahikeSystem conn (:system-name opts))))
 
 ;; ============================================================
-;; Native commit hook via d/listen
+;; Native durable commit hook
 ;; ============================================================
 
 (defmethod hooks/install-commit-hook! :datahike
   [_workspace system on-commit-fn]
   (let [conn (:conn system)
         listener-key (keyword (str "yggdrasil-" (p/system-id system)))]
-    (d/listen conn listener-key
-              (fn [tx-report]
-                (when-let [db (:db-after tx-report)]
-                  (when-let [cid (commit-id-of db)]
-                    (let [snap-id (str cid)
-                          branch (name (get-in db [:config :branch]))]
-                      (on-commit-fn {:type :commit
-                                     :snapshot-id snap-id
-                                     :branch branch
-                                     :timestamp (t/now-ms)}))))))
+    (d/listen-commits
+     conn listener-key
+     (fn [{:keys [commit-id parent-commit-ids branch] :as event}]
+       (on-commit-fn
+        (hooks/normalize-commit-event
+         system
+         (-> event
+             (dissoc :commit-id :parent-commit-ids)
+             (assoc :snapshot-id (str commit-id)
+                    :parent-ids (set (map str parent-commit-ids))
+                    :branch (name branch)
+                    :ref (name branch)
+                    :observed-at (t/now-ms)))))))
     listener-key))
 
 (defmethod hooks/remove-commit-hook! :datahike
   [_workspace system hook-id]
-  (d/unlisten (:conn system) hook-id))
+  (d/unlisten-commits (:conn system) hook-id))
 
 ;; Register Datahike with the system value codec — external-ref flavor, DON'T overload
 ;; datahike. Datahike already owns the DB's OWN serialization (its fused root + Datom

@@ -44,7 +44,7 @@
     (p/watch! system
               (fn [event]
                 (when (= :commit (:type event))
-                  (on-commit-fn event)))
+                  (on-commit-fn (hooks/normalize-commit-event system event))))
               {})))
 
 (defmethod hooks/remove-commit-hook! :default
@@ -337,10 +337,12 @@
      ;; Set up commit hook for auto-registration
      (let [on-commit (fn [event]
                        (let [hlc (swap! (:hlc-atom workspace) t/hlc-tick)
-                             ;; Capture parent-ids from live system state
-                             sys (get @(:systems workspace) sid)
-                             parent-ids (when (and sys (satisfies? p/Snapshotable sys))
-                                          (p/parent-ids sys))]
+                             ;; New hooks carry the parents of the exact observed
+                             ;; snapshot. Rereading a mutable system here races a
+                             ;; following commit and can register the wrong DAG
+                             ;; edge; normalize-commit-event supplies a fallback
+                             ;; only for legacy Watchable adapters.
+                             parent-ids (:parent-ids event)]
                          (reg/register!
                           (:registry workspace)
                           (t/->RegistryEntry
@@ -350,7 +352,12 @@
                            hlc
                            nil
                            parent-ids
-                           {:source :managed-hook}))
+                           (merge {:source :managed-hook
+                                   :system-type (:system-type event)
+                                   :durable? (:durable? event)
+                                   :observed-at (:observed-at event)}
+                                  (select-keys event [:ordering :store-id
+                                                      :max-tx :tx-count]))))
                          (reg/flush! (:registry workspace))))
            hook-id (hooks/install-commit-hook! workspace system on-commit)]
        (when hook-id

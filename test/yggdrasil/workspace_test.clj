@@ -418,6 +418,38 @@
 
       (ws/close! w))))
 
+(deftest managed-event-keeps-the-observed-snapshot-parents
+  (testing "registration uses event parents rather than rereading a newer mutable head"
+    (let [w   (ws/create-workspace)
+          sys (make-watchable-system "mock:exact" "main" ["base"])]
+      (ws/manage! w sys)
+      ;; Move the live system beyond the event before delivering it. A consumer
+      ;; that asks p/parent-ids now sees "newer", not the exact event parent.
+      (reset! (:snapshots-atom sys) ["base" "exact" "newer"])
+      (let [callback (first (vals @(:watchers-atom sys)))]
+        (callback {:type :commit
+                   :snapshot-id "exact"
+                   :parent-ids #{"base"}
+                   :branch "main"
+                   :ordering {:term 4 :index 9}}))
+      (let [entry (first (reg/snapshot-refs (:registry w) "exact"))]
+        (is (= #{"base"} (:parent-ids entry)))
+        (is (= :mock-watchable (get-in entry [:metadata :system-type])))
+        (is (true? (get-in entry [:metadata :durable?])))
+        (is (= {:term 4 :index 9} (get-in entry [:metadata :ordering]))))
+      (ws/close! w))))
+
+(deftest normalize-commit-event-completes-legacy-notifications
+  (let [sys (make-watchable-system "mock:legacy" "main" ["base" "next"])
+        event (hooks/normalize-commit-event
+               sys {:type :commit :snapshot-id "next" :timestamp 42})]
+    (is (= "mock:legacy" (:system-id event)))
+    (is (= :mock-watchable (:system-type event)))
+    (is (= "main" (:ref event)))
+    (is (= #{"base"} (:parent-ids event)))
+    (is (= 42 (:observed-at event)))
+    (is (true? (:durable? event)))))
+
 ;; ============================================================
 ;; Persistent workspace tests
 ;; ============================================================
