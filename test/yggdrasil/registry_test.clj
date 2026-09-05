@@ -1,5 +1,6 @@
 (ns yggdrasil.registry-test
   (:require [clojure.test :refer [deftest testing is are]]
+            [yggdrasil.convergent :as c]
             [yggdrasil.registry :as reg]
             [yggdrasil.storage :as store]
             [yggdrasil.types :as t])
@@ -50,6 +51,37 @@
       (reg/register! r e2)
       (is (= 2 (reg/entry-count r)))
       (reg/close! r))))
+
+(deftest duplicate-observations-have-one-registry-identity
+  (testing "different HLC observations of one snapshot do not pollute queries"
+    (let [r (reg/create-registry)
+          early (make-entry-with-meta "snap-1" "git:repo1" "main" 1000
+                                      {:observer :a})
+          late (make-entry-with-meta "snap-1" "git:repo1" "main" 2000
+                                     {:observer :b})]
+      ;; register! remains the raw CRDT operation used by registry reconciliation;
+      ;; the registry lens must still enforce stable event identity.
+      (reg/register! r late)
+      (reg/register! r early)
+      (is (= 1 (reg/entry-count r)))
+      (is (= early (first (reg/system-history r "git:repo1" "main"))))
+      (is (false? (reg/register-once! r late)))
+      (reg/deregister! r early)
+      (is (empty? (reg/all-entries r))
+          "deregister tombstones every observed representation"))))
+
+(deftest duplicate-observations-remain-deduplicated-after-replica-join
+  (let [early (make-entry-with-meta "snap-1" "git:repo1" "main" 1000
+                                    {:observer :a})
+        late (make-entry-with-meta "snap-1" "git:repo1" "main" 2000
+                                   {:observer :b})
+        left (doto (reg/create-registry) (reg/register! late))
+        right (doto (reg/create-registry) (reg/register! early))
+        joined (c/-join (reg/registry-system left)
+                        (reg/registry-system right))
+        projection (assoc left :tpset-atom (atom joined))]
+    (is (= 1 (reg/entry-count projection)))
+    (is (= early (first (reg/system-history projection "git:repo1" "main"))))))
 
 (deftest test-deregister
   (testing "deregister removes entry from all indices"

@@ -166,7 +166,11 @@ These are the supported namespaces. **Everything else under `yggdrasil.*` is imp
 
 ```clojure
 (let [watch-id (p/watch! sys (fn [event]
-                               (println (:type event))) ; :commit, :branch-created, etc.
+                               ;; Commit events identify the exact DAG edge;
+                               ;; duplicate delivery is allowed.
+                               (println (:snapshot-id event)
+                                        (:parent-ids event)
+                                        (:ref event)))
                              {:poll-interval-ms 500})]
   ;; ... later ...
   (p/unwatch! sys watch-id))
@@ -903,9 +907,9 @@ Cross-system safety: a snapshot referenced by *any* system is never collected, e
 
 ### Hooks
 
-The `yggdrasil.hooks` namespace provides an extension point for adapter-specific commit notification. Adapters extend the `install-commit-hook!` multimethod dispatched on `system-type`:
+The `yggdrasil.hooks` namespace provides an extension point for adapter-specific commit notification. Adapters extend the `install-commit-hook!` multimethod dispatched on `system-type`. Commit events are self-contained: they identify the system, mutable ref, immutable snapshot and that snapshot's exact parents. Hooks reduce notification latency but are not a durable queue: callback failure, process exit, or a remote writer may lose a notification. `workspace/manage!` subscribes before reading state and then reconciles a Graphable system's durable commit DAG; `workspace/sync-registry!` repeats that recovery explicitly. The registry deduplicates `[system-id ref snapshot-id]`, including observations joined from different replicas. An optional opaque `:ordering` map can carry an external coordinator fence without coupling Yggdrasil to that coordinator.
 
-- **Datahike**: Uses `d/listen` for immediate notification
+- **Datahike**: Uses `d/listen-commits` at the durable writer-batch boundary
 - **Default (Watchable)**: Falls back to `p/watch!` polling
 
 ## Consistency Model

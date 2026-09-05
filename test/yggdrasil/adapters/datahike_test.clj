@@ -6,12 +6,16 @@
    (ancestor?, common-ancestor, commit-graph) compared with (str …), so a UUID
    never matched its own string in a set lookup and common-ancestor always
    returned nil — silently breaking fork merge-base derivation."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.writing :as dw]
             [yggdrasil.adapters.datahike :as dha]
             [yggdrasil.convergent.overlay :as ovl]
-            [yggdrasil.protocols :as p]))
+            [yggdrasil.hooks :as hooks]
+            [yggdrasil.protocols :as p]
+            [yggdrasil.registry :as reg]
+            [yggdrasil.workspace :as ws]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *cfg* nil)
@@ -26,6 +30,67 @@
            (finally (d/release *conn*) (d/delete-database cfg))))))
 
 (use-fixtures :each with-mem-db)
+
+(deftest durable-commit-hook-emits-a-complete-dag-event
+  (let [sys    (dha/create *conn* {:system-name "event-test"})
+        events (atom [])
+        hook   (hooks/install-commit-hook! nil sys #(swap! events conj %))]
+    (try
+      (d/transact *conn* [{:note/text "one durable commit"}])
+      (let [event (first @events)]
+        (is (= 1 (count @events)))
+        (is (= :commit (:type event)))
+        (is (= (p/system-id sys) (:system-id event)))
+        (is (= :datahike (:system-type event)))
+        (is (= "db" (:branch event)))
+        (is (= "db" (:ref event)))
+        (is (= (p/snapshot-id sys) (:snapshot-id event)))
+        (is (= (p/parent-ids sys) (:parent-ids event)))
+        (is (uuid? (:store-id event)))
+        (is (integer? (:max-tx event)))
+        (is (= 1 (:tx-count event)))
+        (is (true? (:durable? event)))
+        (is (not (contains? event :db-before)))
+        (is (not (contains? event :db-after)))
+        (is (not (contains? event :tx-reports))))
+      (finally
+        (hooks/remove-commit-hook! nil sys hook)))))
+
+(deftest durable-commit-hooks-have-independent-installation-identities
+  (let [sys (dha/create *conn* {:system-name "event-test"})
+        first-events (atom [])
+        second-events (atom [])
+        first-hook (hooks/install-commit-hook! nil sys #(swap! first-events conj %))
+        second-hook (hooks/install-commit-hook! nil sys #(swap! second-events conj %))]
+    (try
+      (is (not= first-hook second-hook))
+      (d/transact *conn* [{:note/text "both"}])
+      (is (= 1 (count @first-events)))
+      (is (= 1 (count @second-events)))
+      (hooks/remove-commit-hook! nil sys first-hook)
+      (d/transact *conn* [{:note/text "second only"}])
+      (is (= 1 (count @first-events)))
+      (is (= 2 (count @second-events)))
+      (finally
+        (hooks/remove-commit-hook! nil sys first-hook)
+        (hooks/remove-commit-hook! nil sys second-hook)))))
+
+(deftest manage-reconciles-history-created-before-subscription
+  (let [sys (dha/create *conn* {:system-name "event-recovery"})]
+    (d/transact *conn* [{:note/text "before one"}])
+    (d/transact *conn* [{:note/text "before two"}])
+    (let [expected (set (p/history sys))
+          workspace (ws/create-workspace)]
+      (try
+        (ws/manage! workspace sys)
+        (let [observed (into #{}
+                             (comp (filter #(= (p/system-id sys) (:system-id %)))
+                                   (map :snapshot-id))
+                             (reg/all-entries (:registry workspace)))]
+          (is (set/subset? expected observed)
+              "the durable DAG, rather than hook delivery, closes the gap"))
+        (finally
+          (ws/close! workspace))))))
 
 (deftest history-returns-string-snapshot-ids
   (testing "history/ancestors return STRING snapshot-ids (the protocol type)"

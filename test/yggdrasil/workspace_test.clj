@@ -418,6 +418,60 @@
 
       (ws/close! w))))
 
+(deftest managed-event-keeps-the-observed-snapshot-parents
+  (testing "registration uses event parents rather than rereading a newer mutable head"
+    (let [w   (ws/create-workspace)
+          sys (make-watchable-system "mock:exact" "main" ["base"])]
+      (ws/manage! w sys)
+      ;; Move the live system beyond the event before delivering it. A consumer
+      ;; that asks p/parent-ids now sees "newer", not the exact event parent.
+      (reset! (:snapshots-atom sys) ["base" "exact" "newer"])
+      (let [callback (first (vals @(:watchers-atom sys)))]
+        (callback {:type :commit
+                   :snapshot-id "exact"
+                   :parent-ids #{"base"}
+                   :branch "main"
+                   :ordering {:term 4 :index 9}}))
+      (let [entry (first (reg/snapshot-refs (:registry w) "exact"))]
+        (is (= #{"base"} (:parent-ids entry)))
+        (is (= :mock-watchable (get-in entry [:metadata :system-type])))
+        (is (true? (get-in entry [:metadata :durable?])))
+        (is (= {:term 4 :index 9} (get-in entry [:metadata :ordering]))))
+      (ws/close! w))))
+
+(deftest normalize-commit-event-completes-legacy-notifications
+  (let [sys (make-watchable-system "mock:legacy" "main" ["base" "next"])
+        event (hooks/normalize-commit-event
+               sys {:type :commit :snapshot-id "next" :timestamp 42})]
+    (is (= "mock:legacy" (:system-id event)))
+    (is (= :mock-watchable (:system-type event)))
+    (is (= "main" (:ref event)))
+    (is (= #{"base"} (:parent-ids event)))
+    (is (= 42 (:observed-at event)))
+    (is (true? (:durable? event)))))
+
+(deftest normalize-commit-event-canonicalizes-keyword-refs
+  (let [sys (make-watchable-system "mock:legacy" "main" ["base" "next"])
+        event (hooks/normalize-commit-event
+               sys {:snapshot-id "next" :branch :campaign/main
+                    :ref :campaign/main :parent-ids #{"base"}})]
+    (is (= "campaign/main" (:branch event)))
+    (is (= "campaign/main" (:ref event)))))
+
+(deftest managed-events-are-deduplicated-by-stable-identity
+  (let [w (ws/create-workspace)
+        sys (make-watchable-system "mock:duplicate" "main" ["base"])]
+    (ws/manage! w sys)
+    (let [callback (first (vals @(:watchers-atom sys)))
+          event {:type :commit :snapshot-id "same" :parent-ids #{"base"}
+                 :branch :main :ref :main :timestamp 42}]
+      (callback event)
+      (callback event)
+      (is (= 1 (count (reg/snapshot-refs (:registry w) "same"))))
+      (is (= 2 (reg/entry-count (:registry w)))
+          "the initial head plus one logical commit are visible"))
+    (ws/close! w)))
+
 ;; ============================================================
 ;; Persistent workspace tests
 ;; ============================================================
