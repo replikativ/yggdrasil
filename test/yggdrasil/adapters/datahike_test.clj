@@ -103,6 +103,333 @@
           (is (= "b1" (ffirst (d/q '[:find ?bid :where [?i :item/id "i1"] [?i :item/box ?b] [?b :box/id ?bid]] db)))
               "item's ref resolved to the co-created box"))))))
 
+(def document-schema
+  [{:db/ident :document/id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :document/lines
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/isComponent true}
+   {:db/ident :document/link
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :line/text
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :line/next
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :line/tag
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}])
+
+(defn- line-texts [db document-id]
+  (set (d/q '[:find [?text ...]
+              :in $ ?document-id
+              :where
+              [?d :document/id ?document-id]
+              [?d :document/lines ?line]
+              [?line :line/text ?text]]
+            db document-id)))
+
+(defn- line-eid [db document-id text]
+  (d/q '[:find ?line .
+         :in $ ?document-id ?text
+         :where
+         [?d :document/id ?document-id]
+         [?d :document/lines ?line]
+         [?line :line/text ?text]]
+       db document-id text))
+
+(deftest merge-does-not-replay-inherited-anonymous-audit-rows
+  (testing "an unchanged child cannot append fresh copies of sealed parent history"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact
+       *conn*
+       [{:db/ident :audit.transaction/id
+         :db/valueType :db.type/uuid
+         :db/cardinality :db.cardinality/one
+         :db/unique :db.unique/identity}
+        {:db/ident :audit.posting/transaction
+         :db/valueType :db.type/ref
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :audit.posting/amount
+         :db/valueType :db.type/bigdec
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :note/id
+         :db/valueType :db.type/string
+         :db/cardinality :db.cardinality/one
+         :db/unique :db.unique/identity}])
+      (let [transaction-id (random-uuid)]
+        ;; Like Kontor, the transaction is identified while its balanced
+        ;; postings are deliberately anonymous immutable history.
+        (d/transact *conn*
+                    [{:audit.transaction/id transaction-id}
+                     {:audit.posting/transaction
+                      [:audit.transaction/id transaction-id]
+                      :audit.posting/amount 1M}
+                     {:audit.posting/transaction
+                      [:audit.transaction/id transaction-id]
+                      :audit.posting/amount -1M}])
+        (let [base-postings
+              (set (d/q '[:find [?posting ...]
+                          :in $ ?transaction-id
+                          :where
+                          [?tx :audit.transaction/id ?transaction-id]
+                          [?posting :audit.posting/transaction ?tx]]
+                        @*conn* transaction-id))]
+          (p/branch! sys :child)
+          (let [child (p/checkout sys :child)]
+            ;; Exercise a real merge transaction while leaving the inherited
+            ;; audit rows untouched in the source.
+            (d/transact (:conn child) [{:note/id "child-output"}])
+            (p/merge! sys :child)
+            (let [merged-postings
+                  (set (d/q '[:find [?posting ...]
+                              :in $ ?transaction-id
+                              :where
+                              [?tx :audit.transaction/id ?transaction-id]
+                              [?posting :audit.posting/transaction ?tx]]
+                            @*conn* transaction-id))]
+              (is (= base-postings merged-postings)
+                  "merge preserves the exact inherited anonymous posting identities")
+              (is (= #{1M -1M}
+                     (set (d/q '[:find [?amount ...]
+                                 :in $ ?transaction-id
+                                 :where
+                                 [?tx :audit.transaction/id ?transaction-id]
+                                 [?posting :audit.posting/transaction ?tx]
+                                 [?posting :audit.posting/amount ?amount]]
+                               @*conn* transaction-id)))
+                  "no duplicate posting history is appended"))))))))
+
+(deftest merge-preserves-and-retracts-base-anonymous-components
+  (testing "inherited anonymous components use their shared base eid"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "sealed"
+                           :document/lines [{:line/text "debit"}
+                                            {:line/text "credit"}]}])
+      (p/branch! sys :feature)
+      (let [fsys (p/checkout sys :feature)]
+        ;; Diverge both heads without changing either inherited component.
+        (d/transact (:conn fsys) [{:document/id "fork"}])
+        (d/transact *conn* [{:document/id "trunk"}])
+        (p/merge! sys :feature)
+        (is (= #{"debit" "credit"} (line-texts @*conn* "sealed"))
+            "unchanged components are neither duplicated nor lost"))
+      (p/branch! sys :delete-line)
+      (let [delete-sys (p/checkout sys :delete-line)
+            line (line-eid @(:conn delete-sys) "sealed" "debit")]
+        (d/transact (:conn delete-sys) [[:db/retractEntity line]])
+        (p/merge! sys :delete-line)
+        (is (= #{"credit"} (line-texts @*conn* "sealed"))
+            "source deletion of an inherited component propagates")))))
+
+(deftest merge-does-not-clobber-target-only-anonymous-changes
+  (testing "unchanged source history cannot overwrite or resurrect target data"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "edited"
+                           :document/lines [{:line/text "base-edit"}]}
+                          {:document/id "deleted"
+                           :document/lines [{:line/text "base-delete"}]}])
+      (p/branch! sys :no-op-source)
+      (let [source (p/checkout sys :no-op-source)
+            edited-line (line-eid @*conn* "edited" "base-edit")
+            deleted-line (line-eid @*conn* "deleted" "base-delete")]
+        (d/transact (:conn source) [{:document/id "source-unrelated"}])
+        (d/transact *conn* [[:db/add edited-line :line/text "target-edit"]
+                            [:db/retractEntity deleted-line]])
+        (p/merge! sys :no-op-source)
+        (is (= #{"target-edit"} (line-texts @*conn* "edited"))
+            "target-only edit remains authoritative")
+        (is (empty? (line-texts @*conn* "deleted"))
+            "target-only deletion is not resurrected")))))
+
+(deftest merge-applies-source-only-anonymous-edit
+  (testing "a source change to an inherited anonymous entity lands on target"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "doc"
+                           :document/lines [{:line/text "base"}]}])
+      (p/branch! sys :source-edit)
+      (let [source (p/checkout sys :source-edit)
+            line (line-eid @(:conn source) "doc" "base")]
+        (d/transact (:conn source) [[:db/add line :line/text "source-edit"]])
+        (p/merge! sys :source-edit)
+        (is (= #{"source-edit"} (line-texts @*conn* "doc")))))))
+
+(deftest conflicts-cover-anonymous-edits-and-deletions
+  (testing "base eid supplies semantic identity for anonymous 3-way conflicts"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "edited"
+                           :document/lines [{:line/text "base-edit"}]}
+                          {:document/id "deleted"
+                           :document/lines [{:line/text "base-delete"}]}])
+      (let [edit-eid (line-eid @*conn* "edited" "base-edit")
+            delete-eid (line-eid @*conn* "deleted" "base-delete")]
+        (p/branch! sys :ours)
+        (p/branch! sys :theirs)
+        (let [ours (p/checkout sys :ours)
+              theirs (p/checkout sys :theirs)]
+          (d/transact (:conn ours) [[:db/add edit-eid :line/text "ours"]
+                                    [:db/retractEntity delete-eid]])
+          (d/transact (:conn theirs) [[:db/add edit-eid :line/text "theirs"]
+                                      [:db/add delete-eid :line/text "theirs-edit"]])
+          (let [conflicts (p/conflicts ours (p/snapshot-id ours)
+                                       (p/snapshot-id theirs))
+                by-entity (group-by :entity conflicts)]
+            (is (= #{[:yggdrasil/base-eid edit-eid]
+                     [:yggdrasil/base-eid delete-eid]}
+                   (set (keys by-entity))))
+            (is (= #{["base-edit" "ours" "theirs"]
+                     ["base-delete" nil "theirs-edit"]}
+                   (set (map (juxt :base :ours :theirs) conflicts))))))))))
+
+(deftest entity-tombstone-conflicts-with-new-attributes
+  (testing "delete-vs-add conflicts for identified and inherited anonymous entities"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn*
+                  (into document-schema
+                        [{:db/ident :note/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :note/text
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :note/tag
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one}]))
+      (d/transact *conn*
+                  [{:note/id "conflict" :note/text "base"}
+                   {:note/id "one-sided-add" :note/text "base"}
+                   {:note/id "pure-delete" :note/text "base"}
+                   {:document/id "doc"
+                    :document/lines [{:line/text "conflict"}
+                                     {:line/text "one-sided-add"}
+                                     {:line/text "pure-delete"}]}])
+      (let [identified-conflict
+            (d/q '[:find ?e . :where [?e :note/id "conflict"]] @*conn*)
+            identified-delete
+            (d/q '[:find ?e . :where [?e :note/id "pure-delete"]] @*conn*)
+            anonymous-conflict (line-eid @*conn* "doc" "conflict")
+            anonymous-delete (line-eid @*conn* "doc" "pure-delete")]
+        (p/branch! sys :deleting)
+        (p/branch! sys :modifying)
+        (let [deleting (p/checkout sys :deleting)
+              modifying (p/checkout sys :modifying)]
+          (d/transact (:conn deleting)
+                      [[:db/retractEntity identified-conflict]
+                       [:db/retractEntity identified-delete]
+                       [:db/retractEntity anonymous-conflict]
+                       [:db/retractEntity anonymous-delete]
+                       {:note/id "one-sided-add" :note/tag "ours-only"}
+                       [:db/add (line-eid @(:conn deleting) "doc" "one-sided-add")
+                        :line/tag "ours-only"]])
+          (d/transact (:conn modifying)
+                      [{:note/id "conflict" :note/tag "theirs"}
+                       [:db/add anonymous-conflict :line/tag "theirs"]])
+          (let [conflicts (p/conflicts deleting (p/snapshot-id deleting)
+                                       (p/snapshot-id modifying))]
+            (is (= #{[[:note/id "conflict"] :note/tag nil nil "theirs"]
+                     [[:yggdrasil/base-eid anonymous-conflict]
+                      :line/tag nil nil "theirs"]}
+                   (set (map (juxt :entity :attr :base :ours :theirs)
+                             conflicts)))
+                "new survivor attributes conflict with identified and anonymous tombstones")
+            (is (not-any? #(contains? #{[:note/id "one-sided-add"]
+                                        [:note/id "pure-delete"]
+                                        [:yggdrasil/base-eid anonymous-delete]}
+                                      (:entity %))
+                          conflicts)
+                "ordinary one-sided additions and pure deletions stay conflict-free")))))))
+
+(deftest conflicts-normalize-refs-between-base-anonymous-entities
+  (testing "anonymous ref values compare by shared base identity, not Entity object"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "doc"
+                           :document/lines [{:line/text "a"}
+                                            {:line/text "b"}
+                                            {:line/text "c"}]}])
+      (let [a (line-eid @*conn* "doc" "a")
+            b (line-eid @*conn* "doc" "b")
+            c (line-eid @*conn* "doc" "c")]
+        (d/transact *conn* [[:db/add a :line/next b]])
+        (p/branch! sys :ours-ref)
+        (p/branch! sys :theirs-ref)
+        (let [ours (p/checkout sys :ours-ref)
+              theirs (p/checkout sys :theirs-ref)]
+          (d/transact (:conn ours) [[:db/add a :line/next c]])
+          (d/transact (:conn theirs) [[:db/retract a :line/next b]])
+          (let [conflict (->> (p/conflicts ours (p/snapshot-id ours)
+                                           (p/snapshot-id theirs))
+                              (filter #(= :line/next (:attr %)))
+                              first)]
+            (is (= [:yggdrasil/base-eid a] (:entity conflict)))
+            (is (= [:yggdrasil/base-eid b] (:base conflict)))
+            (is (= [:yggdrasil/base-eid c] (:ours conflict)))
+            (is (nil? (:theirs conflict)))))))))
+
+(deftest new-reference-conflicts-with-concurrent-referent-deletion
+  (testing "an incoming edge cannot resurrect its deleted base referent as an empty entity"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "doc"
+                           :document/lines [{:line/text "target"}]}])
+      (let [target (line-eid @*conn* "doc" "target")]
+        (p/branch! sys :add-reference)
+        (p/branch! sys :delete-referent)
+        (let [adding (p/checkout sys :add-reference)
+              deleting (p/checkout sys :delete-referent)]
+          (d/transact (:conn adding)
+                      [[:db/add [:document/id "doc"] :document/link target]])
+          (d/transact (:conn deleting) [[:db/retractEntity target]])
+          (let [forward (p/conflicts adding (p/snapshot-id adding)
+                                     (p/snapshot-id deleting))
+                reverse (p/conflicts deleting (p/snapshot-id deleting)
+                                     (p/snapshot-id adding))
+                expected-referent [:yggdrasil/base-eid target]]
+            (is (= [{:entity [:document/id "doc"]
+                     :attr :document/link
+                     :base nil
+                     :ours expected-referent
+                     :theirs nil
+                     :reason :deleted-referent
+                     :referent expected-referent}]
+                   (filterv #(= :deleted-referent (:reason %)) forward)))
+            (is (= [{:entity [:document/id "doc"]
+                     :attr :document/link
+                     :base nil
+                     :ours nil
+                     :theirs expected-referent
+                     :reason :deleted-referent
+                     :referent expected-referent}]
+                   (filterv #(= :deleted-referent (:reason %)) reverse)))))))))
+
+(deftest sibling-created-anonymous-components-do-not-collide
+  (testing "equal branch-local numeric eids never identify new anonymous values"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* document-schema)
+      (d/transact *conn* [{:document/id "doc"}])
+      (p/branch! sys :left)
+      (p/branch! sys :right)
+      (let [left (p/checkout sys :left)
+            right (p/checkout sys :right)]
+        (d/transact (:conn left) [{:document/id "doc"
+                                   :document/lines [{:line/text "left"}]}])
+        (d/transact (:conn right) [{:document/id "doc"
+                                    :document/lines [{:line/text "right"}]}])
+        (p/merge! sys :left)
+        (p/merge! sys :right)
+        (is (= #{"left" "right"} (line-texts @*conn* "doc"))
+            "both sibling-created components survive")))))
+
 (deftest merge-ignores-schema-attrs-added-in-fork
   (testing "a fork that registers a new SCHEMA attribute (a tool input schema) must
             not abort the merge — :db/* datoms are schema, not data, and upserting
@@ -149,6 +476,199 @@
             (is (= "base" (:base c)))
             (is (= "ours-val" (:ours c)))
             (is (= "theirs-val" (:theirs c)))))))))
+
+(deftest identified-entities-use-the-same-three-way-rules
+  (testing "target-only changes survive and identity delete-vs-edit conflicts"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :note/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "target-only" :note/text "base"}
+                          {:note/id "delete-edit" :note/text "base-delete"}])
+      (p/branch! sys :identity-no-op)
+      (let [source (p/checkout sys :identity-no-op)]
+        (d/transact (:conn source) [{:note/id "source-unrelated"}])
+        (d/transact *conn* [{:note/id "target-only" :note/text "target"}])
+        (p/merge! sys :identity-no-op)
+        (is (= "target"
+               (d/q '[:find ?text .
+                      :where [?e :note/id "target-only"]
+                      [?e :note/text ?text]] @*conn*))))
+      (p/branch! sys :identity-delete)
+      (p/branch! sys :identity-edit)
+      (let [deleting (p/checkout sys :identity-delete)
+            editing (p/checkout sys :identity-edit)
+            eid (d/q '[:find ?e . :where [?e :note/id "delete-edit"]]
+                     @(:conn deleting))]
+        (d/transact (:conn deleting) [[:db/retractEntity eid]])
+        (d/transact (:conn editing) [{:note/id "delete-edit"
+                                      :note/text "edited"}])
+        (is (= [{:entity [:note/id "delete-edit"]
+                 :attr :note/text
+                 :base "base-delete"
+                 :ours nil
+                 :theirs "edited"}]
+               (filterv #(= :note/text (:attr %))
+                        (p/conflicts deleting (p/snapshot-id deleting)
+                                     (p/snapshot-id editing)))))))))
+
+(deftest identified-entity-recreation-is-a-semantic-update
+  (testing "recreating one identity at a new eid does not retract that identity"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :note/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (d/transact *conn* [{:note/id "n" :note/text "base"}])
+      (p/branch! sys :recreate)
+      (let [source (p/checkout sys :recreate)
+            old-eid (d/q '[:find ?e . :where [?e :note/id "n"]]
+                         @(:conn source))]
+        (d/transact (:conn source) [[:db/retractEntity old-eid]])
+        (d/transact (:conn source) [{:note/id "n" :note/text "recreated"}])
+        (p/merge! sys :recreate)
+        (is (= #{["n" "recreated"]}
+               (d/q '[:find ?id ?text
+                      :where
+                      [?e :note/id ?id]
+                      [?e :note/text ?text]] @*conn*))
+            "semantic lookup remains intact after merge")))))
+
+(deftest split-unique-identities-are-a-structural-conflict
+  (testing "one source entity cannot silently merge into two target entities"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :item/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/slug
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (p/branch! sys :unified)
+      (p/branch! sys :split)
+      (let [unified (p/checkout sys :unified)
+            split (p/checkout sys :split)]
+        (d/transact (:conn unified)
+                    [{:item/id "i" :item/slug "s" :item/text "source"}])
+        (d/transact (:conn split)
+                    [{:item/id "i"} {:item/slug "s"}])
+        (let [forward (p/conflicts unified (p/snapshot-id unified)
+                                   (p/snapshot-id split))
+              reverse (p/conflicts split (p/snapshot-id split)
+                                   (p/snapshot-id unified))
+              identity-set #{[:item/id "i"] [:item/slug "s"]}]
+          (is (= 1 (count (filter #(= :split-identity (:reason %)) forward))))
+          (is (= identity-set
+                 (set (:identities
+                       (first (filter #(= :split-identity (:reason %))
+                                      forward))))))
+          (is (= 1 (count (filter #(= :split-identity (:reason %)) reverse))))
+          (is (= [identity-set]
+                 (:theirs
+                  (first (filter #(= :split-identity (:reason %))
+                                 reverse))))))))))
+
+(deftest one-sided-additional-identity-is-preserved
+  (testing "an unclaimed identity joins the already identified target entity"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :item/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/slug
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (p/branch! sys :source)
+      (p/branch! sys :target)
+      (let [source (p/checkout sys :source)
+            target (p/checkout sys :target)]
+        (d/transact (:conn source)
+                    [{:item/id "i" :item/slug "s" :item/text "source"}])
+        (d/transact (:conn target) [{:item/id "i"}])
+        (is (empty? (p/conflicts target (p/snapshot-id target)
+                                 (p/snapshot-id source))))
+        (p/merge! target :source)
+        (is (= {:item/id "i" :item/slug "s" :item/text "source"}
+               (d/pull @(:conn target)
+                       [:item/id :item/slug :item/text]
+                       [:item/id "i"])))))))
+
+(deftest entity-deletion-conflicts-with-cardinality-many-edit
+  (testing "delete-vs-many modification cannot leave an orphaned remainder"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :note/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :note/tags
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/many}])
+      (d/transact *conn* [{:note/id "n" :note/tags #{"base"}}])
+      (p/branch! sys :delete-note)
+      (p/branch! sys :edit-tags)
+      (let [deleting (p/checkout sys :delete-note)
+            editing (p/checkout sys :edit-tags)
+            eid (d/q '[:find ?e . :where [?e :note/id "n"]]
+                     @(:conn deleting))]
+        (d/transact (:conn deleting) [[:db/retractEntity eid]])
+        (d/transact (:conn editing) [[:db/add [:note/id "n"]
+                                      :note/tags "added"]])
+        (is (= [{:entity [:note/id "n"]
+                 :attr :note/tags
+                 :base #{"base"}
+                 :ours nil
+                 :theirs #{"base" "added"}}]
+               (filterv #(= :note/tags (:attr %))
+                        (p/conflicts deleting (p/snapshot-id deleting)
+                                     (p/snapshot-id editing)))))))))
+
+(deftest identity-acquisition-does-not-change-an-inherited-ref
+  (testing "base identity wins over a unique identity added in one descendant"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :doc/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :doc/link
+                           :db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :line/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :line/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (let [tx (d/transact *conn* [{:db/id "b" :line/text "b"}
+                                   {:db/id "c" :line/text "c"}
+                                   {:doc/id "d" :doc/link "b"}])
+            b (get (:tempids tx) "b")
+            c (get (:tempids tx) "c")]
+        (p/branch! sys :gain-identity)
+        (p/branch! sys :change-ref)
+        (let [ours (p/checkout sys :gain-identity)
+              theirs (p/checkout sys :change-ref)]
+          (d/transact (:conn ours) [[:db/add b :line/id "B"]])
+          (d/transact (:conn theirs) [[:db/add [:doc/id "d"] :doc/link c]])
+          (is (empty? (filter #(= :doc/link (:attr %))
+                              (p/conflicts ours (p/snapshot-id ours)
+                                           (p/snapshot-id theirs))))
+              "only the ref-changing branch differs from base"))))))
 
 (deftest common-ancestor-resolves-merge-base
   (testing "common-ancestor finds the fork point across a branch + divergence"
