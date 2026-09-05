@@ -8,6 +8,13 @@ workflows:
     jobs:
       - tools/setup:
           context: docker-deploy
+          # The stacked Datahike dependency generates two JVM interfaces when
+          # consumed from git. Prepare it before the orb resolves :test.
+          pre-steps:
+            - checkout
+            - run:
+                name: Prepare git dependencies
+                command: clojure -X:deps prep :aliases '[:dev :test :build]'
       - tools/build:
           context: docker-deploy
           requires:
@@ -52,7 +59,9 @@ jobs:
             git config --global user.name "CI Test"
       - run:
           name: Download dependencies
-          command: clojure -P -M:test
+          command: |
+            clojure -X:deps prep :aliases '[:test]'
+            clojure -P -M:test
       - run:
           name: Run git adapter tests
           command: clojure -M:test -n yggdrasil.adapters.git-test
