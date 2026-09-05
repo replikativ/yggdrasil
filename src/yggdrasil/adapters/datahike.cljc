@@ -708,7 +708,9 @@
 (defmethod hooks/install-commit-hook! :datahike
   [_workspace system on-commit-fn]
   (let [conn (:conn system)
-        listener-key (keyword (str "yggdrasil-" (p/system-id system)))]
+        ;; Listener keys are installation identities, not system identities.
+        ;; Several workspaces may legitimately observe the same connection.
+        listener-key (str "yggdrasil-" (p/system-id system) "-" (random-uuid))]
     (d/listen-commits
      conn listener-key
      (fn [{:keys [commit-id parent-commit-ids branch] :as event}]

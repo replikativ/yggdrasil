@@ -255,9 +255,10 @@
 
    Commit events used for versioned-DAG dissemination should be self-contained:
    include the exact `:snapshot-id`, `:parent-ids`, and mutable `:branch`/`:ref`
-   observed after durability. Delivery is at-least-once; consumers deduplicate
-   by system, ref, and snapshot rather than arrival time. `:ordering` is an
-   optional opaque coordinator fence, not a wall-clock ordering claim."
+   observed after durability. Notifications may be duplicated and process-local
+   hooks may miss delivery; durable consumers reconcile the underlying commit
+   graph and deduplicate by system, ref, and snapshot rather than arrival time.
+   `:ordering` is an optional opaque coordinator fence, not a wall-clock claim."
 
   (watch! [this callback] [this callback opts]
     "Register callback for state change events. Returns watch-id string.

@@ -109,18 +109,18 @@
     ;; Register current state
     (when (satisfies? p/Snapshotable system)
       (when-let [snap-id (p/snapshot-id system)]
-        (reg/register! (:registry workspace)
-                       (t/->RegistryEntry
-                        (str snap-id)
-                        sid
-                        (if (satisfies? p/Branchable system)
-                          (name (p/current-branch system))
-                          "main")
-                        @(:hlc-atom workspace)
-                        nil
-                        (when (satisfies? p/Snapshotable system)
-                          (p/parent-ids system))
-                        {:source :add-system}))
+        (reg/register-once! (:registry workspace)
+                            (t/->RegistryEntry
+                             (str snap-id)
+                             sid
+                             (if (satisfies? p/Branchable system)
+                               (hooks/ref-name (p/current-branch system))
+                               "main")
+                             @(:hlc-atom workspace)
+                             nil
+                             (when (satisfies? p/Snapshotable system)
+                               (p/parent-ids system))
+                             {:source :add-system}))
         (reg/flush! (:registry workspace))))
     workspace))
 
@@ -313,12 +313,15 @@
 ;; Managed systems — high-level API
 ;; ============================================================
 
+(declare sync-registry!)
+
 (defn manage!
   "Add a system with auto-registration of commits.
 
    This is the recommended high-level API for adding systems to a
-   workspace. It sets up adapter-specific commit hooks so that every
-   commit is automatically registered in the snapshot registry.
+   workspace. It installs the low-latency hook before reading system state,
+   then reconciles Graphable systems. That ordering closes the subscription
+   race and recovers commits missed before this process started.
 
    Hook mechanisms (in priority order):
    - Native hooks via hooks/install-commit-hook! multimethod
@@ -332,9 +335,9 @@
   ([workspace system] (manage! workspace system {}))
   ([workspace system opts]
    (let [sid (p/system-id system)]
-     ;; Add system to workspace (registers current snapshot)
-     (add-system! workspace system)
-     ;; Set up commit hook for auto-registration
+     ;; Subscribe before reading/registering the current head. A commit racing
+     ;; setup is then either delivered by the hook, found by reconciliation, or
+     ;; both (the registry deduplicates the stable event identity).
      (let [on-commit (fn [event]
                        (let [hlc (swap! (:hlc-atom workspace) t/hlc-tick)
                              ;; New hooks carry the parents of the exact observed
@@ -343,12 +346,12 @@
                              ;; edge; normalize-commit-event supplies a fallback
                              ;; only for legacy Watchable adapters.
                              parent-ids (:parent-ids event)]
-                         (reg/register!
+                         (reg/register-once!
                           (:registry workspace)
                           (t/->RegistryEntry
                            (str (:snapshot-id event))
                            sid
-                           (or (:branch event) "main")
+                           (or (:ref event) (:branch event) "main")
                            hlc
                            nil
                            parent-ids
@@ -358,10 +361,24 @@
                                    :observed-at (:observed-at event)}
                                   (select-keys event [:ordering :store-id
                                                       :max-tx :tx-count]))))
+                         ;; Flush even for a duplicate: an earlier registration
+                         ;; may have changed memory before persistence failed.
                          (reg/flush! (:registry workspace))))
            hook-id (hooks/install-commit-hook! workspace system on-commit)]
-       (when hook-id
-         (swap! (:watchers workspace) assoc sid hook-id)))
+       (try
+         (add-system! workspace system)
+         (when hook-id
+           (swap! (:watchers workspace) assoc sid hook-id))
+         (when (and (satisfies? p/Branchable system)
+                    (satisfies? p/Graphable system))
+           (sync-registry! workspace sid))
+         (catch #?(:clj Exception :cljs :default) e
+           (when hook-id
+             (try (hooks/remove-commit-hook! workspace system hook-id)
+                  (catch #?(:clj Exception :cljs :default) _)))
+           (swap! (:watchers workspace) dissoc sid)
+           (swap! (:systems workspace) dissoc sid)
+           (throw e))))
      workspace)))
 
 (defn unmanage!
@@ -440,9 +457,11 @@
                             (:parent-ids meta)
                             (merge {:source :sync}
                                    (select-keys meta [:message :author]))))))))))
-        ;; Batch register and single flush
+        ;; Atomically claim every stable identity, then flush once. A hook may
+        ;; race this scan; register-once! makes either interleaving idempotent.
         (when (seq @batch)
-          (reg/register-batch! (:registry workspace) @batch)
+          (doseq [entry @batch]
+            (reg/register-once! (:registry workspace) entry))
           (reg/flush! (:registry workspace))))))
   workspace)
 

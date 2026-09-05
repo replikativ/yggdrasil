@@ -450,6 +450,28 @@
     (is (= 42 (:observed-at event)))
     (is (true? (:durable? event)))))
 
+(deftest normalize-commit-event-canonicalizes-keyword-refs
+  (let [sys (make-watchable-system "mock:legacy" "main" ["base" "next"])
+        event (hooks/normalize-commit-event
+               sys {:snapshot-id "next" :branch :campaign/main
+                    :ref :campaign/main :parent-ids #{"base"}})]
+    (is (= "campaign/main" (:branch event)))
+    (is (= "campaign/main" (:ref event)))))
+
+(deftest managed-events-are-deduplicated-by-stable-identity
+  (let [w (ws/create-workspace)
+        sys (make-watchable-system "mock:duplicate" "main" ["base"])]
+    (ws/manage! w sys)
+    (let [callback (first (vals @(:watchers-atom sys)))
+          event {:type :commit :snapshot-id "same" :parent-ids #{"base"}
+                 :branch :main :ref :main :timestamp 42}]
+      (callback event)
+      (callback event)
+      (is (= 1 (count (reg/snapshot-refs (:registry w) "same"))))
+      (is (= 2 (reg/entry-count (:registry w)))
+          "the initial head plus one logical commit are visible"))
+    (ws/close! w)))
+
 ;; ============================================================
 ;; Persistent workspace tests
 ;; ============================================================

@@ -19,7 +19,8 @@
    Entries serialize via the 2P-Set's element codec (`entry->map`/`map->entry`):
    bare-element keys, so the codec applies cleanly (no `[elem tag]` pairs).
    Queries full-scan the live set — fast enough at the expected scale."
-  (:require [yggdrasil.types :as t]
+  (:require [hasch.core :as hasch]
+            [yggdrasil.types :as t]
             [yggdrasil.storage :as store]
             [yggdrasil.convergent.twopset :as d2p])
   #?(:clj (:import [org.fressian.handlers WriteHandler ReadHandler]
@@ -90,8 +91,36 @@
   [^Registry registry]
   @(:tpset-atom registry))
 
-(defn- live-entries [^Registry registry]
+(defn entry-identity
+  "Stable semantic identity of a registry observation. Adapter hooks may deliver
+   an event repeatedly and separate replicas may observe it at different HLCs."
+  [entry]
+  [(:system-id entry) (:branch-name entry) (:snapshot-id entry)])
+
+(defn- raw-live-entries [^Registry registry]
   (d2p/elements @(:tpset-atom registry)))
+
+(defn- earlier-entry
+  "Choose one deterministic public projection for duplicate observations."
+  [a b]
+  (let [c (tsbs-comparator a b)]
+    (cond
+      (neg? c) a
+      (pos? c) b
+      ;; Equal causal coordinates can still carry different observation
+      ;; metadata. Canonical content hashes supply an order-independent tie.
+      (neg? (compare (str (hasch/uuid (store/entry->map a)))
+                     (str (hasch/uuid (store/entry->map b))))) a
+      :else b)))
+
+(defn- live-entries [^Registry registry]
+  ;; Deduplicate inside the registry lens, not in downstream consumers. This
+  ;; remains true after two independently observed registries are joined.
+  (vals (reduce (fn [by-id entry]
+                  (update by-id (entry-identity entry)
+                          #(if % (earlier-entry % entry) entry)))
+                {}
+                (raw-live-entries registry))))
 
 ;; ============================================================
 ;; CRUD
@@ -103,6 +132,20 @@
   (swap! (:tpset-atom registry) #(d2p/conj % entry))
   registry)
 
+(defn register-once!
+  "Atomically register ENTRY unless its stable event identity already exists.
+   Returns true exactly when this call added the identity."
+  [^Registry registry entry]
+  (let [added? (volatile! false)
+        identity (entry-identity entry)]
+    (swap! (:tpset-atom registry)
+           (fn [state]
+             (if (some #(= identity (entry-identity %)) (d2p/elements state))
+               state
+               (do (vreset! added? true)
+                   (d2p/conj state entry)))))
+    @added?))
+
 (defn register-batch!
   "Register multiple entries at once."
   [^Registry registry entries]
@@ -112,7 +155,14 @@
 (defn deregister!
   "Convergent observed-remove: tombstone the entry (permanent per content)."
   [^Registry registry entry]
-  (swap! (:tpset-atom registry) #(d2p/disj % entry))
+  ;; Tombstone every locally observed representation of the same stable event,
+  ;; otherwise a hidden duplicate could reappear after removing the projection.
+  (let [identity (entry-identity entry)]
+    (swap! (:tpset-atom registry)
+           (fn [state]
+             (reduce d2p/disj state
+                     (filter #(= identity (entry-identity %))
+                             (d2p/elements state))))))
   registry)
 
 (defn flush!

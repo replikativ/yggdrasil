@@ -11,6 +11,16 @@
    multimethods, so users get optimal hook behavior automatically."
   (:require [yggdrasil.protocols :as p]))
 
+(defn ref-name
+  "Canonical string representation used for branch and ref identity."
+  [ref]
+  (cond
+    (nil? ref) nil
+    (keyword? ref) (subs (str ref) 1)
+    (symbol? ref) (str ref)
+    (string? ref) ref
+    :else (str ref)))
+
 (defn normalize-commit-event
   "Complete an adapter notification into Yggdrasil's versioned-DAG event.
 
@@ -26,9 +36,11 @@
   (let [snapshot-id (some-> (or (:snapshot-id event)
                                 (p/snapshot-id system))
                             str)
-        branch (or (:branch event)
-                   (when (satisfies? p/Branchable system)
-                     (some-> (p/current-branch system) name)))
+        branch (ref-name
+                (or (:branch event)
+                    (when (satisfies? p/Branchable system)
+                      (p/current-branch system))))
+        ref (ref-name (or (:ref event) branch))
         parent-ids (or (:parent-ids event)
                        (when (satisfies? p/Snapshotable system)
                          (p/parent-ids system))
@@ -48,7 +60,7 @@
                :snapshot-id snapshot-id
                :parent-ids (set (map str parent-ids))
                :branch branch
-               :ref (or (:ref event) branch)
+               :ref ref
                :durable? (get event :durable? true))
         (assoc :observed-at (or (:observed-at event)
                                 (:timestamp event)
@@ -72,8 +84,11 @@
       :ordering optional-opaque-map}
 
    Implementations must report the parents belonging to that exact snapshot;
-   consumers must not have to reread a mutable head. Delivery is at-least-once,
-   so `(system-id, ref, snapshot-id)` is the stable deduplication identity.
+   consumers must not have to reread a mutable head. Hooks are low-latency,
+   process-local notifications and may be lost on callback failure or process
+   exit. Graphable systems recover durably through workspace reconciliation.
+   Duplicate delivery is permitted; `(system-id, ref, snapshot-id)` is the
+   stable deduplication identity.
 
    Returns a hook-id for cleanup, or nil if the system doesn't
    support hooks. Dispatches on (system-type system)."
