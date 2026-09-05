@@ -22,11 +22,9 @@
                       ;; datahike is an OPTIONAL adapter dep (the adapter only
                       ;; loads when datahike is present); provide it at test
                       ;; time so yggdrasil.adapters.datahike-test can exercise it.
-                      ;; Merged durable writer-batch listener; use the release
-                      ;; coordinate once 0.8.1875 is available on Clojars.
+                      ;; Released durable writer-batch listener.
                       org.replikativ/datahike
-                      {:git/url "https://github.com/replikativ/datahike.git"
-                       :git/sha "1070bb75a7ecb183a3e3f3792b15287e1838aba1"}
+                      {:mvn/version "0.8.1877"}
                       ;; geschichte is likewise an OPTIONAL adapter dep, for
                       ;; yggdrasil.adapters.geschichte-test.
                       org.replikativ/geschichte {:mvn/version "0.1.14"}}
@@ -52,8 +50,7 @@
                         ;; datahike adapter — it is the same JVM :test dep, here so
                         ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
                         org.replikativ/datahike
-                        {:git/url "https://github.com/replikativ/datahike.git"
-                         :git/sha "1070bb75a7ecb183a3e3f3792b15287e1838aba1"}
+                        {:mvn/version "0.8.1877"}
                         ;; same for the (optional) geschichte adapter — the whole
                         ;; adapter is .cljc, so cljs exercises the same code.
                         org.replikativ/geschichte {:mvn/version "0.1.14"}}}
