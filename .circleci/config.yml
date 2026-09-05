@@ -48,7 +48,9 @@ workflows:
 jobs:
   test-git:
     docker:
-      - image: cimg/clojure:1.11.1
+      # Datahike's git-dependency prep uses current tools.build, which loads
+      # clojure.java.process and therefore requires Clojure 1.12.
+      - image: cimg/clojure:1.12.0
     working_directory: ~/repo
     steps:
       - checkout
