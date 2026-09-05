@@ -415,10 +415,10 @@
 
    An entity may carry SEVERAL unique-identity attrs (dvergr fuses `:chat/id` and
    `:room/slug` on one entity). We address it by an ALREADY-EXISTING one when any
-   exists (so it resolves to that target entity), and we never re-assert identity
-   attrs on an existing subject — otherwise a divergence where the two unique
-   values point at DIFFERENT target entities would upsert the tempid to both
-   (`Conflicting upsert … resolves both to 300 and 320`)."
+   exists (so it resolves to that target entity). A missing additional identity
+   is asserted onto that entity; an identity already owned by another target
+   entity is omitted because `compute-conflicts` reports that split identity
+   explicitly. This avoids both silent identity loss and conflicting upserts."
   [source-db target-db base-db]
   (let [{:keys [unique ref]} (schema-attrs source-db)
         tgt-eid    (memoize
@@ -500,10 +500,12 @@
                                     [e a v])))))]
     (vec (for [[e a v] diff
                :let  [subj (addr e)]
-               ;; on an EXISTING (lookup-ref) subject, never re-assign a unique
-               ;; identity attr — its identity is fixed; reassigning would move a
-               ;; unique value between entities and conflict on divergent data.
-               :when (not (and (vector? subj) (unique a)))
+               ;; A source entity may gain another unique identity after the
+               ;; fork. Preserve that one-sided addition. Only omit the add when
+               ;; TARGET already assigns the value somewhere: `present?` removed
+               ;; the same-entity case, while `compute-conflicts` exposes the
+               ;; remaining split-entity case for explicit resolution.
+               :when (not (and (vector? subj) (unique a) (in-target? a v)))
                :let  [val (if (and (ref a) (integer? v)) (addr v) v)]]
            [:db/add subj a val]))))
 

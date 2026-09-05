@@ -579,6 +579,35 @@
                   (first (filter #(= :split-identity (:reason %))
                                  reverse))))))))))
 
+(deftest one-sided-additional-identity-is-preserved
+  (testing "an unclaimed identity joins the already identified target entity"
+    (let [sys (dha/create *conn* {:system-name "t"})]
+      (d/transact *conn* [{:db/ident :item/id
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/slug
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :item/text
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+      (p/branch! sys :source)
+      (p/branch! sys :target)
+      (let [source (p/checkout sys :source)
+            target (p/checkout sys :target)]
+        (d/transact (:conn source)
+                    [{:item/id "i" :item/slug "s" :item/text "source"}])
+        (d/transact (:conn target) [{:item/id "i"}])
+        (is (empty? (p/conflicts target (p/snapshot-id target)
+                                 (p/snapshot-id source))))
+        (p/merge! target :source)
+        (is (= {:item/id "i" :item/slug "s" :item/text "source"}
+               (d/pull @(:conn target)
+                       [:item/id :item/slug :item/text]
+                       [:item/id "i"])))))))
+
 (deftest entity-deletion-conflicts-with-cardinality-many-edit
   (testing "delete-vs-many modification cannot leave an orphaned remainder"
     (let [sys (dha/create *conn* {:system-name "t"})]
