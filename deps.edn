@@ -26,7 +26,7 @@
                       ;; the exact durable writer-batch listener used below.
                       org.replikativ/datahike
                       {:git/url "https://github.com/replikativ/datahike.git"
-                       :git/sha "eee493b5bbeaee871c68a7cca894843b1c92af59"}
+                       :git/sha "ef548fdbaa2c94b63a7cc8a3d64aad3dc292ade2"}
                       ;; geschichte is likewise an OPTIONAL adapter dep, for
                       ;; yggdrasil.adapters.geschichte-test.
                       org.replikativ/geschichte {:mvn/version "0.1.14"}}
@@ -53,7 +53,7 @@
                         ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
                         org.replikativ/datahike
                         {:git/url "https://github.com/replikativ/datahike.git"
-                         :git/sha "eee493b5bbeaee871c68a7cca894843b1c92af59"}
+                         :git/sha "ef548fdbaa2c94b63a7cc8a3d64aad3dc292ade2"}
                         ;; same for the (optional) geschichte adapter — the whole
                         ;; adapter is .cljc, so cljs exercises the same code.
                         org.replikativ/geschichte {:mvn/version "0.1.14"}}}

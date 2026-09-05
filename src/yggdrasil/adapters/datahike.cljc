@@ -718,7 +718,11 @@
         (hooks/normalize-commit-event
          system
          (-> event
-             (dissoc :commit-id :parent-commit-ids)
+             ;; Datahike's local durable event also carries queryable DB values
+             ;; and ordered TxReports. Yggdrasil's generic DAG event is the
+             ;; portable identity/causality projection, not a second TxReport
+             ;; transport, so retain only small cross-system metadata here.
+             (select-keys [:store-id :max-tx :tx-count])
              (assoc :snapshot-id (str commit-id)
                     :parent-ids (set (map str parent-commit-ids))
                     :branch (name branch)

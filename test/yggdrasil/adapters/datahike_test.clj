@@ -49,7 +49,10 @@
         (is (uuid? (:store-id event)))
         (is (integer? (:max-tx event)))
         (is (= 1 (:tx-count event)))
-        (is (true? (:durable? event))))
+        (is (true? (:durable? event)))
+        (is (not (contains? event :db-before)))
+        (is (not (contains? event :db-after)))
+        (is (not (contains? event :tx-reports))))
       (finally
         (hooks/remove-commit-hook! nil sys hook)))))
 
