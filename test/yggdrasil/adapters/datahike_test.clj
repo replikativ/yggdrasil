@@ -1039,3 +1039,34 @@
         (when (seq full) (swap! with-conflicts inc))
         (is (= (canon full) (canon scoped)) (str "seed " seed))))
     (is (< 10 @with-conflicts) "the generator does produce conflicts to agree on")))
+
+(deftest the-gate-and-the-merge-share-the-branchs-delta
+  ;; spindel asks `conflicts` before every `merge!`: the same two immutable
+  ;; snapshots, the same question. One pass over the indexes answers both, and
+  ;; a parent that did not move since the fork needs none.
+  (let [sys (dha/create *conn* {:system-name "t"})]
+    (d/transact *conn* note-schema)
+    (d/transact *conn* (mapv (fn [i] {:note/id (str "n" i) :note/text (str "t" i)}) (range 50)))
+    (let [passes (atom 0)
+          eav-delta @#'dha/eav-delta
+          counted (fn [f] (reset! passes 0)
+                    (with-redefs [dha/eav-delta (fn [& args] (swap! passes inc) (apply eav-delta args))]
+                      (f))
+                    @passes)]
+      (testing "the parent did not move: one pass for the gate and the merge together"
+        (p/branch! sys :one)
+        (d/transact (:conn (p/checkout sys :one)) [{:note/id "a" :note/text "from one"}])
+        (is (= 1 (counted (fn []
+                            (is (= [] (p/conflicts sys (p/snapshot-id sys)
+                                                   (p/snapshot-id (p/checkout sys :one)))))
+                            (p/merge! sys :one))))))
+      (testing "the parent moved: its own delta, once, and the branch's, once"
+        (p/branch! sys :two)
+        (d/transact (:conn (p/checkout sys :two)) [{:note/id "b" :note/text "from two"}])
+        (d/transact *conn* [{:note/id "c" :note/text "on the parent"}])
+        (is (= 2 (counted (fn []
+                            (is (= [] (p/conflicts sys (p/snapshot-id sys)
+                                                   (p/snapshot-id (p/checkout sys :two)))))
+                            (p/merge! sys :two))))))
+      (is (= #{"a" "b" "c"}
+             (set (d/q '[:find [?id ...] :where [_ :note/id ?id] [(re-matches #"[abc]" ?id)]] @*conn*)))))))
