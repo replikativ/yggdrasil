@@ -150,6 +150,8 @@
               [?a :db/cardinality :db.cardinality/many]]
             db)))
 
+(declare eav-delta)
+
 (defn- compute-conflicts
   "Precise 3-way conflicts for semantic entities and anonymous entities inherited
    from BASE. A cardinality-one attr conflicts when both descendants changed it
@@ -163,213 +165,274 @@
    Identity-bearing entities are addressed by a lookup ref. An anonymous base
    entity is addressed by the opaque descriptor [:yggdrasil/base-eid e]. Newly
    created anonymous entities on sibling branches are deliberately unrelated,
-   even when Datahike happened to allocate the same numeric eid."
-  [base-db ours-db theirs-db]
-  (let [{base-unique :unique base-ref :ref} (schema-attrs base-db)
-        {ours-unique :unique ours-ref :ref} (schema-attrs ours-db)
-        {theirs-unique :unique theirs-ref :ref} (schema-attrs theirs-db)
-        unique  (into base-unique (concat ours-unique theirs-unique))
-        ref      (into base-ref (concat ours-ref theirs-ref))
-        cattrs   (into (card-one-attrs base-db)
-                       (concat (card-one-attrs ours-db)
-                               (card-one-attrs theirs-db)))
-        mattrs   (into (card-many-attrs base-db)
-                       (concat (card-many-attrs ours-db)
-                               (card-many-attrs theirs-db)))
-        exists?  (fn [db e] (and e (seq (d/datoms db :eavt e))))
-        find-e   (fn [db [ua uv]]
-                   (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
-        identities
-        (set (mapcat (fn [db]
-                       (for [ua unique
-                             [_e uv] (d/q '[:find ?e ?uv :in $ ?ua
-                                            :where [?e ?ua ?uv]] db ua)]
-                         [ua uv]))
-                     [base-db ours-db theirs-db]))
-        base-anonymous
-        (->> (d/datoms base-db :eavt)
-             (keep (fn [dt]
-                     (let [e (:e dt) a (:a dt)]
-                       (when (and (not= :db/txInstant a)
-                                  (not= "db" (namespace a))
-                                  (nil? (entity-ident base-db unique e)))
-                         e))))
-             set)
-        specs    (concat
-                  (map (fn [ident]
-                         {:descriptor ident
-                          :base-e (find-e base-db ident)})
-                       identities)
-                  (map (fn [e]
-                         {:descriptor [:yggdrasil/base-eid e]
-                          :base-e e
-                          :anonymous? true})
-                       base-anonymous))
-        branch-e (fn [db {:keys [descriptor base-e anonymous?]}]
-                   (if anonymous?
-                     (when (exists? db base-e) base-e)
-                     (find-e db descriptor)))
+   even when Datahike happened to allocate the same numeric eid.
+
+   `scope` is what each descendant changed, `{:ours (eav-delta ours base)
+   :theirs (eav-delta theirs base)}` (the default), or `:exhaustive`. The rules
+   above are stated over every entity, and `:exhaustive` evaluates them so: that
+   is the specification, and it costs several queries per entity of the
+   database. Scoped, the same rules run where a conflict can arise at all: a
+   value or tombstone conflict needs BOTH descendants to have changed the
+   entity, a deleted-referent conflict needs a reference ADDED since BASE, a
+   split identity needs a changed identity datom. A merge of a small branch
+   into an unchanged parent then costs what the branch changed."
+  ([base-db ours-db theirs-db]
+   (compute-conflicts base-db ours-db theirs-db
+                      {:ours (eav-delta ours-db base-db)
+                       :theirs (eav-delta theirs-db base-db)}))
+  ([base-db ours-db theirs-db scope]
+   (let [scoped? (map? scope)
+         {base-unique :unique base-ref :ref} (schema-attrs base-db)
+         {ours-unique :unique ours-ref :ref} (schema-attrs ours-db)
+         {theirs-unique :unique theirs-ref :ref} (schema-attrs theirs-db)
+         unique  (into base-unique (concat ours-unique theirs-unique))
+         ref      (into base-ref (concat ours-ref theirs-ref))
+         cattrs   (into (card-one-attrs base-db)
+                        (concat (card-one-attrs ours-db)
+                                (card-one-attrs theirs-db)))
+         mattrs   (into (card-many-attrs base-db)
+                        (concat (card-many-attrs ours-db)
+                                (card-many-attrs theirs-db)))
+         exists?  (fn [db e] (and e (seq (d/datoms db :eavt e))))
+         find-e   (fn [db [ua uv]]
+                    (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
+         semantic? (fn [a] (and (not= :db/txInstant a) (not= "db" (namespace a))))
+         idents-of (fn [db e]
+                     (let [ent (d/entity db e)]
+                       (keep (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
+        ;; Every descriptor the entities ONE descendant changed answer to: their
+        ;; identities in BASE and in the descendant, and the base eid of an
+        ;; entity BASE holds anonymously.
+         touched
+         (fn [db delta]
+           (into #{}
+                 (mapcat (fn [e]
+                           (concat (when (exists? base-db e) (idents-of base-db e))
+                                   (when (exists? db e) (idents-of db e))
+                                   (when (and (exists? base-db e)
+                                              (nil? (entity-ident base-db unique e)))
+                                     [[:yggdrasil/base-eid e]]))))
+                 (into #{} (comp (filter #(semantic? (second %))) (map first))
+                       (concat (:only-a delta) (:only-b delta)))))
+         identities
+         (if scoped?
+           (let [theirs (touched theirs-db (:theirs scope))]
+             (into #{} (comp (filter theirs) (remove #(= :yggdrasil/base-eid (first %))))
+                   (touched ours-db (:ours scope))))
+           (set (mapcat (fn [db]
+                          (for [ua unique
+                                [_e uv] (d/q '[:find ?e ?uv :in $ ?ua
+                                               :where [?e ?ua ?uv]] db ua)]
+                            [ua uv]))
+                        [base-db ours-db theirs-db])))
+         base-anonymous
+         (if scoped?
+           (let [theirs (touched theirs-db (:theirs scope))]
+             (into #{} (comp (filter theirs) (filter #(= :yggdrasil/base-eid (first %))) (map second))
+                   (touched ours-db (:ours scope))))
+           (->> (d/datoms base-db :eavt)
+                (keep (fn [dt]
+                        (let [e (:e dt) a (:a dt)]
+                          (when (and (semantic? a)
+                                     (nil? (entity-ident base-db unique e)))
+                            e))))
+                set))
+         specs    (concat
+                   (map (fn [ident]
+                          {:descriptor ident
+                           :base-e (find-e base-db ident)})
+                        identities)
+                   (map (fn [e]
+                          {:descriptor [:yggdrasil/base-eid e]
+                           :base-e e
+                           :anonymous? true})
+                        base-anonymous))
+         branch-e (fn [db {:keys [descriptor base-e anonymous?]}]
+                    (if anonymous?
+                      (when (exists? db base-e) base-e)
+                      (find-e db descriptor)))
         ;; Entity objects belong to one immutable DB value and are never equal
         ;; across descendants. Canonicalize refs to semantic identities, shared
         ;; base eids, or side-qualified branch-local eids.
-        canonical-ref
-        (fn [db side e]
+         canonical-ref
+         (fn [db side e]
           ;; The identity an inherited anonymous entity gains in only one
           ;; descendant does not change the semantic identity of references
           ;; that already pointed at it in BASE. Prefer BASE's classification.
-          (or (entity-ident base-db unique e)
-              (when (exists? base-db e) [:yggdrasil/base-eid e])
-              (entity-ident db unique e)
-              [:yggdrasil/branch-eid side e]))
-        valof    (fn [db side e a]
-                   (when e
-                     (let [values (map (fn [dt]
-                                         (let [v (:v dt)]
-                                           (if (and (ref a) (integer? v))
-                                             (canonical-ref db side v)
-                                             v)))
-                                       (d/datoms db :eavt e a))]
-                       (if (mattrs a)
-                         (set values)
-                         (first values)))))
-        spec-of   (fn [db side e]
+           (or (entity-ident base-db unique e)
+               (when (exists? base-db e) [:yggdrasil/base-eid e])
+               (entity-ident db unique e)
+               [:yggdrasil/branch-eid side e]))
+         valof    (fn [db side e a]
+                    (when e
+                      (let [values (map (fn [dt]
+                                          (let [v (:v dt)]
+                                            (if (and (ref a) (integer? v))
+                                              (canonical-ref db side v)
+                                              v)))
+                                        (d/datoms db :eavt e a))]
+                        (if (mattrs a)
+                          (set values)
+                          (first values)))))
+         spec-of   (fn [db side e]
                     ;; Prefer the BASE classification. An inherited anonymous
                     ;; entity may acquire a unique identity on one branch, but
                     ;; it is still the same pre-fork object for this merge.
-                    (if-let [ident (entity-ident base-db unique e)]
-                      {:descriptor ident :base-e e}
-                      (if (exists? base-db e)
-                        {:descriptor [:yggdrasil/base-eid e]
-                         :base-e e :anonymous? true}
-                        (if-let [ident (entity-ident db unique e)]
-                          {:descriptor ident :base-e (find-e base-db ident)}
-                          {:descriptor [:yggdrasil/branch-eid side e]}))))
-        descriptor-e
-        (fn [db descriptor]
-          (case (first descriptor)
-            :yggdrasil/base-eid
-            (let [e (second descriptor)] (when (exists? db e) e))
-            :yggdrasil/branch-eid nil
-            (find-e db descriptor)))
-        ordinary
-        (for [spec specs
-              :let  [eb (:base-e spec)
-                     eo (branch-e ours-db spec)
-                     et (branch-e theirs-db spec)
+                     (if-let [ident (entity-ident base-db unique e)]
+                       {:descriptor ident :base-e e}
+                       (if (exists? base-db e)
+                         {:descriptor [:yggdrasil/base-eid e]
+                          :base-e e :anonymous? true}
+                         (if-let [ident (entity-ident db unique e)]
+                           {:descriptor ident :base-e (find-e base-db ident)}
+                           {:descriptor [:yggdrasil/branch-eid side e]}))))
+         descriptor-e
+         (fn [db descriptor]
+           (case (first descriptor)
+             :yggdrasil/base-eid
+             (let [e (second descriptor)] (when (exists? db e) e))
+             :yggdrasil/branch-eid nil
+             (find-e db descriptor)))
+         ordinary
+         (for [spec specs
+               :let  [eb (:base-e spec)
+                      eo (branch-e ours-db spec)
+                      et (branch-e theirs-db spec)
                      ;; Cardinality-many values union unless deletion of the
                      ;; containing entity competes with a modification. In that
                      ;; case silently preserving only the added datom would create
                      ;; an orphan, so include many attrs in the conflict test.
-                     attrs (if (and eb (or (nil? eo) (nil? et)))
-                             (into cattrs mattrs)
-                             cattrs)]
-              a     attrs
-              :let  [bv (valof base-db :base eb a)
-                     ov (valof ours-db :ours eo a)
-                     tv (valof theirs-db :theirs et a)]
-              :let  [attribute-conflict?
-                     (and (not= ov bv) (not= tv bv) (not= ov tv))
-                     tombstone-conflict?
-                     (and eb
+                      attrs (if (and eb (or (nil? eo) (nil? et)))
+                              (into cattrs mattrs)
+                              cattrs)]
+               a     attrs
+               :let  [bv (valof base-db :base eb a)
+                      ov (valof ours-db :ours eo a)
+                      tv (valof theirs-db :theirs et a)]
+               :let  [attribute-conflict?
+                      (and (not= ov bv) (not= tv bv) (not= ov tv))
+                      tombstone-conflict?
+                      (and eb
                           ;; Exactly one descendant deleted the BASE entity. The
                           ;; survivor's value differing from BASE is a concurrent
                           ;; modification even when BASE had no value for `a`.
-                          (not= (some? eo) (some? et))
-                          (not= (if eo ov tv) bv))]
+                           (not= (some? eo) (some? et))
+                           (not= (if eo ov tv) bv))]
               ;; both sides changed the attribute differently, or one deleted the
               ;; entity while the survivor changed this attribute …
-              :when (and (or attribute-conflict? tombstone-conflict?)
+               :when (and (or attribute-conflict? tombstone-conflict?)
                          ;; … but a temporal attr both sides merely advanced
                          ;; (updated-at, last-seen) is churn, not a semantic clash —
                          ;; the union takes the later value, no reconciliation needed.
-                         (not (and (inst? ov) (inst? tv))))]
-          {:entity (:descriptor spec) :attr a :base bv :ours ov :theirs tv})
-        incoming-ref-conflicts
-        (fn [source-db source-side deleted-db]
-          (for [dt (d/datoms source-db :eavt)
-                :let [e (:e dt) a (:a dt) v (:v dt)]
-                :when (and (ref a) (integer? v)
-                           (not= "db" (namespace a)))
-                :let [subject (spec-of source-db source-side e)
-                      referent (canonical-ref source-db source-side v)
-                      base-referent (descriptor-e base-db referent)
-                      base-value (valof base-db :base (:base-e subject) a)
-                      source-value (valof source-db source-side e a)
-                      added? (if (mattrs a)
-                               (and (contains? source-value referent)
-                                    (not (contains? (or base-value #{}) referent)))
-                               (and (= referent source-value)
-                                    (not= referent base-value)))]
+                          (not (and (inst? ov) (inst? tv))))]
+           {:entity (:descriptor spec) :attr a :base bv :ours ov :theirs tv})
+         incoming-ref-conflicts
+         (fn [source-db source-side deleted-db]
+          ;; `added?` below holds only for a reference BASE does not have
+           (for [[e a v] (if scoped?
+                           (:only-a (get scope source-side))
+                           (map (fn [dt] [(:e dt) (:a dt) (:v dt)]) (d/datoms source-db :eavt)))
+                 :when (and (ref a) (integer? v)
+                            (not= "db" (namespace a)))
+                 :let [subject (spec-of source-db source-side e)
+                       referent (canonical-ref source-db source-side v)
+                       base-referent (descriptor-e base-db referent)
+                       base-value (valof base-db :base (:base-e subject) a)
+                       source-value (valof source-db source-side e a)
+                       added? (if (mattrs a)
+                                (and (contains? source-value referent)
+                                     (not (contains? (or base-value #{}) referent)))
+                                (and (= referent source-value)
+                                     (not= referent base-value)))]
                 ;; Adding an incoming edge and deleting its inherited referent
                 ;; are changes to different subjects, so the ordinary per-entity
                 ;; tombstone test cannot see their interaction. Never translate
                 ;; that missing referent to a fresh, empty tempid.
-                :when (and base-referent added?
-                           (nil? (descriptor-e deleted-db referent)))]
-            {:entity (:descriptor subject)
-             :attr a
-             :base base-value
-             :source source-value
-             :deleted-referent referent}))
-        ref-conflicts
-        (concat
-         (map (fn [{:keys [entity attr base source deleted-referent]}]
-                {:entity entity :attr attr :base base
-                 :ours source :theirs nil
-                 :reason :deleted-referent :referent deleted-referent})
-              (incoming-ref-conflicts ours-db :ours theirs-db))
-         (map (fn [{:keys [entity attr base source deleted-referent]}]
-                {:entity entity :attr attr :base base
-                 :ours nil :theirs source
-                 :reason :deleted-referent :referent deleted-referent})
-              (incoming-ref-conflicts theirs-db :theirs ours-db)))
-        identity-groups
-        (fn [db]
-          (->> unique
-               (mapcat (fn [ua]
-                         (d/q '[:find ?e ?ua ?uv
-                                :in $ ?ua
-                                :where [?e ?ua ?uv]]
-                              db ua)))
-               (group-by first)
-               vals
-               (mapv (fn [rows]
-                       (set (map (fn [[_ ua uv]] [ua uv]) rows))))))
-        base-groups (identity-groups base-db)
-        ours-groups (identity-groups ours-db)
-        theirs-groups (identity-groups theirs-db)
-        partition-view
-        (fn [groups identities]
-          (->> groups
-               (map #(set (filter identities %)))
-               (remove empty?)
-               distinct
-               (sort-by pr-str)
-               vec))
-        split-conflicts
-        (fn [source-groups target-groups source-key target-key]
-          (for [identities source-groups
-                :when (> (count identities) 1)
-                :let [target-view (partition-view target-groups identities)]
+                 :when (and base-referent added?
+                            (nil? (descriptor-e deleted-db referent)))]
+             {:entity (:descriptor subject)
+              :attr a
+              :base base-value
+              :source source-value
+              :deleted-referent referent}))
+         ref-conflicts
+         (concat
+          (map (fn [{:keys [entity attr base source deleted-referent]}]
+                 {:entity entity :attr attr :base base
+                  :ours source :theirs nil
+                  :reason :deleted-referent :referent deleted-referent})
+               (incoming-ref-conflicts ours-db :ours theirs-db))
+          (map (fn [{:keys [entity attr base source deleted-referent]}]
+                 {:entity entity :attr attr :base base
+                  :ours nil :theirs source
+                  :reason :deleted-referent :referent deleted-referent})
+               (incoming-ref-conflicts theirs-db :theirs ours-db)))
+         identity-groups
+         (fn [db]
+           (->> unique
+                (mapcat (fn [ua]
+                          (d/q '[:find ?e ?ua ?uv
+                                 :in $ ?ua
+                                 :where [?e ?ua ?uv]]
+                               db ua)))
+                (group-by first)
+                vals
+                (mapv (fn [rows]
+                        (set (map (fn [[_ ua uv]] [ua uv]) rows))))))
+        ;; Scoped: an identity group can split only where an identity datom
+        ;; changed; the groups of those identities, and in the other dbs the
+        ;; groups of everything they hold.
+         changed-identities
+         (when scoped?
+           (into #{}
+                 (comp (mapcat (fn [delta] (concat (:only-a delta) (:only-b delta))))
+                       (filter #(unique (second %)))
+                       (map (fn [[_ a v]] [a v])))
+                 [(:ours scope) (:theirs scope)]))
+         groups-of
+         (fn [db identities]
+           (->> identities
+                (keep #(find-e db %))
+                distinct
+                (mapv #(set (idents-of db %)))))
+         partition-view
+         (fn [groups identities]
+           (->> groups
+                (map #(set (filter identities %)))
+                (remove empty?)
+                distinct
+                (sort-by pr-str)
+                vec))
+         split-conflicts
+         (fn [source-db target-db source-key target-key]
+           (let [source-groups (if scoped?
+                                 (groups-of source-db changed-identities)
+                                 (identity-groups source-db))
+                 held (reduce into #{} source-groups)
+                 target-groups (if scoped? (groups-of target-db held) (identity-groups target-db))
+                 base-groups (if scoped? (groups-of base-db held) (identity-groups base-db))]
+             (for [identities source-groups
+                   :when (> (count identities) 1)
+                   :let [target-view (partition-view target-groups identities)]
                 ;; A missing identity is an ordinary one-sided addition. The
                 ;; structural conflict is specifically that TARGET already
                 ;; resolves every identity, but to several distinct entities.
-                :when (and (= identities (reduce into #{} target-view))
-                           (> (count target-view) 1))
-                :let [source-view [(set identities)]
-                      base-view (partition-view base-groups identities)]]
-            (merge {:entity (first (sort-by pr-str identities))
-                    :attr :db.unique/identity
-                    :base base-view
-                    :reason :split-identity
-                    :identities (vec (sort-by pr-str identities))}
-                   {source-key source-view target-key target-view})))
-        structural-conflicts
-        (concat (split-conflicts ours-groups theirs-groups :ours :theirs)
-                (split-conflicts theirs-groups ours-groups :theirs :ours))]
-    (->> (concat ordinary ref-conflicts structural-conflicts)
-         distinct
-         vec)))
+                   :when (and (= identities (reduce into #{} target-view))
+                              (> (count target-view) 1))
+                   :let [source-view [(set identities)]
+                         base-view (partition-view base-groups identities)]]
+               (merge {:entity (first (sort-by pr-str identities))
+                       :attr :db.unique/identity
+                       :base base-view
+                       :reason :split-identity
+                       :identities (vec (sort-by pr-str identities))}
+                      {source-key source-view target-key target-view}))))
+         structural-conflicts
+         (concat (split-conflicts ours-db theirs-db :ours :theirs)
+                 (split-conflicts theirs-db ours-db :theirs :ours))]
+     (->> (concat ordinary ref-conflicts structural-conflicts)
+          distinct
+          vec))))
 
 (defn- compute-conflicts-baseless
   "Conservative 2-way conflict set, used when the merge-base is UNAVAILABLE — e.g.
@@ -402,6 +465,52 @@
                       (not (and (inst? ov) (inst? tv))))]
        {:entity [ua uv] :attr a :base :unavailable :ours ov :theirs tv}))))
 
+(defn- eav-delta
+  "What two db values do not share, as raw `[e a v]`:
+   `{:only-a [...] :only-b [...]}`.
+
+   One linear pass over both EAVT indexes, joined on the entity id (the one
+   ordering both certainly share), no index seek per datom. An unchanged
+   entity is compared datom by datom in index order and costs nothing more;
+   only an entity that differs is diffed as a set. A db and its descendant
+   share almost everything, so the result is the branch's own work: a merge
+   that inspects only this costs what the branch changed, not what the
+   database holds.
+
+   A SUPERSET filter, not a verdict: values that do not compare with `=`
+   (arrays) appear on both sides, and the callers' own predicates decide."
+  [a-db b-db]
+  (let [take-e (fn [datoms e]
+                 (loop [ds datoms acc (transient [])]
+                   (if (and ds (= e (:e (first ds))))
+                     (recur (next ds) (conj! acc (first ds)))
+                     [(persistent! acc) ds])))
+        same?  (fn [xs ys]
+                 (and (= (count xs) (count ys))
+                      (every? true? (map (fn [x y] (and (= (:a x) (:a y)) (= (:v x) (:v y))))
+                                         xs ys))))
+        minus  (fn [xs ys]
+                 (let [held (into #{} (map (juxt :a :v)) ys)]
+                   (into [] (comp (remove #(held [(:a %) (:v %)]))
+                                  (map (fn [dt] [(:e dt) (:a dt) (:v dt)])))
+                         xs)))]
+    (loop [as (seq (d/datoms a-db :eavt))
+           bs (seq (d/datoms b-db :eavt))
+           only-a (transient [])
+           only-b (transient [])]
+      (if (and (nil? as) (nil? bs))
+        {:only-a (persistent! only-a) :only-b (persistent! only-b)}
+        (let [ea (some-> as first :e)
+              eb (some-> bs first :e)
+              e  (cond (nil? ea) eb (nil? eb) ea :else (min ea eb))
+              [xs as'] (if (= e ea) (take-e as e) [[] as])
+              [ys bs'] (if (= e eb) (take-e bs e) [[] bs])]
+          (if (same? xs ys)
+            (recur as' bs' only-a only-b)
+            (recur as' bs'
+                   (reduce conj! only-a (minus xs ys))
+                   (reduce conj! only-b (minus ys xs)))))))))
+
 (defn- compute-merge-tx
   "Merge tx-data for datoms in source not in target, addressed by SEMANTIC
    identity so concurrent branches union instead of colliding on entity-id.
@@ -419,35 +528,38 @@
    is asserted onto that entity; an identity already owned by another target
    entity is omitted because `compute-conflicts` reports that split identity
    explicitly. This avoids both silent identity loss and conflicting upserts."
-  [source-db target-db base-db]
-  (let [{:keys [unique ref]} (schema-attrs source-db)
-        tgt-eid    (memoize
-                    (fn [[ua uv]]
-                      (d/q '[:find ?t . :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv)))
-        in-target? (fn [ua uv] (some? (tgt-eid [ua uv])))
-        idents     (fn [e] (let [ent (d/entity source-db e)]
-                             (keep (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
+  ([source-db target-db base-db]
+   (compute-merge-tx source-db target-db base-db
+                     (when base-db (eav-delta source-db base-db))))
+  ([source-db target-db base-db delta]
+   (let [{:keys [unique ref]} (schema-attrs source-db)
+         tgt-eid    (memoize
+                     (fn [[ua uv]]
+                       (d/q '[:find ?t . :in $ ?ua ?uv :where [?t ?ua ?uv]] target-db ua uv)))
+         in-target? (fn [ua uv] (some? (tgt-eid [ua uv])))
+         idents     (fn [e] (let [ent (d/entity source-db e)]
+                              (keep (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
         ;; the TARGET entity a source entity denotes, via shared identity
-        tgt-of     (memoize (fn [e] (some tgt-eid (idents e))))
+         tgt-of     (memoize (fn [e] (some tgt-eid (idents e))))
         ;; Entity ids allocated before the fork denote the same anonymous
         ;; component on both descendants. New anonymous entities cannot be
         ;; addressed by raw eid because sibling branches may reuse that number.
-        base-e?    (memoize
-                    (fn [e]
-                      (and base-db
-                           (boolean (seq (d/datoms base-db :eavt e))))))
-        target-e?  (memoize
-                    (fn [e]
-                      (boolean (seq (d/datoms target-db :eavt e)))))
-        addr       (fn [e]
+         base-e?    (memoize
+                     (fn [e]
+                       (and base-db
+                            (boolean (seq (d/datoms base-db :eavt e))))))
+         target-e?  (memoize
+                     (fn [e]
+                       (boolean (seq (d/datoms target-db :eavt e)))))
+         addr       (fn [e]
                      ;; prefer an identity that ALREADY exists in target (→ that
                      ;; entity); else a fresh tempid (new/anonymous)
-                     (let [ids (idents e)]
-                       (if-let [ex (first (filter (fn [[ua uv]] (in-target? ua uv)) ids))]
-                         (vec ex)
-                         (if (and (base-e? e) (target-e? e))
-                           e
-                           (str "ygg-tmp-" e)))))
+                      (let [ids (idents e)]
+                        (if-let [ex (first (filter (fn [[ua uv]] (in-target? ua uv)) ids))]
+                          (vec ex)
+                          (if (and (base-e? e) (target-e? e))
+                            e
+                            (str "ygg-tmp-" e)))))
         ;; SELECTION IS BY IDENTITY, NOT ENTITY ID.
         ;;
         ;; This used to ask datalog for datoms in source `(not [$target ?e ?a ?v])`
@@ -467,26 +579,32 @@
         ;; for branch-created entities. An anonymous entity inherited from the
         ;; merge base is safely matched by its shared pre-fork eid; only newly
         ;; created anonymous entities remain deliberately unmatchable.
-        present?   (fn [e a v]
-                     (when-let [te (or (tgt-of e)
-                                       (when (and (base-e? e) (target-e? e)) e))]
-                       (let [tv (if (and (ref a) (integer? v))
-                                  (or (tgt-of v)
-                                      (when (and (base-e? v) (target-e? v)) v))
-                                  v)]
-                         (and (some? tv)
-                              (boolean (seq (d/datoms target-db :eavt te a tv)))))))
-        changed?   (fn [e a v]
+         present?   (fn [e a v]
+                      (when-let [te (or (tgt-of e)
+                                        (when (and (base-e? e) (target-e? e)) e))]
+                        (let [tv (if (and (ref a) (integer? v))
+                                   (or (tgt-of v)
+                                       (when (and (base-e? v) (target-e? v)) v))
+                                   v)]
+                          (and (some? tv)
+                               (boolean (seq (d/datoms target-db :eavt te a tv)))))))
+         changed?   (fn [e a v]
                      ;; True three-way selection: an unchanged source datom is
                      ;; not an addition merely because TARGET edited or deleted
                      ;; it. Entity ids for all base datoms are stable across
                      ;; descendants; branch-created entities never occur here.
-                     (or (nil? base-db)
-                         (empty? (d/datoms base-db :eavt e a v))))
-        diff       (->> (d/datoms source-db :eavt)
-                        (keep (fn [dt]
-                                (let [e (:e dt) a (:a dt) v (:v dt)]
-                                  (when (and (not= :db/txInstant a)
+                      (or (nil? base-db)
+                          (empty? (d/datoms base-db :eavt e a v))))
+        ;; With a merge base only what SOURCE holds and BASE does not can be an
+        ;; addition (`changed?` below is that test, datom by datom); `delta`
+        ;; has it from one linear pass instead of a base-index seek per
+        ;; source datom. Baseless, every source datom is a candidate.
+         candidates (if delta
+                      (:only-a delta)
+                      (map (fn [dt] [(:e dt) (:a dt) (:v dt)]) (d/datoms source-db :eavt)))
+         diff       (->> candidates
+                         (keep (fn [[e a v]]
+                                 (when (and (not= :db/txInstant a)
                                              ;; NEVER merge SCHEMA as data: a `:db/*`
                                              ;; datom is an attribute/enum definition.
                                              ;; Re-transacting it as flat data upserts a
@@ -494,20 +612,20 @@
                                              ;; aborts the whole merge. Schema is
                                              ;; installed at startup and shared by parent
                                              ;; + fork — leave it alone.
-                                             (not= "db" (namespace a))
-                                             (changed? e a v)
-                                             (not (present? e a v)))
-                                    [e a v])))))]
-    (vec (for [[e a v] diff
-               :let  [subj (addr e)]
+                                            (not= "db" (namespace a))
+                                            (changed? e a v)
+                                            (not (present? e a v)))
+                                   [e a v]))))]
+     (vec (for [[e a v] diff
+                :let  [subj (addr e)]
                ;; A source entity may gain another unique identity after the
                ;; fork. Preserve that one-sided addition. Only omit the add when
                ;; TARGET already assigns the value somewhere: `present?` removed
                ;; the same-entity case, while `compute-conflicts` exposes the
                ;; remaining split-entity case for explicit resolution.
-               :when (not (and (vector? subj) (unique a) (in-target? a v)))
-               :let  [val (if (and (ref a) (integer? v)) (addr v) v)]]
-           [:db/add subj a val]))))
+                :when (not (and (vector? subj) (unique a) (in-target? a v)))
+                :let  [val (if (and (ref a) (integer? v)) (addr v) v)]]
+            [:db/add subj a val])))))
 
 (defn- compute-merge-retractions
   "3-way retraction tx-data: datoms present in BASE and still in TARGET but
@@ -519,47 +637,52 @@
    Subjects and ref values are addressed by :db.unique/identity lookup in
    TARGET, or by their shared raw eid when they are anonymous entities inherited
    from BASE. Branch-created anonymous entities cannot occur in BASE."
-  [base-db source-db target-db]
-  (let [{:keys [unique ref]} (schema-attrs base-db)
-        ident-of (fn [db e]
-                   (let [ent (d/entity db e)]
-                     (some (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
-        find-e   (fn [db [ua uv]]
-                   (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
-        source-e? (fn [e] (boolean (seq (d/datoms source-db :eavt e))))
-        target-e? (fn [e] (boolean (seq (d/datoms target-db :eavt e))))
-        source-address (fn [e]
-                         (or (some->> (ident-of base-db e) (find-e source-db))
-                             (when (source-e? e) e)))
-        source-present?
-        (fn [e a v]
-          (when-let [se (source-address e)]
-            (let [sv (if (and (ref a) (integer? v))
-                       (source-address v)
-                       v)]
-              (and (some? sv)
-                   (seq (d/datoms source-db :eavt se a sv))))))
-        deleted  (->> (d/datoms base-db :eavt)
-                      (keep (fn [dt]
-                              (let [e (:e dt) a (:a dt) v (:v dt)]
-                                (when (and (not= :db/txInstant a)
-                                           (not= "db" (namespace a))
-                                           (not (source-present? e a v)))
-                                  [e a v])))))]
-    (vec (for [[e a v] deleted
-               :let  [subj-id (ident-of base-db e)
-                      te      (or (some->> subj-id (find-e target-db))
-                                  (when (target-e? e) e))]
-               :when te
-               :let  [tv (if (and (ref a) (integer? v))
-                           (or (some->> (ident-of base-db v) (find-e target-db))
-                               (when (target-e? v) v))
-                           v)]
-               :when (some? tv)
+  ([base-db source-db target-db]
+   (compute-merge-retractions base-db source-db target-db (eav-delta source-db base-db)))
+  ([base-db source-db target-db delta]
+   (let [{:keys [unique ref]} (schema-attrs base-db)
+         ident-of (fn [db e]
+                    (let [ent (d/entity db e)]
+                      (some (fn [ua] (when-some [uv (get ent ua)] [ua uv])) unique)))
+         find-e   (fn [db [ua uv]]
+                    (d/q '[:find ?e . :in $ ?ua ?uv :where [?e ?ua ?uv]] db ua uv))
+         source-e? (fn [e] (boolean (seq (d/datoms source-db :eavt e))))
+         target-e? (fn [e] (boolean (seq (d/datoms target-db :eavt e))))
+         source-address (fn [e]
+                          (or (some->> (ident-of base-db e) (find-e source-db))
+                              (when (source-e? e) e)))
+         source-present?
+         (fn [e a v]
+           (when-let [se (source-address e)]
+             (let [sv (if (and (ref a) (integer? v))
+                        (source-address v)
+                        v)]
+               (and (some? sv)
+                    (seq (d/datoms source-db :eavt se a sv))))))
+        ;; Only a base datom SOURCE no longer holds under the same entity can
+        ;; have been deleted by the branch (base entity ids are stable in its
+        ;; descendants); the identity-aware test then runs on those alone, not
+        ;; on every base datom (it costs a query each).
+         deleted  (->> (:only-b delta)
+                       (keep (fn [[e a v]]
+                               (when (and (not= :db/txInstant a)
+                                          (not= "db" (namespace a))
+                                          (not (source-present? e a v)))
+                                 [e a v]))))]
+     (vec (for [[e a v] deleted
+                :let  [subj-id (ident-of base-db e)
+                       te      (or (some->> subj-id (find-e target-db))
+                                   (when (target-e? e) e))]
+                :when te
+                :let  [tv (if (and (ref a) (integer? v))
+                            (or (some->> (ident-of base-db v) (find-e target-db))
+                                (when (target-e? v) v))
+                            v)]
+                :when (some? tv)
                ;; still present in TARGET? (else nothing to retract — covers
                ;; the target-edited-since-base case)
-               :when (some #(= tv (:v %)) (d/datoms target-db :eavt te a))]
-           [:db/retract te a tv]))))
+                :when (some #(= tv (:v %)) (d/datoms target-db :eavt te a))]
+            [:db/retract te a tv])))))
 
 ;; ============================================================
 ;; History traversal (synchronous, bounded)
@@ -835,6 +958,10 @@
           parents (if (keyword? source)
                     #{source}
                     #{(if (uuid? source) source (parse-uuid (str source)))})
+          ;; A caller may replace the merge: `:tx-data` (already computed), or
+          ;; `:merge-fn`, given `{:source-db :target-db :base-db :delta}` with
+          ;; `:delta` the raw `{:only-source :only-base}` [e a v] difference of
+          ;; SOURCE and BASE (nil without a merge base), returning tx-data.
           tx-data (or (:tx-data opts)
                       (when source-branch
                         (let [source-db (dv/branch-as-db store source-branch)
@@ -849,11 +976,19 @@
                                            (catch #?(:clj Exception :cljs :default) _ nil))
                               ;; snapshot-ids are STRINGS (walk-history); resolve-db
                               ;; wants the UUID
-                              base-db (some->> base-id str parse-uuid (resolve-db store))]
-                          ;; identity-keyed (sibling-safe), not raw [:db/add e a v]
-                          (into (compute-merge-tx source-db target-db base-db)
-                                (when base-db
-                                  (compute-merge-retractions base-db source-db target-db)))))
+                              base-db (some->> base-id str parse-uuid (resolve-db store))
+                              ;; what the branch changed, once, for both passes
+                              delta (when base-db (eav-delta source-db base-db))]
+                          (if-let [merge-fn (:merge-fn opts)]
+                            (vec (merge-fn {:source-db source-db :target-db target-db
+                                            :base-db base-db
+                                            :delta (when delta
+                                                     {:only-source (:only-a delta)
+                                                      :only-base (:only-b delta)})}))
+                            ;; identity-keyed (sibling-safe), not raw [:db/add e a v]
+                            (into (compute-merge-tx source-db target-db base-db delta)
+                                  (when base-db
+                                    (compute-merge-retractions base-db source-db target-db delta))))))
                       [])]
       ;; merge routes through the datahike WRITER (genuinely async — a go-loop
       ;; transactor). On the JVM datahike's OWN sync API derefs the writer's
