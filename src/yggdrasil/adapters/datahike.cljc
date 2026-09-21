@@ -511,6 +511,35 @@
                    (reduce conj! only-a (minus xs ys))
                    (reduce conj! only-b (minus ys xs)))))))))
 
+(defonce ^:private snapshot-deltas
+  ;; {[snapshot-commit-id base-commit-id] delta}; a handful of entries
+  (atom {}))
+
+(defn- snapshot-delta
+  "`eav-delta` of a COMMITTED snapshot and its merge base, both resolved from
+   the store, remembered by their commit ids.
+
+   The conflict gate and the merge that follows it ask the same question of the
+   same two immutable snapshots; commit ids name them exactly, so the second
+   asker is answered from memory. (Never for arbitrary db values: a `db-with`
+   value carries its parent's commit id.) A snapshot that IS its base, the
+   parent that did not move since the fork, shares everything with it."
+  [db base-db]
+  (when (and db base-db)
+    (let [id (commit-id-of db)
+          base-id (commit-id-of base-db)]
+      (cond
+        ;; not both named by a commit: nothing to remember it by
+        (not (and id base-id)) (eav-delta db base-db)
+        (= (str id) (str base-id)) {:only-a [] :only-b []}
+        :else
+        (let [k [(str id) (str base-id)]]
+          (or (get @snapshot-deltas k)
+              (let [delta (eav-delta db base-db)]
+                (swap! snapshot-deltas
+                       (fn [m] (assoc (if (< (count m) 8) m {}) k delta)))
+                delta)))))))
+
 (defn- compute-merge-tx
   "Merge tx-data for datoms in source not in target, addressed by SEMANTIC
    identity so concurrent branches union instead of colliding on entity-id.
@@ -978,7 +1007,7 @@
                               ;; wants the UUID
                               base-db (some->> base-id str parse-uuid (resolve-db store))
                               ;; what the branch changed, once, for both passes
-                              delta (when base-db (eav-delta source-db base-db))]
+                              delta (snapshot-delta source-db base-db)]
                           (if-let [merge-fn (:merge-fn opts)]
                             (vec (merge-fn {:source-db source-db :target-db target-db
                                             :base-db base-db
@@ -1013,7 +1042,9 @@
           db-base (when base-id (resolve-db store base-id))]
       (cond
         ;; merge-base available → precise 3-way conflict detection.
-        (and db-a db-b db-base) (compute-conflicts db-base db-a db-b)
+        (and db-a db-b db-base) (compute-conflicts db-base db-a db-b
+                                                   {:ours (snapshot-delta db-a db-base)
+                                                    :theirs (snapshot-delta db-b db-base)})
         ;; base UNAVAILABLE (GC'd by retention, or no common ancestor) but both
         ;; heads resolve → conservative 2-way fallback, NEVER a silent `[]` that
         ;; would let the merge gate blind-merge a divergent stale fork.
