@@ -895,3 +895,147 @@
                              [?l :leg/id ?lid] (not [?l :leg/parent _])] db))
               "no orphan legs — a dropped :leg/parent leaves the row unreachable
                from its transaction, invisible to any join-based report"))))))
+
+;; ---------------------------------------------------------------------------
+;; A merge costs what the branch changed, not what the database holds.
+
+(def ^:private note-schema
+  [{:db/ident :note/id   :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :note/text :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}])
+
+(deftest eav-delta-is-what-two-db-values-do-not-share
+  (d/transact *conn* note-schema)
+  (d/transact *conn* (mapv (fn [i] {:note/id (str "n" i) :note/text (str "t" i)}) (range 200)))
+  (let [base @*conn*
+        e7   (d/q '[:find ?e . :where [?e :note/id "n7"]] base)
+        e9   (d/q '[:find ?e . :where [?e :note/id "n9"]] base)
+        fork (d/db-with base [{:note/id "new" :note/text "added"}
+                              {:note/id "n7" :note/text "edited"}
+                              [:db/retractEntity e9]])
+        strip (fn [xs] (set (remove #(= :db/txInstant (second %)) xs)))
+        {:keys [only-a only-b]} (#'dha/eav-delta fork base)]
+    (testing "only the fork holds: the new entity, and the edited value"
+      (is (some #(= [:note/id "new"] (subvec % 1)) only-a))
+      (is (some #(= [:note/text "added"] (subvec % 1)) only-a))
+      (is (contains? (strip only-a) [e7 :note/text "edited"]))
+      (is (= 3 (count (strip only-a))) "two datoms of the new note, one edited value"))
+    (testing "only the base holds: the edited value's old one, and the retracted entity"
+      (is (= #{[e7 :note/text "t7"] [e9 :note/id "n9"] [e9 :note/text "t9"]} (strip only-b))))
+    (testing "two equal db values share everything"
+      (is (= {:only-a [] :only-b []} (#'dha/eav-delta base base))))))
+
+(deftest merge-inspects-what-the-branch-changed
+  ;; The identity-aware tests of a merge cost a query or an entity per datom.
+  ;; Run over every datom of a database they made a one-row merge take seconds;
+  ;; they run over the branch's delta.
+  (let [sys (dha/create *conn* {:system-name "t"})]
+    (d/transact *conn* note-schema)
+    (d/transact *conn* (mapv (fn [i] {:note/id (str "n" i) :note/text (str "t" i)}) (range 500)))
+    (p/branch! sys :work)
+    (let [wsys (p/checkout sys :work)
+          n3   (d/q '[:find ?e . :where [?e :note/id "n3"]] @(:conn wsys))]
+      (d/transact (:conn wsys) [{:note/id "new" :note/text "added"}
+                                {:note/id "n1" :note/text "edited"}
+                                [:db/retractEntity n3]])
+      (let [queries (atom 0)
+            entities (atom 0)
+            q d/q
+            entity d/entity]
+        (with-redefs [d/q (fn [& args] (swap! queries inc) (apply q args))
+                      d/entity (fn [& args] (swap! entities inc) (apply entity args))]
+          (p/merge! sys :work))
+        (is (< @queries 40) (str @queries " queries for a three-change merge of 500 rows"))
+        (is (< @entities 40) (str @entities " entities for a three-change merge of 500 rows")))
+      (let [db @*conn*]
+        (is (= "added" (d/q '[:find ?t . :where [?e :note/id "new"] [?e :note/text ?t]] db)))
+        (is (= "edited" (d/q '[:find ?t . :where [?e :note/id "n1"] [?e :note/text ?t]] db)))
+        (is (nil? (d/q '[:find ?e . :where [?e :note/id "n3"]] db)) "the branch's deletion landed")
+        (is (= 500 (count (d/q '[:find [?id ...] :where [_ :note/id ?id]] db))))))))
+
+(deftest a-caller-can-supply-the-merge
+  (let [sys (dha/create *conn* {:system-name "t"})
+        seen (atom nil)]
+    (d/transact *conn* note-schema)
+    (d/transact *conn* [{:note/id "base" :note/text "base"}])
+    (p/branch! sys :work)
+    (let [wsys (p/checkout sys :work)]
+      (d/transact (:conn wsys) [{:note/id "a" :note/text "from the branch"}
+                                {:note/id "b" :note/text "also from the branch"}])
+      ;; a merge policy of the caller's: adopt only note "a", rewritten
+      (p/merge! sys :work
+                {:merge-fn (fn [{:keys [source-db target-db base-db delta] :as ctx}]
+                             (reset! seen {:keys (set (keys ctx))
+                                           :only-source (set (map #(nth % 2) (:only-source delta)))})
+                             (is (some? base-db))
+                             (is (some? (d/q '[:find ?e . :where [?e :note/id "a"]] source-db)))
+                             (is (nil? (d/q '[:find ?e . :where [?e :note/id "a"]] target-db)))
+                             [{:note/id "a" :note/text "adopted by policy"}])})
+      (is (= #{:source-db :target-db :base-db :delta} (:keys @seen)))
+      (is (every? (:only-source @seen) ["a" "b" "from the branch"]))
+      (let [db @*conn*]
+        (is (= "adopted by policy" (d/q '[:find ?t . :where [?e :note/id "a"] [?e :note/text ?t]] db)))
+        (is (nil? (d/q '[:find ?e . :where [?e :note/id "b"]] db)) "the policy left b out")))))
+
+(def ^:private doc-schema
+  [{:db/ident :doc/id :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :doc/alias :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :doc/title :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :doc/tags :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :doc/parent :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+   {:db/ident :doc/lines :db/valueType :db.type/ref :db/cardinality :db.cardinality/many
+    :db/isComponent true}
+   {:db/ident :line/text :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+
+(defn- random-edits
+  "A few edits a branch might make to `db`: retitle, retag, reparent, add or
+   drop an alias, rewrite or drop an anonymous line, delete a doc, add one."
+  [^java.util.Random rng db side]
+  (let [ids   (vec (sort (d/q '[:find [?id ...] :where [_ :doc/id ?id]] db)))
+        pick  (fn [] (nth ids (.nextInt rng (count ids))))
+        lines (vec (sort (d/q '[:find [?l ...] :where [_ :doc/lines ?l]] db)))]
+    (vec
+     (for [i (range (+ 1 (.nextInt rng 4)))]
+       (case (.nextInt rng 9)
+         0 {:doc/id (pick) :doc/title (str side "-title-" i)}
+         1 {:doc/id (pick) :doc/tags (str side "-tag-" i)}
+         2 {:doc/id (pick) :doc/parent [:doc/id (pick)]}
+         3 {:doc/id (pick) :doc/alias (str "alias-" (.nextInt rng 3))}
+         4 (if (seq lines)
+             {:db/id (nth lines (.nextInt rng (count lines))) :line/text (str side "-line-" i)}
+             {:doc/id (pick) :doc/title (str side "-t")})
+         5 (if (seq lines)
+             [:db/retractEntity (nth lines (.nextInt rng (count lines)))]
+             {:doc/id (pick) :doc/title (str side "-t2")})
+         6 [:db/retractEntity [:doc/id (pick)]]
+         7 {:doc/id (str side "-new-" i) :doc/title "new" :doc/parent [:doc/id (pick)]}
+         8 {:doc/id (str "shared-new-" (.nextInt rng 2)) :doc/title (str side "-made")})))))
+
+(deftest scoped-conflicts-are-the-exhaustive-ones
+  ;; `compute-conflicts` looks where a conflict can arise (what each descendant
+  ;; changed). Its `:exhaustive` mode evaluates the same rules over every entity
+  ;; and is the specification; they must agree, conflicts and none alike.
+  (d/transact *conn* doc-schema)
+  (d/transact *conn* (mapv (fn [i] {:doc/id (str "d" i) :doc/title (str "title " i)
+                                    :doc/tags ["a" "b"]
+                                    :doc/lines [{:line/text (str "l" i "-0")} {:line/text (str "l" i "-1")}]})
+                           (range 12)))
+  (d/transact *conn* [{:doc/id "d1" :doc/parent [:doc/id "d0"]}
+                      {:doc/id "d2" :doc/parent [:doc/id "d0"]}])
+  (let [base @*conn*
+        canon (fn [cs] (frequencies (map #(update % :identities vec) cs)))
+        with-conflicts (atom 0)]
+    (doseq [seed (range 120)]
+      (let [rng (java.util.Random. seed)
+            try-with (fn [db side] (try (d/db-with db (random-edits rng db side))
+                                        (catch Exception _ db)))
+            ours (try-with base "ours")
+            theirs (try-with base "theirs")
+            scoped (#'dha/compute-conflicts base ours theirs)
+            full   (#'dha/compute-conflicts base ours theirs :exhaustive)]
+        (when (seq full) (swap! with-conflicts inc))
+        (is (= (canon full) (canon scoped)) (str "seed " seed))))
+    (is (< 10 @with-conflicts) "the generator does produce conflicts to agree on")))
