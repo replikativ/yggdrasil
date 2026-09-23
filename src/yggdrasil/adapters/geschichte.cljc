@@ -216,6 +216,21 @@
 
 (declare ->GeschichteSystem)
 
+(defn- reachable?
+  "Whether `target` is `from` or one of its ancestors in `commits`."
+  [commits from target]
+  (loop [todo [from] seen #{}]
+    (if-let [id (peek todo)]
+      (cond
+        (= id target) true
+        (contains? seen id) (recur (pop todo) seen)
+        :else (recur (into (pop todo) (parents-of commits id)) (conj seen id)))
+      false)))
+
+(defn- ref-target [refs ref]
+  (let [t (get refs ref)]
+    (if (map? t) (:geschichte.commit/id t) t)))
+
 (defrecord GeschichteOverlay
            [parent local-writes workspace-branch base-snapshot mode]
   p/Overlayable
@@ -238,13 +253,40 @@
        (when-not (:clean? parent-status)
          (throw (ex-info "Cannot merge a Geschichte workspace into a dirty parent"
                          {:status parent-status})))
-       (let [{:keys [new]}
-             (await (workspace/publish! (:conn parent) (:conn @local-writes)
-                                        (select-keys opts [:ref :commit :force?])))]
-         ;; Publication intentionally transfers only immutable history + the
-         ;; canonical ref. A live parent workspace also needs its index/worktree
-         ;; advanced so virtual filesystem readers observe the merge immediately.
-         (await (repo/reset! (:conn parent) new {:mode :hard}))))
+       (let [pconn (:conn parent)
+             wconn (:conn @local-writes)
+             ref (or (:ref opts) (repo/current-ref wconn))
+             canonical (ref-target (repo/refs pconn) ref)
+             tip (ref-target (repo/refs wconn) ref)]
+         (if (or (:force? opts) (:commit opts) (nil? canonical) (nil? tip)
+                 (reachable? (commit-index wconn) tip canonical))
+           (let [{:keys [new]}
+                 (await (workspace/publish! pconn wconn
+                                            (select-keys opts [:ref :commit :force?])))]
+             ;; Publication intentionally transfers only immutable history + the
+             ;; canonical ref. A live parent workspace also needs its index/worktree
+             ;; advanced so virtual filesystem readers observe the merge immediately.
+             (await (repo/reset! pconn new {:mode :hard})))
+           ;; The parent advanced since the overlay forked: a fast-forward
+           ;; publication would be refused. Publish the overlay's tip under a
+           ;; temporary ref (transferring its history), then merge it into the
+           ;; parent's branch three-way, as `merge!` does for branches. A
+           ;; conflicting merge is refused before anything but the temporary
+           ;; ref (removed again) has changed.
+           (let [tmp (str "refs/heads/ygg-merge-down-" (random-uuid))
+                 _ (await (workspace/publish! pconn wconn {:ref tmp :commit tip :create? true}))
+                 theirs (repo/commit-by-id pconn tip)
+                 {:keys [clean? conflicts]} (await (merge-plan pconn (head pconn) theirs))]
+             (if-not clean?
+               (do (await (repo/delete-branch! pconn tmp {:force? true}))
+                   (throw (ex-info "Geschichte merge has unresolved conflicts"
+                                   {:type :geschichte/merge-conflict
+                                    :conflicts conflicts})))
+               (do (await (p/merge! (->GeschichteSystem pconn nil) tip
+                                    {:message (or (:message opts)
+                                                  (str "Merge workspace " (branch-name ref)))
+                                     :author (:author opts)}))
+                   (await (repo/delete-branch! pconn tmp {:force? true}))))))))
      ;; Spindel/Yggdrasil deliberately calls discard! after merge-down! to
      ;; dispose the overlay. Keep cleanup in that single lifecycle phase; doing
      ;; it here made merge-to-parent! attempt to delete the branch twice.
