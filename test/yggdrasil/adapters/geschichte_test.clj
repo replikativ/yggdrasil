@@ -91,6 +91,52 @@
                                     "published.txt"))))
             (is (identical? parent (p/discard! observer {})))))))))
 
+;; A parent that advanced after its overlay forked cannot take a fast-forward
+;; publication. merge-down! used to fail there ("Publication is not a
+;; fast-forward"), so a workspace fork was unmergeable once its parent moved.
+(deftest merge-down-of-a-diverged-overlay-merges-three-way
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "base.txt" "base\n" "base")
+      (let [system (gy/create conn {:system-name "demo"})
+            producer (p/overlay system {})
+            local (overlay/overlay-system producer)]
+        (commit-file! conn "parent.txt" "parent\n" "parent advances")
+        (repo/write! (:conn local) "fork.txt" (->bytes "fork\n"))
+        (repo/stage-all! (:conn local))
+        (p/commit! local "fork work")
+        (let [fork-tip (parse-uuid (p/snapshot-id local))
+              parent-tip (:geschichte.commit/id (repo/head-commit conn))
+              parent (p/merge-down! producer {})
+              head (repo/commit-by-id conn (parse-uuid (p/snapshot-id parent)))]
+          (p/discard! producer {})
+          (is (= #{fork-tip parent-tip}
+                 (set (map :geschichte.commit/id (:geschichte.commit/parents head))))
+              "a merge commit of both sides")
+          (is (= "fork\n" (text (repo/read conn "fork.txt"))))
+          (is (= "parent\n" (text (repo/read conn "parent.txt"))))
+          (is (not-any? #(str/includes? % "ygg-merge-down") (keys (repo/refs conn)))
+              "the temporary ref is gone"))))))
+
+(deftest merge-down-of-a-conflicting-diverged-overlay-is-refused
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "shared.txt" "base\n" "base")
+      (let [system (gy/create conn {:system-name "demo"})
+            producer (p/overlay system {})
+            local (overlay/overlay-system producer)]
+        (commit-file! conn "shared.txt" "parent\n" "parent edits")
+        (repo/write! (:conn local) "shared.txt" (->bytes "fork\n"))
+        (repo/stage-all! (:conn local))
+        (p/commit! local "fork edits")
+        (let [before (:geschichte.commit/id (repo/head-commit conn))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unresolved conflicts"
+                                (p/merge-down! producer {})))
+          (is (= before (:geschichte.commit/id (repo/head-commit conn))) "the parent is unchanged")
+          (is (= "parent\n" (text (repo/read conn "shared.txt"))))
+          (is (not-any? #(str/includes? % "ygg-merge-down") (keys (repo/refs conn)))))
+        (p/discard! producer {})))))
+
 ;; ============================================================
 ;; Snapshotable / Graphable
 ;; ============================================================
