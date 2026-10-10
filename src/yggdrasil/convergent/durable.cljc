@@ -25,6 +25,7 @@
    element-level join-delta. `ship!` is the store-to-store sync primitive; it
    copies only the nodes the destination is missing (incremental)."
   (:require [yggdrasil.kbridge :as kb]
+            [konserve.utils :as ku]
             [yggdrasil.storage :as store]
             [yggdrasil.convergent.dag :as dag]
             [yggdrasil.types :as t]
@@ -190,12 +191,20 @@
                        buffered  @pending
                        root-node (or (some (fn [[a n]] (when (= a root-addr) n)) buffered)
                                      #?(:clj (.root ^PersistentSortedSet s) :cljs (.-root s)))]
-                   ;; drain every buffered node EXCEPT the root → children to konserve
-                   (loop [ps (seq buffered)]
-                     (when-let [[a n] (first ps)]
-                       (when (not= a root-addr)
-                         (await (kb/k-assoc (:kv-store storage) a n kb/immutable-meta opts)))
-                       (recur (next ps))))
+                   ;; drain every buffered node EXCEPT the root → children to konserve.
+                   ;; A store that applies batches atomically gets them as ONE ordered
+                   ;; multi-assoc (one write, and one write-hook event a sync layer can
+                   ;; relay as one frame); any other store gets ordered single writes.
+                   ;; Either way they land before the caller's head-cell write, which is
+                   ;; what makes them reachable, so a torn flush leaves only orphans.
+                   (let [children (filterv (fn [[a _]] (not= a root-addr)) buffered)
+                         kv-store (:kv-store storage)]
+                     (if (and (next children) (ku/multi-key-capable? kv-store))
+                       (await (kb/k-multi-assoc kv-store children kb/immutable-meta opts))
+                       (loop [ps (seq children)]
+                         (when-let [[a n] (first ps)]
+                           (await (kb/k-assoc kv-store a n kb/immutable-meta opts))
+                           (recur (next ps))))))
                    (reset! pending nil)
                    {:root-addr root-addr :root-node root-node})))))
 
