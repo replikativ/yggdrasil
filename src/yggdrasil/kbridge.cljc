@@ -35,6 +35,14 @@
   ([store key val meta opts]
    (ca/sync-or-cps (k/assoc store key val meta opts) opts)))
 
+(defn k-multi-assoc
+  "Write the ordered `[k v]` pairs `kvs` as ONE atomic batch, each value marked with
+   `meta` (e.g. `immutable-meta`). Only for a store where `multi-key-capable?` holds;
+   konserve refuses otherwise rather than degrading to separate writes."
+  [store kvs meta opts]
+  (ca/sync-or-cps (k/multi-assoc store kvs (into {} (map (fn [[key _]] [key meta])) kvs) opts)
+                  opts))
+
 (defn k-dissoc [store key opts]
   (ca/sync-or-cps (k/dissoc store key opts) opts))
 
