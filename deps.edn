@@ -6,14 +6,12 @@
         ;; Match the Datahike commit-listener baseline. 0.5.144 provides the
         ;; canonical node handlers, MST boundary, and warm namespace loaded by
         ;; current Datahike.
-        org.replikativ/persistent-sorted-set {:mvn/version "0.5.144"
-                                              :exclusions [is.simm/partial-cps]}
+        org.replikativ/persistent-sorted-set {:mvn/version "0.5.145"}
         ;; Match current Datahike/Konserve's released hashing stack.
         org.replikativ/hasch {:mvn/version "0.4.104"}
         ;; 0.1.60 ships the optional core.async adapter (is.simm.partial-cps.core-async)
         ;; that kbridge + the storage layer delegate to.
-        ;; partial-cps moved to org.replikativ (namespaces unchanged); the old
-        ;; is.simm jar is excluded where a dependency still pulls it.
+        ;; partial-cps moved to org.replikativ (namespaces unchanged).
         org.replikativ/partial-cps {:mvn/version "0.1.68"}
         org.clojure/core.async {:mvn/version "1.6.681"}}
 
@@ -27,10 +25,10 @@
                       ;; time so yggdrasil.adapters.datahike-test can exercise it.
                       ;; Released durable writer-batch listener.
                       org.replikativ/datahike
-                      {:mvn/version "0.8.1877" :exclusions [is.simm/partial-cps]}
+                      {:mvn/version "0.8.1904"}
                       ;; geschichte is likewise an OPTIONAL adapter dep, for
                       ;; yggdrasil.adapters.geschichte-test.
-                      org.replikativ/geschichte {:mvn/version "0.1.14" :exclusions [is.simm/partial-cps]}}
+                      org.replikativ/geschichte {:mvn/version "0.1.18"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
@@ -53,10 +51,10 @@
                         ;; datahike adapter — it is the same JVM :test dep, here so
                         ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
                         org.replikativ/datahike
-                        {:mvn/version "0.8.1877" :exclusions [is.simm/partial-cps]}
+                        {:mvn/version "0.8.1904"}
                         ;; same for the (optional) geschichte adapter — the whole
                         ;; adapter is .cljc, so cljs exercises the same code.
-                        org.replikativ/geschichte {:mvn/version "0.1.14" :exclusions [is.simm/partial-cps]}}}
+                        org.replikativ/geschichte {:mvn/version "0.1.18"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
