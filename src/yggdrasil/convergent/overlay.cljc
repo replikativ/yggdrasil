@@ -66,13 +66,23 @@
 
    Use this instead of mutating `(overlay-system ov)` in place: a value-semantic
    CRDT op returns a NEW system, so the overlay (a conn over `:local-writes`) must
-   adopt it."
+   adopt it.
+
+   Seated by compare-and-set against the system `f` was given: when another
+   writer (a concurrent swap, a merge or advance joining into the overlay)
+   changed it meanwhile, `f` runs again on the new system, so no write is
+   lost. `f` must therefore be free of side effects beyond its result."
   [ov f]
   ;; the parent no longer carries a runtime mode → platform default.
   (async+sync (:sync? c/default-opts)
               (async
-               (reset! (:local-writes ov) (await (f @(:local-writes ov))))
-               ov)))
+               (let [cell (:local-writes ov)]
+                 (loop []
+                   (let [cur @cell
+                         new (await (f cur))]
+                     (if (compare-and-set! cell cur new)
+                       ov
+                       (recur))))))))
 
 (defn convergent-overlay
   "Build an Overlay over a convergent `parent`. `local-writes-system` is the
@@ -128,7 +138,14 @@
            parent (:parent ov)]
        (async+sync (:sync? opts)
                    (async
-                    (reset! (:local-writes ov) (await (c/-join @(:local-writes ov) parent opts)))
+                    ;; compare-and-set, as `overlay-swap!`: a write landing
+                    ;; during the join is kept
+                    (let [cell (:local-writes ov)]
+                      (loop []
+                        (let [cur @cell
+                              joined (await (c/-join cur parent opts))]
+                          (when-not (compare-and-set! cell cur joined)
+                            (recur)))))
                     ov)))))
 
   ;; push the overlay's isolated state back into the parent (convergent join).

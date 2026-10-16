@@ -36,3 +36,24 @@
           adv    (p/advance! ov {:message "adv"})]
       (is (not (fn? adv)) "advance! must return a value, not a partial-cps continuation")
       (is (ovl/overlay? adv) "advance! returns the overlay"))))
+
+(deftest a-concurrent-write-during-overlay-swap-is-kept
+  (testing "a write that lands while a swap computes is not overwritten: the swap retries"
+    (let [parent (-> (mem-gset "kb") (g/conj :shared))
+          ov     (p/overlay parent {:mode :following})
+          fired  (atom false)]
+      (ovl/overlay-swap! ov (fn [gs]
+                              ;; another writer lands first (once)
+                              (when (compare-and-set! fired false true)
+                                (ovl/overlay-swap! ov (fn [g2] (g/conj g2 :concurrent))))
+                              (g/conj gs :mine)))
+      (is (= #{:shared :mine :concurrent} (g/elements (ovl/overlay-value ov)))))))
+
+(deftest a-write-during-advance-is-kept
+  (testing "advance! joins by compare-and-set: a write landing during the join stays"
+    (let [parent (-> (mem-gset "kb") (g/conj :shared))
+          ov     (p/overlay parent {:mode :frozen})]
+      (ovl/overlay-swap! ov (fn [gs] (g/conj gs :before)))
+      (p/advance! ov {})
+      (ovl/overlay-swap! ov (fn [gs] (g/conj gs :after)))
+      (is (= #{:shared :before :after} (g/elements (ovl/overlay-value ov)))))))
