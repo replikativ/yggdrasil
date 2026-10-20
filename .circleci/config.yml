@@ -81,5 +81,9 @@ jobs:
             clojure -X:deps prep :aliases '[:test]'
             clojure -P -M:test
       - run:
-          name: Run git adapter tests
-          command: clojure -M:test -n yggdrasil.adapters.git-test
+          name: Run Git and historical workspace adapter tests
+          command: >-
+            clojure -M:test
+            -n yggdrasil.adapters.git-test
+            -n yggdrasil.adapters.geschichte-test
+            -n yggdrasil.historical-overlay-test
