@@ -25,10 +25,10 @@
                       ;; time so yggdrasil.adapters.datahike-test can exercise it.
                       ;; Released durable writer-batch listener.
                       org.replikativ/datahike
-                      {:mvn/version "0.8.1904"}
+                      {:mvn/version "0.8.1910"}
                       ;; geschichte is likewise an OPTIONAL adapter dep, for
                       ;; yggdrasil.adapters.geschichte-test.
-                      org.replikativ/geschichte {:mvn/version "0.1.18"}}
+                      org.replikativ/geschichte {:mvn/version "0.1.22"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
@@ -51,10 +51,10 @@
                         ;; datahike adapter — it is the same JVM :test dep, here so
                         ;; yggdrasil.adapters.datahike compiles + is exercised on cljs.
                         org.replikativ/datahike
-                        {:mvn/version "0.8.1904"}
+                        {:mvn/version "0.8.1910"}
                         ;; same for the (optional) geschichte adapter — the whole
                         ;; adapter is .cljc, so cljs exercises the same code.
-                        org.replikativ/geschichte {:mvn/version "0.1.18"}}}
+                        org.replikativ/geschichte {:mvn/version "0.1.22"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}
