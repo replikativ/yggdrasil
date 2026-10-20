@@ -7,8 +7,10 @@
    never matched its own string in a set lookup and common-ancestor always
    returned nil — silently breaking fork merge-base derivation."
   (:require [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
+            [datahike.versioning :as dv]
             [datahike.writing :as dw]
             [yggdrasil.adapters.datahike :as dha]
             [yggdrasil.convergent.overlay :as ovl]
@@ -38,6 +40,11 @@
   (d/transact *conn* [{:db/ident :historical/id :db/valueType :db.type/string
                        :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}])
   (d/transact *conn* [{:historical/id "A"}]))
+
+(defn- historical-child-config? [cfg]
+  (and (= (:store (:config @*conn*)) (:store cfg))
+       (keyword? (:branch cfg))
+       (str/starts-with? (name (:branch cfg)) "overlay-")))
 
 (deftest historical-datahike-overlay-owns-exact-branch-and-immutable-base
   (seed-historical-notes!)
@@ -81,19 +88,25 @@
   (let [sys (dha/create *conn*)
         a (p/snapshot-id sys)
         before (p/branches sys)
-        failed-branch (atom nil)]
+        failed-branch (atom nil)
+        entered (atom 0)
+        connect d/connect]
     (is (thrown? Exception (p/overlay sys {:snapshot (str (random-uuid))})))
     (is (thrown? Exception (p/overlay sys {:snapshot a :mode :following})))
     (is (= before (p/branches sys)))
     (try
       (let [error (try
-                    (with-redefs [p/checkout (fn [_ branch & _]
-                                               (reset! failed-branch branch)
-                                               (throw (ex-info "injected checkout" {})))]
+                    (with-redefs [d/connect (fn [cfg & args]
+                                              (if (historical-child-config? cfg)
+                                                (do (swap! entered inc)
+                                                    (reset! failed-branch (:branch cfg))
+                                                    (throw (ex-info "injected checkout" {})))
+                                                (apply connect cfg args)))]
                       (p/overlay sys {:snapshot a}))
                     nil
                     (catch Exception error error))]
         (is (= :yggdrasil/overlay-connection-uncertain (:type (ex-data error))))
+        (is (= 1 @entered))
         (is (= "injected checkout" (ex-message (ex-cause error))))
         (is (= @failed-branch (:branch (ex-data error))))
         (is (= (conj before @failed-branch) (p/branches sys)))
@@ -107,20 +120,25 @@
   (let [sys (dha/create *conn*)
         a (p/snapshot-id sys)
         before (p/branches sys)
-        checkout p/checkout
-        created (atom nil)]
+        connect d/connect
+        created (atom nil)
+        entered (atom 0)]
     (try
       (let [error (try
-                    (with-redefs [p/checkout (fn [s branch & args]
-                                               (let [child (apply checkout s branch args)]
-                                                 (reset! created child)
-                                                 (throw (ex-info "checkout ACK lost" {}))))]
+                    (with-redefs [d/connect (fn [cfg & args]
+                                              (let [conn (apply connect cfg args)]
+                                                (if (historical-child-config? cfg)
+                                                  (do (swap! entered inc)
+                                                      (reset! created conn)
+                                                      (throw (ex-info "checkout ACK lost" {})))
+                                                  conn)))]
                       (p/overlay sys {:snapshot a}))
                     nil
                     (catch Exception error error))
-            child @created
+            child (dha/create @created)
             branch (p/current-branch child)]
         (is (= :yggdrasil/overlay-connection-uncertain (:type (ex-data error))))
+        (is (= 1 @entered))
         (is (= "checkout ACK lost" (ex-message (ex-cause error))))
         (is (= branch (:branch (ex-data error))))
         (is (= (conj before branch) (p/branches sys)))
@@ -131,9 +149,9 @@
       (finally
         ;; Recovery here is test-owned: the injection retained the exact native
         ;; handle independently, unlike the failed constructor.
-        (when-let [child @created]
-          (let [branch (p/current-branch child)]
-            (d/release (:conn child))
+        (when-let [conn @created]
+          (let [branch (get-in @conn [:config :branch])]
+            (d/release conn)
             (p/delete-branch! sys branch)))))))
 
 (deftest historical-datahike-overlay-cleanup-failure-retains-owned-resource-identity
@@ -141,22 +159,26 @@
   (let [sys (dha/create *conn*)
         a (p/snapshot-id sys)
         owned (atom nil)
-        checkout p/checkout
-        snapshot-id p/snapshot-id]
+        snapshot-failures (atom 0)
+        cleanup-failures (atom 0)
+        commit-id @#'dha/commit-id-of]
     (try
       (let [error (try
-                    (with-redefs [p/checkout (fn [s branch & args]
-                                               (reset! owned branch)
-                                               (apply checkout s branch args))
-                                  p/snapshot-id (fn [s]
-                                                  (if (identical? sys s)
-                                                    (snapshot-id s)
-                                                    (throw (ex-info "post-checkout failure" {}))))
-                                  p/delete-branch! (fn [& _] (throw (ex-info "cleanup failed" {})))]
-                      (p/overlay sys {:snapshot a}))
+                    (with-redefs-fn
+                      {#'dha/commit-id-of (fn [db]
+                                            (if (historical-child-config? (:config db))
+                                              (do (swap! snapshot-failures inc)
+                                                  (reset! owned (get-in db [:config :branch]))
+                                                  (throw (ex-info "post-checkout failure" {})))
+                                              (commit-id db)))
+                       #'dv/delete-branch! (fn [& _]
+                                             (swap! cleanup-failures inc)
+                                             (throw (ex-info "cleanup failed" {})))}
+                      #(p/overlay sys {:snapshot a}))
                     nil
                     (catch Exception error error))]
         (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
+        (is (= 1 @snapshot-failures @cleanup-failures))
         (is (= @owned (:branch (ex-data error))))
         (is (contains? (p/branches sys) @owned))
         (is (= a (p/snapshot-id sys))))
@@ -219,14 +241,18 @@
   (seed-historical-notes!)
   (let [sys (dha/create *conn*)
         ov (p/overlay sys {:snapshot (p/snapshot-id sys)})
-        branch (p/current-branch (ovl/overlay-system ov))]
+        branch (p/current-branch (ovl/overlay-system ov))
+        entered (atom 0)]
     (try
       (let [error (try
-                    (with-redefs [p/delete-branch! (fn [& _] (throw (ex-info "delete failed" {})))]
+                    (with-redefs [dv/delete-branch! (fn [& _]
+                                                      (swap! entered inc)
+                                                      (throw (ex-info "delete failed" {})))]
                       (p/discard! ov))
                     nil
                     (catch Exception error error))]
         (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
+        (is (= 1 @entered))
         (is (= branch (:branch (ex-data error))))
         (is (contains? (p/branches sys) branch))
         (is (= #{"A"} (historical-note-ids *conn*))))

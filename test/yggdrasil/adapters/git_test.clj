@@ -224,19 +224,28 @@
       (p/commit! sys "A")
       (let [a (p/snapshot-id sys)
             before (p/branches sys)
-            checkout p/checkout
-            failed-branch (atom nil)]
+            branch-path @#'git/branch-path
+            failed-branch (atom nil)
+            entered (atom 0)]
         (is (thrown? Exception (p/overlay sys {:snapshot "missing-snapshot"})))
         (is (thrown? Exception (p/overlay sys {:snapshot a :mode :following})))
         (is (= before (p/branches sys)))
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"injected checkout"
-             (with-redefs [p/checkout (fn [s branch & args]
-                                        (if (= s sys)
-                                          (do (reset! failed-branch branch)
-                                              (throw (ex-info "injected checkout" {})))
-                                          (apply checkout s branch args)))]
-               (p/overlay sys {:snapshot a}))))
+             (with-redefs-fn
+               {#'git/branch-path
+                (fn [repo worktrees branch]
+                  (let [path (branch-path repo worktrees branch)]
+                    (when (and (= repo (:repo-path sys))
+                               (= worktrees (:worktrees-dir sys))
+                               (.startsWith ^String branch "overlay-")
+                               (.exists (java.io.File. path))
+                               (compare-and-set! entered 0 1))
+                      (reset! failed-branch (keyword branch))
+                      (throw (ex-info "injected checkout" {})))
+                    path))}
+               #(p/overlay sys {:snapshot a}))))
+        (is (= 1 @entered))
         (is (keyword? @failed-branch))
         (is (= before (p/branches sys)))
         (is (not (.exists (java.io.File. (str (:worktrees-dir sys) "/" (name @failed-branch)))))))
@@ -245,20 +254,40 @@
 (deftest historical-git-overlay-cleanup-failure-retains-owned-resource-identity
   (let [fix (make-fixture)
         sys ((:create-system fix))
-        owned (atom nil)]
+        owned (atom nil)
+        branch-path @#'git/branch-path
+        native-git @#'git/git
+        checkout-entries (atom 0)
+        cleanup-entries (atom 0)]
     (try
       ((:write-entry fix) sys "base" "A")
       (p/commit! sys "A")
       (let [a (p/snapshot-id sys)
             error (try
-                    (with-redefs [p/checkout (fn [_ branch & _]
-                                               (reset! owned branch)
-                                               (throw (ex-info "checkout failed" {})))
-                                  p/delete-branch! (fn [& _] (throw (ex-info "cleanup failed" {})))]
-                      (p/overlay sys {:snapshot a}))
+                    (with-redefs-fn
+                      {#'git/branch-path
+                       (fn [repo worktrees branch]
+                         (let [path (branch-path repo worktrees branch)]
+                           (when (and (= repo (:repo-path sys))
+                                      (= worktrees (:worktrees-dir sys))
+                                      (.startsWith ^String branch "overlay-")
+                                      (.exists (java.io.File. path))
+                                      (compare-and-set! checkout-entries 0 1))
+                             (reset! owned (keyword branch))
+                             (throw (ex-info "checkout failed" {})))
+                           path))
+                       #'git/git
+                       (fn [dir & args]
+                         (if (and (= dir (:repo-path sys))
+                                  (= ["worktree" "remove"] (vec (take 2 args))))
+                           (do (swap! cleanup-entries inc)
+                               (throw (ex-info "cleanup failed" {})))
+                           (apply native-git dir args)))}
+                      #(p/overlay sys {:snapshot a}))
                     nil
                     (catch Exception error error))]
         (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
+        (is (= 1 @checkout-entries @cleanup-entries))
         (is (= @owned (:branch (ex-data error))))
         (is (contains? (p/branches sys) @owned))
         (is (= a (p/snapshot-id sys))))
