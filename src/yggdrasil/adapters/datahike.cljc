@@ -760,12 +760,12 @@
 
 ;; `mode` is always :frozen — a versioned store can't cheaply do `:following`
 ;; (live join); a `:following` request degrades to :frozen + manual `advance!`.
-(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch mode]
+(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch mode base-snapshot owned-conn]
   p/Overlayable
-  (base-ref [_] (p/snapshot-id parent))
+  (base-ref [_] base-snapshot)
   (peek-parent [_] parent)
   (peek-parent [_ _] parent)
-  (overlay-writes [_] (p/diff parent (p/snapshot-id parent) (p/snapshot-id @local-writes)))
+  (overlay-writes [_] (p/diff parent base-snapshot (p/snapshot-id @local-writes)))
 
   ;; These chain the now-async branch!/checkout/merge!/delete-branch! — so they run
   ;; under async+sync and `await` each step (value on JVM, CPS on cljs). The composite
@@ -788,7 +788,23 @@
   (discard! [ov] (p/discard! ov nil))
   (discard! [_ opts]
     (async+sync (sync?* opts)
-                (async (await (p/delete-branch! parent fork-branch)) nil))))
+                (async
+      ;; The creation-owned connection is stable even if a caller later re-seats
+      ;; local-writes. Release while its registry entry still exists: native
+      ;; branch deletion removes that entry without shutting its writer down.
+                 (try
+                   (d/release owned-conn)
+                   (catch #?(:clj Throwable :cljs :default) error
+                     (throw (ex-info "Datahike overlay connection cleanup did not complete"
+                                     {:type :yggdrasil/overlay-cleanup-uncertain
+                                      :branch fork-branch :snapshot base-snapshot} error))))
+                 (try
+                   (await (p/delete-branch! parent fork-branch opts))
+                   (catch #?(:clj Throwable :cljs :default) error
+                     (throw (ex-info "Datahike overlay branch cleanup did not acknowledge completion"
+                                     {:type :yggdrasil/overlay-cleanup-uncertain
+                                      :branch fork-branch :snapshot base-snapshot} error))))
+                 nil))))
 
 ;; `checkout` below builds a fresh DatahikeSystem via the record's own constructor;
 ;; forward-declare it so cljs's single-pass analyzer doesn't warn :undeclared-var.
@@ -801,7 +817,8 @@
         (str "datahike:" (get-in @conn [:config :store :id]))))
   (system-type [_] :datahike)
   (capabilities [_]
-    (t/->Capabilities true true true true true false true false false))
+    (assoc (t/->Capabilities true true true true true false true false false)
+           :snapshot-overlay true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -1078,16 +1095,67 @@
   ;; native branch fork: branch+checkout a fresh overlay branch as the writable
   ;; system; `merge-down!` 3-way-merges it back, `discard!` deletes it.
   (overlay [this opts]
-    (let [s?      (sync?* opts)
-          pbranch (p/current-branch this)
-          fbranch (keyword (str "overlay-" (random-uuid)))]
-      ;; branch! + checkout are now async (value JVM / CPS cljs) — await each.
+    (let [s? (sync?* opts)
+          historical? (contains? opts :snapshot)
+          _ (when (and historical? (contains? opts :mode)
+                       (not= :frozen (:mode opts)))
+              (throw (ex-info "Historical Datahike overlays require frozen mode"
+                              {:type :yggdrasil/invalid-historical-mode})))
+          requested (when historical? (:snapshot opts))
+          requested-id (cond (uuid? requested) requested
+                             (string? requested) (parse-uuid requested)
+                             :else nil)
+          pbranch (p/current-branch this)]
       (async+sync s?
                   (async
-                   (await (p/branch! this fbranch))
-                   (let [forked (await (p/checkout this fbranch))]
-           ;; :following degrades to :frozen for a versioned store (honest fallback).
-                     (->DatahikeOverlay this (atom forked) fbranch pbranch :frozen)))))))
+        ;; Resolve branch names to an immutable commit before allocating. Do not
+        ;; pass protocol string IDs through to native branch!'s store-key lookup.
+                   (let [source (if historical?
+                                  (when (or (keyword? requested) requested-id)
+                                    (await (ca/sync-or-cps
+                                            (if (keyword? requested)
+                                              (dv/branch-as-db conn requested {:sync? s?})
+                                              (dv/commit-as-db conn requested-id {:sync? s?}))
+                                            {:sync? s?})))
+                                  @conn)
+                         base (when source (commit-id-of source))
+                         _ (when-not (uuid? base)
+                             (throw (ex-info "Unknown Datahike historical snapshot"
+                                             {:type :yggdrasil/invalid-snapshot})))
+                         fbranch (keyword (str "overlay-" (random-uuid)))
+                         connected (volatile! nil)]
+                     (try
+            ;; Keep ordinary branch-key creation working when commit-graph? is
+            ;; disabled; explicit historical UUID restoration must fail closed.
+                       (await (p/branch! this fbranch (if historical? base pbranch) {:sync? s?}))
+                       (catch #?(:clj Throwable :cljs :default) error
+                         (throw (ex-info "Datahike overlay allocation did not acknowledge completion"
+                                         {:type :yggdrasil/overlay-allocation-uncertain
+                                          :branch fbranch :snapshot (str base)} error))))
+                     (try
+                       (let [forked (await (p/checkout this fbranch {:sync? s?}))]
+                         (vreset! connected (:conn forked))
+                         (->DatahikeOverlay this (atom forked) fbranch pbranch :frozen
+                                            (p/snapshot-id forked) (:conn forked)))
+                       (catch #?(:clj Throwable :cljs :default) error
+              ;; A throwing checkout can have started a native writer before
+              ;; losing its acknowledgement. Without the exact returned conn,
+              ;; deleting the branch would erase its only recovery locator.
+                         (when-not @connected
+                           (throw (ex-info "Datahike overlay connection ownership is uncertain"
+                                           {:type :yggdrasil/overlay-connection-uncertain
+                                            :branch fbranch :parent-branch pbranch
+                                            :system-id (p/system-id this)
+                                            :snapshot (str base)} error)))
+                         (try
+                           (d/release @connected)
+                           (await (p/delete-branch! this fbranch {:sync? s?}))
+                           (catch #?(:clj Throwable :cljs :default) cleanup
+                             (throw (ex-info "Datahike overlay cleanup did not acknowledge completion"
+                                             {:type :yggdrasil/overlay-cleanup-uncertain
+                                              :branch fbranch :snapshot (str base)
+                                              :cleanup-message (ex-message cleanup)} error))))
+                         (throw error)))))))))
 
 ;; ============================================================
 ;; Constructor

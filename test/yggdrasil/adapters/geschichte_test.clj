@@ -10,7 +10,9 @@
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [geschichte.bytes :as gbytes]
+            [geschichte.query :as query]
             [geschichte.repo :as repo]
+            [geschichte.workspace :as workspace]
             [yggdrasil.adapters.geschichte :as gy]
             [yggdrasil.convergent.overlay :as overlay]
             [yggdrasil.protocols :as p]
@@ -46,6 +48,213 @@
   (repo/remove! conn path)
   (repo/stage-all! conn)
   (:geschichte.commit/id (repo/commit! conn {:message message :author "test"})))
+
+(defn- physical-view [conn]
+  (let [db @conn]
+    {:config (:config db) :head (p/snapshot-id (gy/create conn))
+     :refs (query/refs db) :work (query/worktree db) :index (query/stage db)}))
+
+(deftest historical-overlay-owns-one-private-workspace-and-leaves-parent-unchanged
+  (with-repo
+    (fn [conn]
+      (let [a (commit-file! conn "state.txt" "A" "A")
+            system (gy/create conn {:system-name "history"})]
+        (repo/write! conn "state.txt" (->bytes "B"))
+        (repo/stage! conn ["state.txt"])
+        (repo/write! conn "state.txt" (->bytes "B2") {:mode 33261})
+        (repo/write! conn "untracked.txt" (->bytes "untracked"))
+        (let [ordinary (p/overlay system {})]
+          (try
+            (let [dirty (physical-view (gy/connection ordinary))]
+              (is (= "B2" (text (repo/read (gy/connection ordinary) "state.txt"))))
+              (is (= 33261 (get-in dirty [:work "state.txt" :mode])))
+              (is (= 33188 (get-in dirty [:index "state.txt" :mode])))
+              (is (contains? (:work dirty) "untracked.txt")))
+            (commit-file! conn "state.txt" "C" "C")
+            (repo/write! conn "staged-extra.txt" (->bytes "extra"))
+            (repo/stage! conn ["staged-extra.txt"])
+            (repo/write! conn "later-untracked.txt" (->bytes "later"))
+            (let [before (physical-view conn)
+                  branches (workspace/list conn)
+                  historical (p/overlay system {:snapshot (str a) :mode :frozen})]
+              (try
+                (let [child (gy/connection historical)]
+                  (is (true? (:snapshot-overlay (p/capabilities system))))
+                  (is (not (identical? conn child)))
+                  (is (= (inc (count branches)) (count (workspace/list conn))))
+                  (is (= (str a) (p/base-ref historical)))
+                  (is (= :frozen (:mode historical)))
+                  (is (= #{"state.txt"} (set (keys (query/worktree @child)))))
+                  (is (= #{"state.txt"} (set (keys (query/stage @child)))))
+                  (is (= "A" (text (repo/read child "state.txt"))))
+                  (is (= before (physical-view conn)))
+                  (is (= "B2" (text (repo/read (gy/connection ordinary) "state.txt")))))
+                (finally (p/discard! historical {})))
+              (is (= branches (workspace/list conn)))
+              (is (= before (physical-view conn))))
+            (finally (p/discard! ordinary {}))))))))
+
+(deftest historical-base-and-nested-overlays-retain-the-canonical-commit
+  (with-repo
+    (fn [conn]
+      (let [a (commit-file! conn "base.txt" "A" "A")
+            system (gy/create conn)]
+        (commit-file! conn "parent.txt" "C" "parent C")
+        (let [historical (p/overlay system {:snapshot a})
+              child-system (overlay/overlay-system historical)
+              child (gy/connection historical)]
+          (try
+            (commit-file! conn "later.txt" "D" "parent D")
+            (is (= (str a) (p/base-ref historical)))
+            (commit-file! child "child.txt" "child" "child work")
+            (let [diff (p/diff child-system a (parse-uuid (p/snapshot-id child-system)))
+                  nested (p/overlay child-system {:snapshot a :mode :frozen})]
+              (try
+                (is (= [{:status :added :path "child.txt"}] (:files diff)))
+                (is (= (str a) (p/base-ref nested)))
+                (is (= "A" (text (repo/read (gy/connection nested) "base.txt"))))
+                (is (nil? (repo/read (gy/connection nested) "child.txt")))
+                (is (= "child" (text (repo/read child "child.txt"))))
+                (finally (p/discard! nested {}))))
+            (p/merge-down! historical {})
+            (is (= "child" (text (repo/read conn "child.txt"))))
+            (is (= "C" (text (repo/read conn "parent.txt"))))
+            (is (= "D" (text (repo/read conn "later.txt"))))
+            (is (= (str a) (p/base-ref historical)))
+            (finally (p/discard! historical {}))))))))
+
+(deftest invalid-historical-request-refuses-before-physical-allocation
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "base.txt" "A" "A")
+      (let [system (gy/create conn) calls (atom 0) original workspace/fork!]
+        (with-redefs [workspace/fork! (fn [& args] (swap! calls inc) (apply original args))]
+          (doseq [opts [{:snapshot nil} {:snapshot "unknown"}
+                        {:snapshot (p/snapshot-id system) :mode :following}
+                        {:snapshot (p/snapshot-id system) :mode nil}]]
+            (is (thrown? clojure.lang.ExceptionInfo (p/overlay system opts))))
+          (is (zero? @calls)))
+        (is (empty? (workspace/list conn)))))))
+
+(deftest historical-materialization-failure-cleans-acknowledged-owned-resources
+  (with-repo
+    (fn [conn]
+      (let [a (commit-file! conn "state.txt" "A" "A")
+            system (gy/create conn)
+            before (physical-view conn)
+            failure (ex-info "materialization failed" {})
+            seen (atom nil)]
+        (with-redefs [repo/reset! (fn [child commit opts]
+                                    (reset! seen child)
+                                    (is (not (identical? child conn)))
+                                    (throw failure))]
+          (let [result (try (p/overlay system {:snapshot a})
+                            (catch Throwable error error))]
+            (is (identical? failure result))))
+        (is (some? @seen))
+        (is (empty? (workspace/list conn)))
+        (is (= before (physical-view conn)))))))
+
+(deftest historical-failed-cleanup-retains-the-primary-error-and-exact-owner
+  (with-repo
+    (fn [conn]
+      (let [a (commit-file! conn "state.txt" "A" "A")
+            primary (ex-info "materialization refused" {})
+            cleanup (ex-info "branch removal refused" {})
+            system (gy/create conn)
+            result (with-redefs [repo/reset! (fn [& _] (throw primary))
+                                 workspace/remove! (fn [& _] (throw cleanup))]
+                     (try (p/overlay system {:snapshot a})
+                          (catch Throwable error error)))
+            resource (:resource (ex-data result))]
+        (is (identical? primary (ex-cause result)))
+        (is (= [cleanup] (:cleanup-errors (ex-data result))))
+        (is (true? (:allocation-acknowledged? (ex-data result))))
+        (is (identical? conn (:parent-conn resource)))
+        (is (some? (:child-conn resource)))
+        (is (= #{(:branch resource)} (workspace/list conn)))
+        ;; Explicit recovery of the exact retained resource after recording
+        ;; uncertainty, not a fabricated successful constructor result.
+        (workspace/remove! conn (:branch resource))
+        (is (empty? (workspace/list conn)))))))
+
+(deftest overlay-disposal-releases-creation-owned-connection-not-a-reseated-parent
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "A" "A")
+      (let [system (gy/create conn)
+            overlay (p/overlay system {})
+            owned (gy/connection overlay)
+            released (atom [])
+            release d/release]
+        (reset! (:local-writes overlay) system)
+        (with-redefs [d/release (fn [c] (swap! released conj c) (release c))]
+          (p/discard! overlay {}))
+        (is (= 1 (count @released)))
+        (is (identical? owned (first @released)))
+        (is (not (identical? conn (first @released))))
+        (is (empty? (workspace/list conn)))
+        (is (= "A" (text (repo/read conn "state.txt"))))))))
+
+(deftest historical-lost-connect-ack-retains-branch-with-live-native-connection
+  (with-repo
+    (fn [conn]
+      (let [a (commit-file! conn "state.txt" "A" "A")
+            before (physical-view conn)
+            connected (atom nil)
+            connect d/connect
+            failure (ex-info "connect reply lost" {})
+            error (with-redefs [d/connect (fn [& args]
+                                            (let [child (apply connect args)]
+                                              (reset! connected child)
+                                              (throw failure)))]
+                    (try (p/overlay (gy/create conn) {:snapshot a})
+                         (catch Throwable error error)))
+            resource (:resource (ex-data error))]
+        (try
+          (is (identical? failure (ex-cause error)))
+          (is (true? (:allocation-acknowledged? (ex-data error))))
+          (is (false? (:connection-acknowledged? (ex-data error))))
+          (is (nil? (:child-conn resource)) "Missing ACK is not proof native connect never ran")
+          (is (= #{(:branch resource)} (workspace/list conn)))
+          (is (= "A" (text (repo/read @connected "state.txt"))))
+          (is (= before (physical-view conn)))
+          (finally
+            ;; Only this diagnostic observer has the exact lost-ACK connection.
+            ;; Recover it explicitly after restoring the native functions.
+            (d/release @connected)
+            (workspace/remove! conn (:branch resource))))))))
+
+(deftest historical-constructor-release-failure-keeps-owned-branch-and-registry
+  (with-repo
+    (fn [conn]
+      (let [a (commit-file! conn "state.txt" "A" "A")
+            before (physical-view conn)
+            connected (atom nil)
+            release d/release
+            primary (ex-info "reset failed" {})
+            cleanup (ex-info "release failed" {})
+            error (with-redefs [repo/reset! (fn [child & _]
+                                              (reset! connected child)
+                                              (throw primary))
+                                d/release (fn [c]
+                                            (if (identical? c @connected)
+                                              (throw cleanup)
+                                              (release c)))]
+                    (try (p/overlay (gy/create conn) {:snapshot a})
+                         (catch Throwable error error)))
+            resource (:resource (ex-data error))]
+        (try
+          (is (identical? primary (ex-cause error)))
+          (is (true? (:connection-acknowledged? (ex-data error))))
+          (is (= [cleanup] (:cleanup-errors (ex-data error))))
+          (is (identical? @connected (:child-conn resource)))
+          (is (query/initialized? @@connected) "The refused release still has a live native DB")
+          (is (= #{(:branch resource)} (workspace/list conn)))
+          (is (= before (physical-view conn)))
+          (finally
+            (d/release @connected)
+            (workspace/remove! conn (:branch resource))))))))
 
 ;; ============================================================
 ;; Branches and overlays (moved from geschichte.yggdrasil-test)

@@ -136,12 +136,12 @@
 
 ;; `mode` is always :frozen — git can't do live fall-through across worktrees; a
 ;; `:following` request degrades to :frozen + manual `advance!` (git merge main).
-(defrecord GitOverlay [parent local-writes fork-branch parent-branch mode]
+(defrecord GitOverlay [parent local-writes fork-branch parent-branch mode base-snapshot]
   p/Overlayable
-  (base-ref [_] (p/snapshot-id parent))
+  (base-ref [_] base-snapshot)
   (peek-parent [_] parent)
   (peek-parent [_ _] parent)
-  (overlay-writes [_] (p/diff parent (p/snapshot-id parent) (p/snapshot-id @local-writes)))
+  (overlay-writes [_] (p/diff parent base-snapshot (p/snapshot-id @local-writes)))
 
   (advance! [ov] (p/advance! ov nil))
   (advance! [ov _] (reset! local-writes (p/merge! @local-writes parent-branch)) ov)
@@ -158,7 +158,8 @@
   (system-id [_] (or system-name (str "git:" repo-path)))
   (system-type [_] :git)
   (capabilities [_]
-    (t/->Capabilities true true true true true true true true true))
+    (assoc (t/->Capabilities true true true true true true true true true)
+           :snapshot-overlay true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -359,12 +360,42 @@
   ;; native worktree branch fork: branch+checkout a fresh overlay branch (its own
   ;; worktree) as the writable system; `merge-down!` merges it back, `discard!`
   ;; deletes branch + worktree.
-  (overlay [this _opts]
-    (let [pbranch (p/current-branch this)
-          fbranch (keyword (str "overlay-" (random-uuid)))
-          forked  (-> this (p/branch! fbranch) (p/checkout fbranch))]
-      ;; :following degrades to :frozen for git (honest fallback).
-      (->GitOverlay this (atom forked) fbranch pbranch :frozen)))
+  (overlay [this opts]
+    (let [historical? (contains? opts :snapshot)
+          _ (when (and historical? (contains? opts :mode)
+                       (not= :frozen (:mode opts)))
+              (throw (ex-info "Historical Git overlays require frozen mode"
+                              {:type :yggdrasil/invalid-historical-mode})))
+          requested (if historical? (:snapshot opts) (p/snapshot-id this))
+          _ (when-not (or (string? requested) (keyword? requested))
+              (throw (ex-info "Invalid Git historical snapshot"
+                              {:type :yggdrasil/invalid-snapshot})))
+          ;; Resolve a moving ref to its immutable commit BEFORE allocating.
+          base (git repo-path "rev-parse" "--verify" "--end-of-options"
+                    (str (if (keyword? requested) (name requested) requested) "^{commit}"))
+          pbranch (p/current-branch this)
+          fbranch (keyword (str "overlay-" (random-uuid)))]
+      (try
+        (p/branch! this fbranch base)
+        (catch Throwable error
+          (throw (ex-info "Git overlay allocation did not acknowledge completion"
+                          {:type :yggdrasil/overlay-allocation-uncertain
+                           :branch fbranch :snapshot base}
+                          error))))
+      (try
+        ;; :following still degrades to :frozen for ordinary overlays.
+        (->GitOverlay this (atom (p/checkout this fbranch))
+                      fbranch pbranch :frozen base)
+        (catch Throwable error
+          (try
+            (p/delete-branch! this fbranch)
+            (catch Throwable cleanup
+              (.addSuppressed error cleanup)
+              (throw (ex-info "Git overlay cleanup did not acknowledge completion"
+                              {:type :yggdrasil/overlay-cleanup-uncertain
+                               :branch fbranch :snapshot base}
+                              error))))
+          (throw error)))))
 
   p/GarbageCollectable
   (gc-roots [_]

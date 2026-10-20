@@ -174,3 +174,95 @@
             (is (file? merged "fork.txt")   "merge-down! merged the fork's file into the parent branch")))
         (is (true? (:overlayable (p/capabilities sys))) "git advertises :overlayable")
         (finally (delete-dir-recursive path))))))
+
+(deftest historical-overlay-owns-exact-worktree-and-immutable-base
+  (let [fix (make-fixture)
+        sys ((:create-system fix))
+        write! (:write-entry fix)
+        read! (:read-entry fix)]
+    (try
+      (write! sys "base" "A")
+      (p/commit! sys "A")
+      (let [a (p/snapshot-id sys)]
+        (write! sys "later" "C")
+        (p/commit! sys "C")
+        (let [c (p/snapshot-id sys)
+              branches (p/branches sys)
+              ov (p/overlay sys {:snapshot a :mode :frozen})
+              child (ovl/overlay-system ov)
+              owned (p/current-branch child)
+              owned-path (wt-path child)]
+          (try
+            (is (true? (:snapshot-overlay (p/capabilities sys))))
+            (is (= a (p/snapshot-id child) (p/base-ref ov)))
+            (is (= c (p/snapshot-id sys)))
+            (is (nil? (read! child "later")))
+            (is (= "C" (read! sys "later")))
+            (let [nested (p/overlay child {:snapshot a})]
+              (try
+                (is (not= owned (p/current-branch (ovl/overlay-system nested))))
+                (is (= a (p/base-ref nested)))
+                (finally (p/discard! nested))))
+            (write! child "child" "isolated")
+            (p/commit! child "child")
+            (write! sys "newer" "D")
+            (p/commit! sys "D")
+            (is (= a (p/base-ref ov)) "parent progress does not move creation base")
+            (is (= ["entries/child"] (mapv :path (:files (p/overlay-writes ov)))))
+            (is (nil? (read! sys "child")))
+            (is (= "isolated" (read! (p/merge-down! ov) "child")))
+            (finally (p/discard! ov)))
+          (is (= branches (p/branches sys)))
+          (is (not (.exists (java.io.File. owned-path))))))
+      (finally ((:close! fix) sys)))))
+
+(deftest historical-git-overlay-validates-before-allocation-and-cleans-checkout-failure
+  (let [fix (make-fixture)
+        sys ((:create-system fix))]
+    (try
+      ((:write-entry fix) sys "base" "A")
+      (p/commit! sys "A")
+      (let [a (p/snapshot-id sys)
+            before (p/branches sys)
+            checkout p/checkout
+            failed-branch (atom nil)]
+        (is (thrown? Exception (p/overlay sys {:snapshot "missing-snapshot"})))
+        (is (thrown? Exception (p/overlay sys {:snapshot a :mode :following})))
+        (is (= before (p/branches sys)))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"injected checkout"
+             (with-redefs [p/checkout (fn [s branch & args]
+                                        (if (= s sys)
+                                          (do (reset! failed-branch branch)
+                                              (throw (ex-info "injected checkout" {})))
+                                          (apply checkout s branch args)))]
+               (p/overlay sys {:snapshot a}))))
+        (is (keyword? @failed-branch))
+        (is (= before (p/branches sys)))
+        (is (not (.exists (java.io.File. (str (:worktrees-dir sys) "/" (name @failed-branch)))))))
+      (finally ((:close! fix) sys)))))
+
+(deftest historical-git-overlay-cleanup-failure-retains-owned-resource-identity
+  (let [fix (make-fixture)
+        sys ((:create-system fix))
+        owned (atom nil)]
+    (try
+      ((:write-entry fix) sys "base" "A")
+      (p/commit! sys "A")
+      (let [a (p/snapshot-id sys)
+            error (try
+                    (with-redefs [p/checkout (fn [_ branch & _]
+                                               (reset! owned branch)
+                                               (throw (ex-info "checkout failed" {})))
+                                  p/delete-branch! (fn [& _] (throw (ex-info "cleanup failed" {})))]
+                      (p/overlay sys {:snapshot a}))
+                    nil
+                    (catch Exception error error))]
+        (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
+        (is (= @owned (:branch (ex-data error))))
+        (is (contains? (p/branches sys) @owned))
+        (is (= a (p/snapshot-id sys))))
+      (finally
+        (when (and @owned (contains? (p/branches sys) @owned))
+          (p/delete-branch! sys @owned))
+        ((:close! fix) sys)))))

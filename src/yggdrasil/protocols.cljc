@@ -214,6 +214,9 @@
   (overlay [this opts]
     "Create an isolated overlay workspace over this system.
      opts: {:mode :frozen|:following|:gated (default :frozen), :sync? true}
+     Historical creation is a stronger optional contract: use `overlay-at`,
+     which checks positive :snapshot-overlay capability before supplying
+     :snapshot. Do not pass that option optimistically to older adapters.
      Returns an overlay whose `:mode` is the GRANTED mode. Read the effective
      value with `yggdrasil.convergent.overlay/overlay-value`, write via
      `overlay-system`, and `merge-down!`/`discard!` to finish.")
@@ -345,7 +348,42 @@
       :branchable true
       :graphable true
       :mergeable false
-      :overlayable false}"))
+      :overlayable false}
+     Optional :snapshot-overlay true advertises historical frozen workspace
+     creation through overlay-at; Snapshotable/Branchable alone do not."))
+
+(defn supports-snapshot-overlay?
+  "Whether a system positively advertises owned historical workspace creation.
+   Pure capability inspection; no allocation, snapshot loading or side effects."
+  [system]
+  (and (satisfies? Snapshotable system)
+       (satisfies? Overlayable system)
+       (satisfies? SystemIdentity system)
+       (true? (:snapshot-overlay (capabilities system)))))
+
+(defn overlay-at
+  "Create an OWNED isolated workspace at a historical snapshot, or refuse.
+
+   A positive :snapshot-overlay capability promises that the adapter resolves
+   the requested snapshot before exposing the child, retains its immutable
+   base, leaves the parent workspace untouched, and owns exactly the resources
+   merge-down!/discard! will settle. This is not a full dirty-workspace capture.
+
+   Frozen only. Options may include :sync? with the ordinary per-call execution
+   convention. The returned value-or-CPS is the adapter's, not a synchronous
+   substitute. Unsupported systems never fall back to today's/shared state."
+  ([system snapshot] (overlay-at system snapshot nil))
+  ([system snapshot opts]
+   (when-not (and (or (nil? opts) (map? opts))
+                  (or (uuid? snapshot) (and (string? snapshot) (seq snapshot)))
+                  (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
+                  (not (contains? opts :snapshot)))
+     (throw (ex-info "Invalid historical workspace request"
+                     {:type ::invalid-historical-workspace})))
+   (when-not (supports-snapshot-overlay? system)
+     (throw (ex-info "System does not support isolated historical workspaces"
+                     {:type ::unsupported-historical-workspace})))
+   (overlay system (assoc (or opts {}) :snapshot snapshot :mode :frozen))))
 
 ;; NOTE: the per-system runtime-mode helpers `system-sync?`/`system-async?` were
 ;; REMOVED — a system no longer carries an execution mode (`:opts {:sync?}` was

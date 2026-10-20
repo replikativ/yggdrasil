@@ -232,7 +232,7 @@
     (if (map? t) (:geschichte.commit/id t) t)))
 
 (defrecord GeschichteOverlay
-           [parent local-writes workspace-branch base-snapshot mode]
+           [parent local-writes workspace-branch base-snapshot mode owned-conn]
   p/Overlayable
   (base-ref [_] base-snapshot)
   (peek-parent [_] parent)
@@ -294,9 +294,71 @@
   (discard! [this] (p/discard! this nil))
   (discard! [_ _opts]
     (platform-async
-     (d/release (:conn @local-writes))
+     ;; Native Datahike release returns nil on both platforms; it is not a
+     ;; sync-or-channel API. The enclosing operation still awaits branch removal.
+     (d/release owned-conn)
      (await (workspace/remove! (:conn parent) workspace-branch))
      parent)))
+
+(defn- historical-overlay
+  "Construct one owned physical workspace at a committed logical snapshot.
+   Never check out or reset the source connection. Failed construction only
+   disposes resources whose allocation returned an acknowledgement."
+  [parent conn system-name {:keys [snapshot mode] :as opts}]
+  (platform-async
+   (when (or (nil? snapshot)
+             (and (contains? opts :mode) (not= :frozen mode)))
+     (throw (ex-info "Historical Geschichte overlays require a snapshot and frozen mode"
+                     {:snapshot snapshot :mode mode})))
+   (let [resolved (resolve-commit conn snapshot)
+         commit (when-let [id (:geschichte.commit/id resolved)]
+                  (repo/commit-by-id conn id))]
+     (when-not commit
+       (throw (ex-info "Unknown Geschichte historical snapshot" {:snapshot snapshot})))
+     (let [branch (workspace/branch-key (random-uuid))
+           allocated? (atom false)
+           child (atom nil)]
+       (try
+         (await (workspace/fork! conn branch))
+         (reset! allocated? true)
+         (let [cfg (assoc (:config @conn) :branch branch)
+               child-conn (await (execution/io-result
+                                  (d/connect cfg #?(:clj {:sync? true} :cljs {:sync? false}))
+                                  execution/default-opts))]
+           (reset! child child-conn)
+           ;; Hard reset alone intentionally preserves untracked files. Clear
+           ;; the private worktree/index first, without reading/re-writing any
+           ;; blobs, so today's untracked paths cannot leak into yesterday.
+           (await (repo/materialize-bytes! child-conn [] {:force? true}))
+           (await (repo/reset! child-conn commit {:mode :hard}))
+           (->GeschichteOverlay parent
+                                (atom (->GeschichteSystem child-conn system-name))
+                                branch (str (:geschichte.commit/id commit)) :frozen child-conn))
+         (catch #?(:clj Throwable :cljs :default) error
+           (let [cleanup-errors (atom [])
+                 released? (atom false)]
+             (when-let [child-conn @child]
+               (try
+                 (d/release child-conn)
+                 (reset! released? true)
+                 (catch #?(:clj Throwable :cljs :default) cleanup-error
+                   (swap! cleanup-errors conj cleanup-error))))
+             ;; No connection ACK is not proof connect never created a writer.
+             ;; Likewise a failed release must keep the branch/registry intact.
+             (when (and @allocated? @released?)
+               (try
+                 (await (workspace/remove! conn branch))
+                 (catch #?(:clj Throwable :cljs :default) cleanup-error
+                   (swap! cleanup-errors conj cleanup-error))))
+             (if (or (not @allocated?) (nil? @child) (seq @cleanup-errors))
+               (throw (ex-info "Historical Geschichte workspace construction is uncertain"
+                               {:type ::historical-construction-incomplete
+                                :allocation-acknowledged? @allocated?
+                                :connection-acknowledged? (some? @child)
+                                :resource {:parent-conn conn :child-conn @child :branch branch}
+                                :cleanup-errors @cleanup-errors}
+                               error))
+               (throw error)))))))))
 
 (defrecord GeschichteSystem [conn system-name]
   p/SystemIdentity
@@ -305,7 +367,8 @@
         (str "geschichte:" (get-in @conn [:config :store :id]))))
   (system-type [_] :geschichte)
   (capabilities [_]
-    (t/->Capabilities true true true true true false true false true))
+    (assoc (t/->Capabilities true true true true true false true false true)
+           :snapshot-overlay true))
 
   p/Snapshotable
   (snapshot-id [_] (some-> (head conn) :geschichte.commit/id str))
@@ -556,19 +619,21 @@
             :reclaimed (if (counted? removed) (count removed) 0)})))))
 
   p/Overlayable
-  (overlay [this _opts]
-    (platform-async
-     (let [branch (workspace/branch-key (random-uuid))
-           base (p/snapshot-id this)
-           _ (await (workspace/fork! conn branch))
-           cfg (assoc (:config @conn) :branch branch)
-           child-conn (await (execution/io-result
-                              (d/connect cfg #?(:clj {:sync? true}
-                                                :cljs {:sync? false}))
-                              execution/default-opts))]
-       (->GeschichteOverlay this
-                            (atom (->GeschichteSystem child-conn system-name))
-                            branch base :frozen)))))
+  (overlay [this opts]
+    (if (contains? opts :snapshot)
+      (historical-overlay this conn system-name opts)
+      (platform-async
+       (let [branch (workspace/branch-key (random-uuid))
+             base (p/snapshot-id this)
+             _ (await (workspace/fork! conn branch))
+             cfg (assoc (:config @conn) :branch branch)
+             child-conn (await (execution/io-result
+                                (d/connect cfg #?(:clj {:sync? true}
+                                                  :cljs {:sync? false}))
+                                execution/default-opts))]
+         (->GeschichteOverlay this
+                              (atom (->GeschichteSystem child-conn system-name))
+                              branch base :frozen child-conn))))))
 
 (defn create
   "Wrap an initialized Geschichte connection as a Yggdrasil system."
