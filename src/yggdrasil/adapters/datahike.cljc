@@ -12,6 +12,7 @@
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.hooks :as hooks]
+            [yggdrasil.adapters.datahike-cleanup :as cleanup]
             ;; the shared core.async↔partial-cps adapter: bridges datahike's (core.async)
             ;; async results into yggdrasil's NATIVE partial-cps substrate, so the adapter's
             ;; storage ops are `await`-able by the convergent/composite layer (and equally
@@ -760,7 +761,7 @@
 
 ;; `mode` is always :frozen — a versioned store can't cheaply do `:following`
 ;; (live join); a `:following` request degrades to :frozen + manual `advance!`.
-(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch mode base-snapshot owned-conn]
+(defrecord DatahikeOverlay [parent local-writes fork-branch parent-branch mode base-snapshot owned-conn cleanup-owner]
   p/Overlayable
   (base-ref [_] base-snapshot)
   (peek-parent [_] parent)
@@ -782,28 +783,15 @@
   (merge-down! [_ opts]
     (async+sync (sync?* opts)
                 (async
-                 (let [pco (await (p/checkout parent parent-branch))]
-                   (await (p/merge! pco fork-branch))))))
+                 ;; The captured parent already owns exactly parent-branch.
+                 ;; Re-checkout acquired an unowned extra connection lease.
+                 (await (p/merge! parent fork-branch)))))
 
   (discard! [ov] (p/discard! ov nil))
   (discard! [_ opts]
     (async+sync (sync?* opts)
                 (async
-      ;; The creation-owned connection is stable even if a caller later re-seats
-      ;; local-writes. Release while its registry entry still exists: native
-      ;; branch deletion removes that entry without shutting its writer down.
-                 (try
-                   (d/release owned-conn)
-                   (catch #?(:clj Throwable :cljs :default) error
-                     (throw (ex-info "Datahike overlay connection cleanup did not complete"
-                                     {:type :yggdrasil/overlay-cleanup-uncertain
-                                      :branch fork-branch :snapshot base-snapshot} error))))
-                 (try
-                   (await (p/delete-branch! parent fork-branch opts))
-                   (catch #?(:clj Throwable :cljs :default) error
-                     (throw (ex-info "Datahike overlay branch cleanup did not acknowledge completion"
-                                     {:type :yggdrasil/overlay-cleanup-uncertain
-                                      :branch fork-branch :snapshot base-snapshot} error))))
+                 (await (cleanup/discard! cleanup-owner opts))
                  nil))))
 
 ;; `checkout` below builds a fresh DatahikeSystem via the record's own constructor;
@@ -1123,37 +1111,36 @@
                              (throw (ex-info "Unknown Datahike historical snapshot"
                                              {:type :yggdrasil/invalid-snapshot})))
                          fbranch (keyword (str "overlay-" (random-uuid)))
-                         connected (volatile! nil)]
+                         connected (volatile! nil)
+                         owner (cleanup/owner conn fbranch (str base))]
                      (try
+                       (await (cleanup/acquire! owner {:sync? s?}))
+                       (cleanup/allocating! owner)
             ;; Keep ordinary branch-key creation working when commit-graph? is
             ;; disabled; explicit historical UUID restoration must fail closed.
                        (await (p/branch! this fbranch (if historical? base pbranch) {:sync? s?}))
+                       (cleanup/allocated! owner)
                        (catch #?(:clj Throwable :cljs :default) error
-                         (throw (ex-info "Datahike overlay allocation did not acknowledge completion"
-                                         {:type :yggdrasil/overlay-allocation-uncertain
-                                          :branch fbranch :snapshot (str base)} error))))
+                         (cleanup/construction-failed! owner error)))
                      (try
-                       (let [forked (await (p/checkout this fbranch {:sync? s?}))]
+                       (let [child-conn (await (cleanup/connect-child! owner {:sync? s?}))
+                             forked (->DatahikeSystem child-conn system-name)]
                          (vreset! connected (:conn forked))
                          (->DatahikeOverlay this (atom forked) fbranch pbranch :frozen
-                                            (p/snapshot-id forked) (:conn forked)))
+                                            (p/snapshot-id forked) (:conn forked) owner))
                        (catch #?(:clj Throwable :cljs :default) error
               ;; A throwing checkout can have started a native writer before
               ;; losing its acknowledgement. Without the exact returned conn,
               ;; deleting the branch would erase its only recovery locator.
                          (when-not @connected
-                           (throw (ex-info "Datahike overlay connection ownership is uncertain"
-                                           {:type :yggdrasil/overlay-connection-uncertain
-                                            :branch fbranch :parent-branch pbranch
-                                            :system-id (p/system-id this)
-                                            :snapshot (str base)} error)))
+                           (cleanup/construction-failed! owner error))
                          (try
-                           (d/release @connected)
-                           (await (p/delete-branch! this fbranch {:sync? s?}))
+                           (await (cleanup/discard! owner {:sync? s?}))
                            (catch #?(:clj Throwable :cljs :default) cleanup
                              (throw (ex-info "Datahike overlay cleanup did not acknowledge completion"
                                              {:type :yggdrasil/overlay-cleanup-uncertain
                                               :branch fbranch :snapshot (str base)
+                                              :yggdrasil.adapters.datahike-cleanup/owner owner
                                               :cleanup-message (ex-message cleanup)} error))))
                          (throw error)))))))))
 

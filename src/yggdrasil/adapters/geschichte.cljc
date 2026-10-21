@@ -28,6 +28,7 @@
             [geschichte.workspace :as workspace]
             [is.simm.partial-cps.async :refer [await]]
             [yggdrasil.protocols :as p]
+            [yggdrasil.adapters.datahike-cleanup :as cleanup]
             [yggdrasil.types :as t])
   #?(:cljs (:require-macros [geschichte.macros :refer [platform-async]]))
   #?(:clj (:require [geschichte.macros :refer [platform-async]])))
@@ -232,7 +233,7 @@
     (if (map? t) (:geschichte.commit/id t) t)))
 
 (defrecord GeschichteOverlay
-           [parent local-writes workspace-branch base-snapshot mode owned-conn]
+           [parent local-writes workspace-branch base-snapshot mode owned-conn cleanup-owner]
   p/Overlayable
   (base-ref [_] base-snapshot)
   (peek-parent [_] parent)
@@ -294,11 +295,40 @@
   (discard! [this] (p/discard! this nil))
   (discard! [_ _opts]
     (platform-async
-     ;; Native Datahike release returns nil on both platforms; it is not a
-     ;; sync-or-channel API. The enclosing operation still awaits branch removal.
-     (d/release owned-conn)
-     (await (workspace/remove! (:conn parent) workspace-branch))
+     (await (cleanup/discard! cleanup-owner execution/default-opts))
      parent)))
+
+(defn- owned-overlay
+  "Allocate one overlay with independent native cleanup ownership. Historical
+   and ordinary construction share acknowledgement and failure semantics."
+  [parent conn system-name base historical-commit]
+  (platform-async
+   (let [branch (workspace/branch-key (random-uuid))
+         owner (cleanup/owner conn branch base)
+         child (atom nil)]
+     (try
+       (await (cleanup/acquire! owner execution/default-opts))
+       (cleanup/allocating! owner)
+       (await (workspace/fork! conn branch))
+       (cleanup/allocated! owner)
+       (let [child-conn (await (cleanup/connect-child! owner execution/default-opts))]
+         (reset! child child-conn)
+         (when historical-commit
+           (await (repo/materialize-bytes! child-conn [] {:force? true}))
+           (await (repo/reset! child-conn historical-commit {:mode :hard})))
+         (->GeschichteOverlay parent (atom (->GeschichteSystem child-conn system-name))
+                              branch base :frozen child-conn owner))
+       (catch #?(:clj Throwable :cljs :default) error
+         (if @child
+           (let [cleanup-error (try (await (cleanup/discard! owner execution/default-opts)) nil
+                                    (catch #?(:clj Throwable :cljs :default) failure failure))]
+             (if cleanup-error
+               (throw (ex-info "Geschichte overlay construction cleanup is uncertain"
+                               {:type ::historical-construction-incomplete
+                                :cleanup (cleanup/info owner) :yggdrasil.adapters.datahike-cleanup/owner owner
+                                :cleanup-errors [cleanup-error]} error))
+               (throw error)))
+           (cleanup/construction-failed! owner error)))))))
 
 (defn- historical-overlay
   "Construct one owned physical workspace at a committed logical snapshot.
@@ -315,50 +345,7 @@
                   (repo/commit-by-id conn id))]
      (when-not commit
        (throw (ex-info "Unknown Geschichte historical snapshot" {:snapshot snapshot})))
-     (let [branch (workspace/branch-key (random-uuid))
-           allocated? (atom false)
-           child (atom nil)]
-       (try
-         (await (workspace/fork! conn branch))
-         (reset! allocated? true)
-         (let [cfg (assoc (:config @conn) :branch branch)
-               child-conn (await (execution/io-result
-                                  (d/connect cfg #?(:clj {:sync? true} :cljs {:sync? false}))
-                                  execution/default-opts))]
-           (reset! child child-conn)
-           ;; Hard reset alone intentionally preserves untracked files. Clear
-           ;; the private worktree/index first, without reading/re-writing any
-           ;; blobs, so today's untracked paths cannot leak into yesterday.
-           (await (repo/materialize-bytes! child-conn [] {:force? true}))
-           (await (repo/reset! child-conn commit {:mode :hard}))
-           (->GeschichteOverlay parent
-                                (atom (->GeschichteSystem child-conn system-name))
-                                branch (str (:geschichte.commit/id commit)) :frozen child-conn))
-         (catch #?(:clj Throwable :cljs :default) error
-           (let [cleanup-errors (atom [])
-                 released? (atom false)]
-             (when-let [child-conn @child]
-               (try
-                 (d/release child-conn)
-                 (reset! released? true)
-                 (catch #?(:clj Throwable :cljs :default) cleanup-error
-                   (swap! cleanup-errors conj cleanup-error))))
-             ;; No connection ACK is not proof connect never created a writer.
-             ;; Likewise a failed release must keep the branch/registry intact.
-             (when (and @allocated? @released?)
-               (try
-                 (await (workspace/remove! conn branch))
-                 (catch #?(:clj Throwable :cljs :default) cleanup-error
-                   (swap! cleanup-errors conj cleanup-error))))
-             (if (or (not @allocated?) (nil? @child) (seq @cleanup-errors))
-               (throw (ex-info "Historical Geschichte workspace construction is uncertain"
-                               {:type ::historical-construction-incomplete
-                                :allocation-acknowledged? @allocated?
-                                :connection-acknowledged? (some? @child)
-                                :resource {:parent-conn conn :child-conn @child :branch branch}
-                                :cleanup-errors @cleanup-errors}
-                               error))
-               (throw error)))))))))
+     (await (owned-overlay parent conn system-name (str (:geschichte.commit/id commit)) commit)))))
 
 (defrecord GeschichteSystem [conn system-name]
   p/SystemIdentity
@@ -622,18 +609,7 @@
   (overlay [this opts]
     (if (contains? opts :snapshot)
       (historical-overlay this conn system-name opts)
-      (platform-async
-       (let [branch (workspace/branch-key (random-uuid))
-             base (p/snapshot-id this)
-             _ (await (workspace/fork! conn branch))
-             cfg (assoc (:config @conn) :branch branch)
-             child-conn (await (execution/io-result
-                                (d/connect cfg #?(:clj {:sync? true}
-                                                  :cljs {:sync? false}))
-                                execution/default-opts))]
-         (->GeschichteOverlay this
-                              (atom (->GeschichteSystem child-conn system-name))
-                              branch base :frozen child-conn))))))
+      (owned-overlay this conn system-name (p/snapshot-id this) nil))))
 
 (defn create
   "Wrap an initialized Geschichte connection as a Yggdrasil system."

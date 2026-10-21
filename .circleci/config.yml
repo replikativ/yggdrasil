@@ -27,6 +27,8 @@ workflows:
           context: docker-deploy
       - test-datahike:
           context: docker-deploy
+      - test-cljs:
+          context: docker-deploy
       - tools/deploy:
           context:
             - clojars-deploy
@@ -38,6 +40,7 @@ workflows:
             - tools/build
             - test-git
             - test-datahike
+            - test-cljs
       - tools/release:
           context:
             - github-token
@@ -87,3 +90,21 @@ jobs:
             -n yggdrasil.adapters.git-test
             -n yggdrasil.adapters.geschichte-test
             -n yggdrasil.historical-overlay-test
+            -n yggdrasil.adapters.datahike-cleanup-test
+            -n yggdrasil.adapters.overlay-parent-lifetime-test
+
+  test-cljs:
+    docker:
+      - image: cimg/clojure:1.12.1-openjdk-21.0-node
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run:
+          name: Install pinned Node test dependencies
+          command: npm ci --ignore-scripts
+      - run:
+          name: Compile and execute portable adapter tests
+          command: |
+            clojure -J-Xmx2g -J-XX:MaxMetaspaceSize=640m -M:shadow -m shadow.cljs.devtools.cli compile test
+            node target/node-tests.js
+          no_output_timeout: 15m
