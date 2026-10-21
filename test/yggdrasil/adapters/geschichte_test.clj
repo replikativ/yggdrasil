@@ -9,11 +9,14 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
+            [datahike.versioning :as versioning]
             [geschichte.bytes :as gbytes]
             [geschichte.query :as query]
             [geschichte.repo :as repo]
             [geschichte.workspace :as workspace]
             [yggdrasil.adapters.geschichte :as gy]
+            [yggdrasil.adapters.cleanup-test-support :as cleanup-test]
+            [yggdrasil.adapters.datahike-cleanup :as cleanup-owner]
             [yggdrasil.convergent.overlay :as overlay]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]))
@@ -163,19 +166,20 @@
             cleanup (ex-info "branch removal refused" {})
             system (gy/create conn)
             result (with-redefs [repo/reset! (fn [& _] (throw primary))
-                                 workspace/remove! (fn [& _] (throw cleanup))]
+                                 versioning/delete-branch! (fn [& _] (throw cleanup))]
                      (try (p/overlay system {:snapshot a})
                           (catch Throwable error error)))
-            resource (:resource (ex-data result))]
+            owner (cleanup-test/owner-of result)
+            resource (cleanup-test/state-of owner)]
         (is (identical? primary (ex-cause result)))
-        (is (= [cleanup] (:cleanup-errors (ex-data result))))
-        (is (true? (:allocation-acknowledged? (ex-data result))))
-        (is (identical? conn (:parent-conn resource)))
+        (is (identical? cleanup (ex-cause (first (:cleanup-errors (ex-data result))))))
+        (is (= :child-open (:stage resource)))
+        (is (identical? conn (:cleanup-conn resource)))
         (is (some? (:child-conn resource)))
         (is (= #{(:branch resource)} (workspace/list conn)))
         ;; Explicit recovery of the exact retained resource after recording
         ;; uncertainty, not a fabricated successful constructor result.
-        (workspace/remove! conn (:branch resource))
+        (cleanup-test/dispose-known! owner)
         (is (empty? (workspace/list conn)))))))
 
 (deftest overlay-disposal-releases-creation-owned-connection-not-a-reseated-parent
@@ -190,8 +194,9 @@
         (reset! (:local-writes overlay) system)
         (with-redefs [d/release (fn [c] (swap! released conj c) (release c))]
           (p/discard! overlay {}))
-        (is (= 1 (count @released)))
+        (is (= 2 (count @released)))
         (is (identical? owned (first @released)))
+        (is (identical? conn (second @released)) "Release only our canonical lease, not the caller's")
         (is (not (identical? conn (first @released))))
         (is (empty? (workspace/list conn)))
         (is (= "A" (text (repo/read conn "state.txt"))))))))
@@ -204,17 +209,18 @@
             connected (atom nil)
             connect d/connect
             failure (ex-info "connect reply lost" {})
-            error (with-redefs [d/connect (fn [& args]
-                                            (let [child (apply connect args)]
-                                              (reset! connected child)
-                                              (throw failure)))]
+            error (with-redefs [d/connect (fn [cfg & args]
+                                            (let [child (apply connect cfg args)]
+                                              (if (= :db (:branch cfg)) child
+                                                  (do (reset! connected child) (throw failure)))))]
                     (try (p/overlay (gy/create conn) {:snapshot a})
                          (catch Throwable error error)))
-            resource (:resource (ex-data error))]
+            owner (cleanup-test/owner-of error)
+            resource (cleanup-test/state-of owner)]
         (try
           (is (identical? failure (ex-cause error)))
-          (is (true? (:allocation-acknowledged? (ex-data error))))
-          (is (false? (:connection-acknowledged? (ex-data error))))
+          (is (= :branch-open (:stage resource)))
+          (is (= :child-connect (:uncertain resource)))
           (is (nil? (:child-conn resource)) "Missing ACK is not proof native connect never ran")
           (is (= #{(:branch resource)} (workspace/list conn)))
           (is (= "A" (text (repo/read @connected "state.txt"))))
@@ -222,8 +228,7 @@
           (finally
             ;; Only this diagnostic observer has the exact lost-ACK connection.
             ;; Recover it explicitly after restoring the native functions.
-            (d/release @connected)
-            (workspace/remove! conn (:branch resource))))))))
+            (cleanup-test/dispose-known! owner @connected)))))))
 
 (deftest historical-constructor-release-failure-keeps-owned-branch-and-registry
   (with-repo
@@ -243,18 +248,18 @@
                                               (release c)))]
                     (try (p/overlay (gy/create conn) {:snapshot a})
                          (catch Throwable error error)))
-            resource (:resource (ex-data error))]
+            owner (cleanup-test/owner-of error)
+            resource (cleanup-test/state-of owner)]
         (try
           (is (identical? primary (ex-cause error)))
-          (is (true? (:connection-acknowledged? (ex-data error))))
-          (is (= [cleanup] (:cleanup-errors (ex-data error))))
+          (is (= :child-open (:stage resource)))
+          (is (identical? cleanup (ex-cause (first (:cleanup-errors (ex-data error))))))
           (is (identical? @connected (:child-conn resource)))
           (is (query/initialized? @@connected) "The refused release still has a live native DB")
           (is (= #{(:branch resource)} (workspace/list conn)))
           (is (= before (physical-view conn)))
           (finally
-            (d/release @connected)
-            (workspace/remove! conn (:branch resource))))))))
+            (cleanup-test/dispose-known! owner)))))))
 
 ;; ============================================================
 ;; Branches and overlays (moved from geschichte.yggdrasil-test)

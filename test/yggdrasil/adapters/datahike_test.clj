@@ -13,6 +13,7 @@
             [datahike.versioning :as dv]
             [datahike.writing :as dw]
             [yggdrasil.adapters.datahike :as dha]
+            [yggdrasil.adapters.cleanup-test-support :as cleanup-test]
             [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.hooks :as hooks]
             [yggdrasil.protocols :as p]
@@ -74,12 +75,9 @@
         (is (seq (:added (p/overlay-writes ov))))
         (is (= #{"A" "C" "D"} (historical-note-ids *conn*)))
         (let [merged (p/merge-down! ov)]
-          (try
-            (is (= #{"A" "C" "D" "child"}
-                   (historical-note-ids (:conn merged))))
-            ;; merge-down!'s parent checkout acquired this additional handle;
-            ;; the fixture retains its original parent connection separately.
-            (finally (d/release (:conn merged)))))
+          (is (= #{"A" "C" "D" "child"}
+                 (historical-note-ids (:conn merged))))
+          (is (identical? *conn* (:conn merged)) "Merge acquires no unowned checkout lease"))
         (finally (p/discard! ov)))
       (is (= branches (p/branches sys))))))
 
@@ -89,6 +87,7 @@
         a (p/snapshot-id sys)
         before (p/branches sys)
         failed-branch (atom nil)
+        held (atom nil)
         entered (atom 0)
         connect d/connect]
     (is (thrown? Exception (p/overlay sys {:snapshot (str (random-uuid))})))
@@ -105,6 +104,7 @@
                       (p/overlay sys {:snapshot a}))
                     nil
                     (catch Exception error error))]
+        (reset! held (cleanup-test/owner-of error))
         (is (= :yggdrasil/overlay-connection-uncertain (:type (ex-data error))))
         (is (= 1 @entered))
         (is (= "injected checkout" (ex-message (ex-cause error))))
@@ -113,7 +113,7 @@
         (is (= a (p/snapshot-id sys))))
       ;; This injection proves no native checkout was attempted. Production may
       ;; not infer that from an arbitrary checkout exception.
-      (finally (when @failed-branch (p/delete-branch! sys @failed-branch))))))
+      (finally (when @held (cleanup-test/dispose-known! @held))))))
 
 (deftest historical-datahike-overlay-lost-checkout-ack-retains-live-connection-locator
   (seed-historical-notes!)
@@ -122,6 +122,7 @@
         before (p/branches sys)
         connect d/connect
         created (atom nil)
+        held (atom nil)
         entered (atom 0)]
     (try
       (let [error (try
@@ -137,6 +138,7 @@
                     (catch Exception error error))
             child (dha/create @created)
             branch (p/current-branch child)]
+        (reset! held (cleanup-test/owner-of error))
         (is (= :yggdrasil/overlay-connection-uncertain (:type (ex-data error))))
         (is (= 1 @entered))
         (is (= "checkout ACK lost" (ex-message (ex-cause error))))
@@ -149,16 +151,14 @@
       (finally
         ;; Recovery here is test-owned: the injection retained the exact native
         ;; handle independently, unlike the failed constructor.
-        (when-let [conn @created]
-          (let [branch (get-in @conn [:config :branch])]
-            (d/release conn)
-            (p/delete-branch! sys branch)))))))
+        (when @held (cleanup-test/dispose-known! @held @created))))))
 
 (deftest historical-datahike-overlay-cleanup-failure-retains-owned-resource-identity
   (seed-historical-notes!)
   (let [sys (dha/create *conn*)
         a (p/snapshot-id sys)
         owned (atom nil)
+        held (atom nil)
         snapshot-failures (atom 0)
         cleanup-failures (atom 0)
         commit-id @#'dha/commit-id-of]
@@ -177,14 +177,14 @@
                       #(p/overlay sys {:snapshot a}))
                     nil
                     (catch Exception error error))]
+        (reset! held (cleanup-test/owner-of error))
         (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
         (is (= 1 @snapshot-failures @cleanup-failures))
         (is (= @owned (:branch (ex-data error))))
         (is (contains? (p/branches sys) @owned))
         (is (= a (p/snapshot-id sys))))
       (finally
-        (when (and @owned (contains? (p/branches sys) @owned))
-          (p/delete-branch! sys @owned))))))
+        (when @held (cleanup-test/dispose-known! @held))))))
 
 (deftest datahike-overlay-discard-releases-creation-owned-connection-before-branch-removal
   (seed-historical-notes!)
@@ -207,7 +207,8 @@
                                         :parent-head (p/snapshot-id sys)})
                                 (apply release conn args))]
         (p/discard! ov))
-      (is (= [{:owned? true :registered? true :parent-head a}] @observations))
+      (is (= [{:owned? true :registered? true :parent-head a}
+              {:owned? false :registered? false :parent-head a}] @observations))
       (is (not (contains? (p/branches sys) branch)))
       (d/transact *conn* [{:historical/id "parent-alive"}])
       (is (= #{"A" "parent-alive"} (historical-note-ids *conn*)))
@@ -235,9 +236,9 @@
         (is (= branch (:branch (ex-data error))))
         (is (contains? (p/branches sys) branch))
         (is (= #{"A"} (historical-note-ids *conn*))))
-      (finally (p/discard! ov)))))
+      (finally (cleanup-test/dispose-known! (:cleanup-owner ov))))))
 
-(deftest datahike-overlay-discard-delete-failure-retains-branch-for-retry
+(deftest datahike-overlay-discard-delete-failure-retains-branch-and-refuses-replay
   (seed-historical-notes!)
   (let [sys (dha/create *conn*)
         ov (p/overlay sys {:snapshot (p/snapshot-id sys)})
@@ -256,7 +257,9 @@
         (is (= branch (:branch (ex-data error))))
         (is (contains? (p/branches sys) branch))
         (is (= #{"A"} (historical-note-ids *conn*))))
-      (finally (p/discard! ov)))))
+      (is (thrown? clojure.lang.ExceptionInfo (p/discard! ov)))
+      (is (= 1 @entered))
+      (finally (cleanup-test/dispose-known! (:cleanup-owner ov))))))
 
 (deftest durable-commit-hook-emits-a-complete-dag-event
   (let [sys    (dha/create *conn* {:system-name "event-test"})

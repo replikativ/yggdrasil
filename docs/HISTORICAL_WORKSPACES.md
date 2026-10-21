@@ -59,3 +59,29 @@ all-or-nothing transaction.
 Regression obligations include A-to-C parent advancement while the historical
 child reads A, independent child writes, stable base/diff, exact resource
 disposal, missing-snapshot refusal, creation-failure cleanup and nested forks.
+
+## Native Datahike cleanup ownership
+
+Ordinary and historical Datahike/Geschichte overlays acquire their own lease
+on the protected physical `:db` branch before allocating a private branch.
+This lease is for native cleanup only: it is not a selected application
+workspace, write permission, logical Git checkout or newly created database.
+Its effective store identity must match the source. Captured configuration,
+connections and phase witnesses stay in an opaque process-local cleanup owner.
+
+Cleanup releases the creation-owned child connection, removes its physical
+branch through the owned canonical connection, then releases that canonical
+lease. It never force-releases a shared connection. It does not borrow the
+temporary parent's connection: a copied world's source may already have merged
+and been disposed when another copy is discarded. Reseating overlay writes
+does not transfer ownership. Datahike merge-down uses its captured parent and
+does not acquire an additional unowned checkout lease.
+
+Successful cleanup is idempotent. A concurrent cleanup cannot dispatch another
+release. Each native operation is marked in-flight before dispatch; a missing
+acknowledgement retains the opaque owner and safe branch/phase locators, and
+refuses automatic replay. For example, acknowledged child release followed by
+uncertain branch removal retains the canonical cleanup lease. Native owners in
+internal exception data are not portable receipts and must never be serialized
+or exposed to an interpreter. Explicit operator reconciliation of uncertainty
+is separate; these APIs do not infer rollback or success from an exception.
