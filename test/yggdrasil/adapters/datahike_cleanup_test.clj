@@ -45,7 +45,9 @@
                     versioning/delete-branch! (fn [conn _ _]
                                                 (is (identical? root conn))
                                                 (swap! calls conj :branch-removal)
-                                                (when (= :branch-removal fault) (throw failure)))]
+                                                (when (= :branch-removal fault) (throw failure)))
+                    ;; A removal whose registry cannot be read stays uncertain.
+                    versioning/branches (fn [& _] (throw (ex-info "Registry read failed" {})))]
         (let [error (try (cleanup/discard! owner {}) (catch Exception error error))
               before @calls]
           (is (identical? failure (ex-cause error)))
@@ -58,23 +60,65 @@
           (is (not (contains? (ex-data error) :cleanup-conn)))
           (is (= "<native-overlay-cleanup-owner>" (str (:yggdrasil.adapters.datahike-cleanup/owner (ex-data error))))))))))
 
-(deftest concurrent-discard-cannot-decrement-the-same-lease-twice
-  (let [{:keys [owner child] :as f} (fixture)
-        entered (promise) proceed (promise) calls (atom [])]
-    (open! f)
-    (with-redefs [d/release (fn [conn]
-                              (swap! calls conj [:release conn])
-                              (when (identical? child conn) (deliver entered true) @proceed))
-                  versioning/delete-branch! (fn [& _] (swap! calls conj :remove))]
-      (let [first (future (cleanup/discard! owner {}))]
-        (try
-          (is (= true (deref entered 5000 :timeout)))
-          (is (thrown? clojure.lang.ExceptionInfo (cleanup/discard! owner {})))
-          (is (= 1 (count @calls)))
-          (finally (deliver proceed true)))
-        (is (nil? (deref first 5000 :timeout)))
-        (is (nil? (cleanup/discard! owner {})))
-        (is (= 3 (count @calls)))))))
+(deftest concurrent-discard-joins-the-running-cleanup
+  (doseq [outcome [:closed :uncertain]]
+    (let [{:keys [owner child] :as f} (fixture)
+          entered (promise) proceed (promise) calls (atom [])
+          failure (ex-info "Injected missing release ACK" {})]
+      (open! f)
+      (with-redefs [d/release (fn [conn]
+                                (swap! calls conj [:release conn])
+                                (when (identical? child conn)
+                                  (deliver entered true)
+                                  @proceed
+                                  (when (= :uncertain outcome) (throw failure))))
+                    versioning/delete-branch! (fn [& _] (swap! calls conj :remove))]
+        (let [first (future (try (cleanup/discard! owner {}) (catch Exception error error)))
+              _ (is (= true (deref entered 5000 :timeout)))
+              second (future (try (cleanup/discard! owner {}) (catch Exception error error)))]
+          (try
+            (is (= :timeout (deref second 200 :timeout)) "The joiner waits for the outcome")
+            (is (= 1 (count @calls)))
+            (finally (deliver proceed true)))
+          (case outcome
+            :closed (do (is (nil? (deref first 5000 :timeout)))
+                        (is (nil? (deref second 5000 :timeout)))
+                        (is (= 3 (count @calls))))
+            :uncertain (let [error (deref first 5000 :timeout)
+                             joined (deref second 5000 :timeout)]
+                         (is (identical? failure (ex-cause error)))
+                         (is (identical? error (ex-cause joined)) "The joiner receives the same outcome")
+                         (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data joined))))
+                         (is (= 1 (count @calls)))))
+          (is (= outcome (if (= :closed (:cleanup-phase (cleanup/info owner))) :closed :uncertain))))))))
+
+(deftest definite-branch-removal-failure-is-retryable
+  (doseq [registered? [true false]]
+    (let [{:keys [owner root child] :as f} (fixture)
+          calls (atom [])
+          failure (ex-info "Injected konserve write error" {})
+          fail? (atom true)]
+      (open! f)
+      (with-redefs [d/release #(swap! calls conj [:release %])
+                    versioning/delete-branch! (fn [_ branch _]
+                                                (swap! calls conj [:remove branch])
+                                                (when @fail? (throw failure)))
+                    versioning/branches (fn [conn _]
+                                          (is (identical? root conn))
+                                          (if registered? #{:db :cleanup-test} #{:db}))]
+        (if registered?
+          (let [error (try (cleanup/discard! owner {}) nil (catch Exception error error))]
+            (is (identical? failure (ex-cause error)))
+            (is (= :yggdrasil/overlay-cleanup-failed (:type (ex-data error))))
+            (is (= {:cleanup-phase :child-released :in-flight nil :uncertain nil}
+                   (select-keys (cleanup/info owner) [:cleanup-phase :in-flight :uncertain])))
+            (reset! fail? false)
+            (is (nil? (cleanup/discard! owner {})))
+            (is (= [[:release child] [:remove :cleanup-test] [:remove :cleanup-test] [:release root]] @calls)
+                "The retry resumes at removal; the child is released once"))
+          (do (is (nil? (cleanup/discard! owner {})) "An unregistered branch was removed")
+              (is (= [[:release child] [:remove :cleanup-test] [:release root]] @calls))))
+        (is (= :closed (:cleanup-phase (cleanup/info owner))))))))
 
 (deftest acquisition-faults-retain-locators-without-speculative-compensation
   (doseq [phase [:canonical-connect :child-connect]]

@@ -14,6 +14,7 @@
             [datahike.writing :as dw]
             [yggdrasil.adapters.datahike :as dha]
             [yggdrasil.adapters.cleanup-test-support :as cleanup-test]
+            [yggdrasil.adapters.datahike-cleanup :as cleanup]
             [yggdrasil.convergent.overlay :as ovl]
             [yggdrasil.hooks :as hooks]
             [yggdrasil.protocols :as p]
@@ -238,28 +239,39 @@
         (is (= #{"A"} (historical-note-ids *conn*))))
       (finally (cleanup-test/dispose-known! (:cleanup-owner ov))))))
 
-(deftest datahike-overlay-discard-delete-failure-retains-branch-and-refuses-replay
+(deftest datahike-overlay-discard-delete-failure-retains-branch-and-resumes-on-retry
   (seed-historical-notes!)
   (let [sys (dha/create *conn*)
         ov (p/overlay sys {:snapshot (p/snapshot-id sys)})
         branch (p/current-branch (ovl/overlay-system ov))
+        owned (:conn (ovl/overlay-system ov))
+        release d/release
+        released (atom [])
         entered (atom 0)]
     (try
-      (let [error (try
-                    (with-redefs [dv/delete-branch! (fn [& _]
-                                                      (swap! entered inc)
-                                                      (throw (ex-info "delete failed" {})))]
-                      (p/discard! ov))
-                    nil
-                    (catch Exception error error))]
-        (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
-        (is (= 1 @entered))
-        (is (= branch (:branch (ex-data error))))
-        (is (contains? (p/branches sys) branch))
-        (is (= #{"A"} (historical-note-ids *conn*))))
-      (is (thrown? clojure.lang.ExceptionInfo (p/discard! ov)))
-      (is (= 1 @entered))
-      (finally (cleanup-test/dispose-known! (:cleanup-owner ov))))))
+      (with-redefs [d/release (fn [conn & args]
+                                (swap! released conj (identical? owned conn))
+                                (apply release conn args))]
+        (let [error (try
+                      (with-redefs [dv/delete-branch! (fn [& _]
+                                                        (swap! entered inc)
+                                                        (throw (ex-info "delete failed" {})))]
+                        (p/discard! ov))
+                      nil
+                      (catch Exception error error))]
+          ;; The registry still names the branch: removal definitely failed.
+          (is (= :yggdrasil/overlay-cleanup-failed (:type (ex-data error))))
+          (is (= 1 @entered))
+          (is (= branch (:branch (ex-data error))))
+          (is (contains? (p/branches sys) branch))
+          (is (= #{"A"} (historical-note-ids *conn*))))
+        (p/discard! ov)
+        (is (= [true false] @released) "The retry releases the child no second time"))
+      (is (not (contains? (p/branches sys) branch)))
+      (is (= :closed (:cleanup-phase (cleanup/info (:cleanup-owner ov)))))
+      (finally
+        (when-not (= :closed (:cleanup-phase (cleanup/info (:cleanup-owner ov))))
+          (cleanup-test/dispose-known! (:cleanup-owner ov)))))))
 
 (deftest durable-commit-hook-emits-a-complete-dag-event
   (let [sys    (dha/create *conn* {:system-name "event-test"})
