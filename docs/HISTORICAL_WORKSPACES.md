@@ -77,6 +77,13 @@ and been disposed when another copy is discarded. Reseating overlay writes
 does not transfer ownership. Datahike merge-down uses its captured parent and
 does not acquire an additional unowned checkout lease.
 
+A throwing branch allocation is resolved by reading the branch registry
+through the owned canonical lease, not inferred from the exception. A
+registered branch was allocated and is disposed like any other; an
+unregistered one was not, and the lease is released. Either way the native
+error propagates. This relies on a returned native call having no write still
+in flight. Only a failed registry read leaves the allocation uncertain.
+
 Successful cleanup is idempotent. A concurrent cleanup cannot dispatch another
 release. Each native operation is marked in-flight before dispatch; a missing
 acknowledgement retains the opaque owner and safe branch/phase locators, and

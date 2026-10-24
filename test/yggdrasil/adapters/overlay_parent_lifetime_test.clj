@@ -3,6 +3,7 @@
             [datahike.api :as d]
             [datahike.connections :as connections]
             [datahike.store :as store]
+            [datahike.versioning :as dv]
             [geschichte.repo :as repo]
             [yggdrasil.adapters.datahike :as dh]
             [yggdrasil.adapters.datahike-cleanup :as cleanup]
@@ -101,3 +102,30 @@
           (p/discard! unrelated)
           (is (= baseline (conn-count conn)))
           (is (= #{:db} (d/branches conn))))))))
+
+(deftest failed-branch-allocation-releases-the-acquired-canonical-lease
+  ;; :refused throws before any write (a konserve write error); :registered
+  ;; throws after the branch reached the registry (a lost acknowledgement).
+  ;; Either outcome is observable through the owned canonical lease, so neither
+  ;; may strand that lease or the branch.
+  (doseq [kind [:geschichte :datahike]
+          historical? [false true]
+          fault [:refused :registered]]
+    (with-source kind
+      (fn [conn system _]
+        (let [baseline (conn-count conn)
+              before (d/branches conn)
+              failure (ex-info "Injected konserve write error" {})
+              branch! dv/branch!
+              calls (atom 0)
+              opts (if historical? {:snapshot (p/snapshot-id system)} {})
+              error (with-redefs [dv/branch! (fn [& args]
+                                               (swap! calls inc)
+                                               (when (= :registered fault) (apply branch! args))
+                                               (throw failure))]
+                      (try (p/overlay system opts) nil
+                           (catch Throwable error error)))]
+          (is (= 1 @calls))
+          (is (identical? failure error) "A resolved allocation failure is the native error")
+          (is (= baseline (conn-count conn)) "The canonical cleanup lease is released")
+          (is (= before (d/branches conn)) "No allocated branch is left behind"))))))
