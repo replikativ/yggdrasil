@@ -54,9 +54,10 @@
           (and (= :cleanup operation) (= :closed (:cleanup-phase before))) false
           (or (:uncertain before) (:in-flight before))
           (throw (uncertain! owner "Overlay operation is pending or uncertain; do not retry automatically" nil))
-          (not= (:stage before) (case operation
-                                  :canonical-connect :new :branch-allocation :canonical-open
-                                  :child-connect :branch-open :cleanup :child-open))
+          (not (contains? (case operation
+                            :canonical-connect #{:new} :branch-allocation #{:canonical-open}
+                            :child-connect #{:branch-open} :cleanup #{:branch-open :child-open})
+                          (:stage before)))
           (throw (uncertain! owner "Overlay operation has an invalid ownership phase" nil))
           (compare-and-set! a before (assoc before :in-flight operation)) true
           :else (recur))))))
@@ -110,13 +111,49 @@
                      (acknowledged! owner {:stage :child-open :child-conn conn})
                      conn)
                    (catch #?(:clj Throwable :cljs :default) error (failed! owner error)))))))
+(declare discard!)
+
+(defn- with-primary [cleanup-error primary]
+  (ex-info (ex-message cleanup-error)
+           (assoc (ex-data cleanup-error) :cleanup-errors [cleanup-error]) primary))
+
 (defn construction-failed!
-  "Retain an uncertain construction owner, including acquisition locators.
-   Does not infer that a throwing allocator/connect had no side effects."
-  [owner error]
-  (if (identical? owner (::owner (ex-data error)))
-    (throw error)
-    (failed! owner error)))
+  "Resolve or retain a failed construction step. A throwing branch allocation
+   is resolved by observing the branch registry through our canonical lease,
+   never inferred from the exception: an unregistered branch was not allocated,
+   so the lease is released; a registered one was, so it is disposed. Either way
+   the native error is rethrown. Any other step, or a failed observation,
+   retains an uncertain owner with its acquisition locators."
+  ([owner error] (construction-failed! owner error {}))
+  ([owner error opts]
+   (let [s? (sync? opts)]
+     (async+sync s?
+                 (async
+                  (cond
+                    (identical? owner (::owner (ex-data error))) (throw error)
+                    (not= :branch-allocation (:in-flight @(state owner))) (failed! owner error)
+                    :else
+                    (let [{:keys [cleanup-conn branch]} @(state owner)
+                          registered (try
+                                       (contains? (set (await (ca/sync-or-cps (versioning/branches cleanup-conn {:sync? s?})
+                                                                              {:sync? s?})))
+                                                  branch)
+                                       (catch #?(:clj Throwable :cljs :default) _ (failed! owner error)))]
+                      (if registered
+                        (do (acknowledged! owner {:stage :branch-open})
+                            (try
+                              (await (discard! owner opts))
+                              (catch #?(:clj Throwable :cljs :default) cleanup-error
+                                (throw (with-primary cleanup-error error)))))
+                        (do (swap! (state owner) assoc :in-flight :canonical-release)
+                            (try (d/release cleanup-conn)
+                                 (catch #?(:clj Throwable :cljs :default) release-error
+                                   (swap! (state owner) assoc :uncertain :canonical-release)
+                                   (throw (with-primary (uncertain! owner "Overlay native operation did not acknowledge completion"
+                                                                    release-error)
+                                            error))))
+                            (acknowledged! owner {:cleanup-phase :closed})))
+                      (throw error))))))))
 
 (defn discard!
   "Release child, remove branch through our canonical lease, then release that
@@ -129,12 +166,12 @@
                  (when (begin! owner :cleanup)
                    (try
                      (let [{:keys [child-conn cleanup-conn branch stage]} @(state owner)]
-                       (when-not (= :child-open stage)
-                         (throw (ex-info "Overlay construction has no complete child ownership acknowledgement" {})))
                ;; Keep an in-flight marker around each operation. No later
                ;; call repeats a successful release after an intervening fault.
-                       (swap! (state owner) assoc :in-flight :child-release)
-                       (d/release child-conn)
+               ;; An allocated branch without a child connection has none to release.
+                       (when (= :child-open stage)
+                         (swap! (state owner) assoc :in-flight :child-release)
+                         (d/release child-conn))
                        (swap! (state owner) assoc :cleanup-phase :child-released :in-flight :branch-removal)
                        (await (ca/sync-or-cps (versioning/delete-branch! cleanup-conn branch {:sync? s?}) {:sync? s?}))
                        (swap! (state owner) assoc :cleanup-phase :branch-removed :in-flight :canonical-release)

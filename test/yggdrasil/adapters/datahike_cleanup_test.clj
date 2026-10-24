@@ -121,3 +121,46 @@
         (is (identical? wrong (get @(@#'cleanup/state owner)
                                    (if (= phase :canonical-connect) :cleanup-conn :child-conn))))
         (is (not= :child-open (:stage (cleanup/info owner))))))))
+
+(deftest failed-allocation-is-resolved-through-the-owned-registry
+  (doseq [observed [:unregistered :registered :unobservable :release-fails]]
+    (let [{:keys [owner root]} (fixture)
+          failure (ex-info "Injected allocation failure" {})
+          calls (atom [])]
+      (with-redefs [d/connect (fn [& _] root)
+                    versioning/branches (fn [conn _]
+                                          (is (identical? root conn))
+                                          (case observed
+                                            :unobservable (throw (ex-info "Registry read failed" {}))
+                                            :registered #{:db :cleanup-test}
+                                            #{:db}))
+                    d/release (fn [conn]
+                                (swap! calls conj :release)
+                                (is (identical? root conn))
+                                (when (= :release-fails observed) (throw (ex-info "Lost release ACK" {}))))
+                    versioning/delete-branch! (fn [conn branch _]
+                                                (is (identical? root conn))
+                                                (swap! calls conj [:remove branch]))]
+        (cleanup/acquire! owner {})
+        (cleanup/allocating! owner)
+        (let [error (try (cleanup/construction-failed! owner failure {}) nil
+                         (catch Exception error error))]
+          (case observed
+            :unregistered (do (is (identical? failure error))
+                              (is (= [:release] @calls))
+                              (is (= :closed (:cleanup-phase (cleanup/info owner)))))
+            :registered (do (is (identical? failure error))
+                            (is (= [[:remove :cleanup-test] :release] @calls))
+                            (is (= :closed (:cleanup-phase (cleanup/info owner)))))
+            :unobservable (do (is (identical? failure (ex-cause error)))
+                              (is (= :yggdrasil/overlay-allocation-uncertain (:type (ex-data error))))
+                              (is (= :branch-allocation (:uncertain (cleanup/info owner))))
+                              (is (empty? @calls)))
+            :release-fails (do (is (identical? failure (ex-cause error)))
+                               (is (= :yggdrasil/overlay-cleanup-uncertain (:type (ex-data error))))
+                               (is (= :canonical-release (:uncertain (cleanup/info owner))))
+                               (is (= [:release] @calls))))
+          (when-not (= :closed (:cleanup-phase (cleanup/info owner)))
+            (is (identical? owner (:yggdrasil.adapters.datahike-cleanup/owner (ex-data error))))
+            (is (thrown? clojure.lang.ExceptionInfo (cleanup/discard! owner {})))
+            (is (= (if (= :release-fails observed) [:release] []) @calls))))))))

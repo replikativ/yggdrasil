@@ -1121,7 +1121,7 @@
                        (await (p/branch! this fbranch (if historical? base pbranch) {:sync? s?}))
                        (cleanup/allocated! owner)
                        (catch #?(:clj Throwable :cljs :default) error
-                         (cleanup/construction-failed! owner error)))
+                         (await (cleanup/construction-failed! owner error {:sync? s?}))))
                      (try
                        (let [child-conn (await (cleanup/connect-child! owner {:sync? s?}))
                              forked (->DatahikeSystem child-conn system-name)]
@@ -1133,7 +1133,7 @@
               ;; losing its acknowledgement. Without the exact returned conn,
               ;; deleting the branch would erase its only recovery locator.
                          (when-not @connected
-                           (cleanup/construction-failed! owner error))
+                           (await (cleanup/construction-failed! owner error {:sync? s?})))
                          (try
                            (await (cleanup/discard! owner {:sync? s?}))
                            (catch #?(:clj Throwable :cljs :default) cleanup

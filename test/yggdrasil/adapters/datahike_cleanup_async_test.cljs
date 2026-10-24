@@ -80,3 +80,38 @@
         (set! d/connect original-connect)
         (set! d/release original-release)
         (set! versioning/delete-branch! original-delete)))))
+
+(deftest-async async-failed-allocation-releases-the-canonical-lease
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :branch :db}
+        root (atom {:config cfg})
+        original-connect d/connect
+        original-release d/release
+        original-branches versioning/branches
+        calls (atom [])
+        failure (js/Error. "Injected allocation failure")]
+    (set! d/connect (fn [_ opts]
+                      (is (false? (:sync? opts)))
+                      (channel root)))
+    (set! d/release (fn [conn]
+                      (swap! calls conj [:release (get-in @conn [:config :branch])])
+                      nil))
+    ;; Multi-arity like the native fn: compiled callers dispatch by arity.
+    (set! versioning/branches (fn
+                                ([_conn] (throw (js/Error. "Expected explicit async options")))
+                                ([_conn opts]
+                                 (is (false? (:sync? opts)))
+                                 (swap! calls conj :observe)
+                                 (channel #{:db}))))
+    (try
+      (let [owner (cleanup/owner root :async-child "basis")]
+        (<? (cleanup/acquire! owner {:sync? false}))
+        (cleanup/allocating! owner)
+        (let [error (try (<? (cleanup/construction-failed! owner failure {:sync? false})) nil
+                         (catch :default error error))]
+          (is (identical? failure error))
+          (is (= [:observe [:release :db]] @calls))
+          (is (= :closed (:cleanup-phase (cleanup/info owner))))))
+      (finally
+        (set! d/connect original-connect)
+        (set! d/release original-release)
+        (set! versioning/branches original-branches)))))
