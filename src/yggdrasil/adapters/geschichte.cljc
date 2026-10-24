@@ -328,7 +328,7 @@
                                 :cleanup (cleanup/info owner) :yggdrasil.adapters.datahike-cleanup/owner owner
                                 :cleanup-errors [cleanup-error]} error))
                (throw error)))
-           (cleanup/construction-failed! owner error)))))))
+           (await (cleanup/construction-failed! owner error execution/default-opts))))))))
 
 (defn- historical-overlay
   "Construct one owned physical workspace at a committed logical snapshot.

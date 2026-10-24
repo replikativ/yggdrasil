@@ -77,11 +77,25 @@ and been disposed when another copy is discarded. Reseating overlay writes
 does not transfer ownership. Datahike merge-down uses its captured parent and
 does not acquire an additional unowned checkout lease.
 
+A throwing branch allocation is resolved by reading the branch registry
+through the owned canonical lease, not inferred from the exception. A
+registered branch was allocated and is disposed like any other; an
+unregistered one was not, and the lease is released. Either way the native
+error propagates. This relies on a returned native call having no write still
+in flight. Only a failed registry read leaves the allocation uncertain.
+
 Successful cleanup is idempotent. A concurrent cleanup cannot dispatch another
-release. Each native operation is marked in-flight before dispatch; a missing
+release: it joins the running cleanup and returns or throws its outcome (a
+ClojureScript caller passing `:sync? true` cannot block and is refused). Each native operation is marked in-flight before dispatch; a missing
 acknowledgement retains the opaque owner and safe branch/phase locators, and
-refuses automatic replay. For example, acknowledged child release followed by
-uncertain branch removal retains the canonical cleanup lease. Native owners in
-internal exception data are not portable receipts and must never be serialized
-or exposed to an interpreter. Explicit operator reconciliation of uncertainty
+refuses automatic replay. Branch removal alone is observable: when it throws,
+the registry is read through the canonical lease. An unregistered branch was
+removed and cleanup continues; a still-registered one is a definite failure
+(`:yggdrasil/overlay-cleanup-failed`) that retains the owner, and a later
+`discard!` resumes at removal without repeating the child release. Releases
+are not observable, so their failures stay uncertain. For example, acknowledged
+child release followed by uncertain branch removal (the registry read failed
+too) retains the canonical cleanup lease. Native owners in internal exception
+data are not portable receipts and must never be serialized or exposed to an
+interpreter. Explicit operator reconciliation of uncertainty
 is separate; these APIs do not infer rollback or success from an exception.
