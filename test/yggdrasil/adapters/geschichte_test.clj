@@ -6,7 +6,8 @@
    but NOT Mergeable, so a Geschichte-backed system had no `diff` at all and
    consumers fell back to a bare datom count of geschichte's INTERNAL
    commit/tree/blob schema."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
@@ -619,6 +620,34 @@
   {:version 1 :kind :datahike :commit (d/commit-id db)
    :source {:store (get-in db [:config :store :id])
             :repository (:geschichte.repo/id (query/repository db))}})
+
+(deftest generated-overlay-branches-round-trip-through-edn
+  ;; Force the formerly failing prefix while retaining fresh IDs for every
+  ;; allocation, including the repository's own native resources.
+  (let [fresh-uuid random-uuid]
+    (with-redefs [clojure.core/random-uuid
+                  (fn [] (java.util.UUID/fromString
+                          (str "0" (subs (str (fresh-uuid)) 1))))]
+      (with-repo
+        (fn [conn]
+          (let [commit (commit-file! conn "state.txt" "base" "base")
+                system (gy/create conn)
+                checkpoint (physical-checkpoint @conn)
+                branches (workspace/list conn)]
+            (doseq [[kind create] [[:ordinary #(p/overlay system {})]
+                                   [:historical #(p/overlay system {:snapshot commit})]
+                                   [:checkpoint #(p/overlay-at-checkpoint system checkpoint)]]]
+              (testing (name kind)
+                (let [child (create)]
+                  (try
+                    (let [basis {:branch (second (gy/workspace-id child))
+                                 :base (p/base-ref child)
+                                 :checkpoint (:checkpoint child)}]
+                      (is (str/starts-with? (name (:branch basis)) "overlay-0"))
+                      (is (= basis (edn/read-string (pr-str basis))))
+                      (is (= "base" (text (repo/read (gy/connection child) "state.txt")))))
+                    (finally (p/discard! child))))
+                (is (= branches (workspace/list conn)))))))))))
 
 (deftest exact-checkpoint-retains-the-entire-repository-state-without-resetting-parent
   (with-repo
