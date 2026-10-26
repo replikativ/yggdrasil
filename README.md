@@ -204,6 +204,7 @@ These are the supported namespaces. **Everything else under `yggdrasil.*` is imp
 | IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes | - | yes |
 | Iceberg | snapshots | branches | full DAG | manual | - | poll | yes | - | yes |
 | Datahike | commit-id | branch! | full DAG | merge! | branch fork | via hooks¹ | yes | - | - |
+| Geschichte | logical commits | logical refs | full DAG | 3-way | Datahike workspace | - | yes | - | yes |
 | Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes | yes | yes |
 | OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes | yes | yes |
 | Podman | image layers | containers | full DAG | diff+apply | - | poll | yes | - | yes |
@@ -501,6 +502,92 @@ Wraps a Datahike connection, using its internal versioning system. Uses `d/liste
 ```
 
 Requires Datahike on the classpath.
+
+### Geschichte Adapter
+
+Requires Geschichte and Datahike on the classpath. Logical Git refs and commits
+live inside an isolated, structurally shared Datahike workspace branch.
+The adapter requires Geschichte's checkpoint workspace API from commit
+`c3c8239f048b30e4cb56dbadf5d078999aba2de3` ([Geschichte #21](https://github.com/replikativ/geschichte/pull/21))
+or a release containing it. The test and Node aliases pin that public source
+revision until the corresponding release is available.
+
+```clojure
+(require '[yggdrasil.adapters.geschichte :as geschichte]
+         '[yggdrasil.protocols :as p])
+
+(def sys (geschichte/create conn {:system-name "knowledge"}))
+
+;; A logical Git commit: reconstruct its files/index in a private workspace.
+(def historical (p/overlay-at sys logical-commit-id))
+
+;; An exact physical checkpoint: includes dirty files, stage, refs, schema,
+;; history and other repository attributes as captured at that Datahike commit.
+(def exact
+  (p/overlay-at-checkpoint
+   sys {:version 1 :kind :datahike :commit datahike-commit-id
+        :source {:store store-uuid :repository repository-uuid}}))
+
+(geschichte/connection exact) ; private child connection
+(p/discard! exact)            ; release only its owned resources
+(p/discard! historical)
+```
+
+These origins are distinct. A logical commit overlay may retain other current
+database state; it does not promise a complete historical database. A checkpoint
+overlay starts a new physical branch directly from the exact stored Datahike
+record, without resetting or reconnecting the parent. No file bodies are copied
+up front. The new branch configuration is intentional; connections must preserve
+the checkpoint's source identity, schema, transaction counters and immutable
+secondary-generation addresses. Checkpoints with building secondary indices are
+refused, because Datahike deliberately drops their unfinished generations when
+branching. Missing or mismatched checkpoints never fall back to current state.
+
+Repository checkpoint resolution, named branch allocation and connected-child
+verification live in `geschichte.workspace`. The adapter delegates those steps
+and retains its existing native acquisition/cleanup owner. It records allocation
+ACK before connecting or verifying the child. Generic Yggdrasil dispatch checks
+capabilities, execution mode and bounded portable descriptor data; each adapter
+interprets its own descriptor fields. The Datahike/store/repository descriptor
+above belongs to Geschichte and is not required of other Yggdrasil systems.
+
+The closed descriptor is an identity assertion, not authorization or a GC lease.
+The caller must retain the source checkpoint before construction and retain the
+historical bytes for any promised execution/evidence lifetime. Keeping its UUID
+after discarding a workspace does not by itself preserve that evidence.
+
+`:checkpoint-overlay true` is a separate positive capability, accompanied by
+`:checkpoint-overlay-modes` (`#{:sync}` on JVM, `#{:async}` on CLJS for this
+adapter). Absent `:sync?` follows the platform default; an explicit unsupported
+or non-boolean mode refuses before source IO or allocation. Use the guarded
+`overlay-at-checkpoint` constructor rather than assuming every overlay adapter
+understands `:checkpoint`. It cannot be combined with `:snapshot`. Failed native
+allocation/connect acknowledgements retain the exact existing cleanup owner;
+callers must not guess-delete or automatically replay uncertain construction.
+
+For whole-plan preflight before allocating any child, use
+`supports-checkpoint-validation?` followed by `validate-checkpoint-origin!`.
+The support predicate checks only capabilities and the optional
+`CheckpointOriginValidator` protocol. The validator reads and verifies the
+source checkpoint and returns the original descriptor, directly on JVM or as
+CPS on CLJS, without allocating a branch, connection, cleanup owner or GC lease.
+Geschichte uses the same source checks for validation and construction, and
+construction repeats them: successful preflight is not a promise that a later
+unretained checkpoint will remain available. A capability advertisement without
+the validator protocol cannot satisfy this preflight.
+
+Child verification compares the constant number of primary index root addresses
+(or shared immutable root identity for an in-memory store), plus source metadata
+and secondary generations. It does not scan the whole database or read file
+bodies to establish the copied root.
+
+This fixes the **initial repository state**, not every input to a computation.
+Attached/global code roots, network access and remote workers need their own
+declared policies. The child remains writable. Merge still uses the checkpoint's
+logical Git HEAD as its base, not its Datahike commit ID; inherited dirty changes
+can enter a later child commit. Existing conflict handling and dirty-parent
+refusal remain in force. A checkpoint is not a claim that only post-checkpoint
+edits will be published, nor proof of which files an agent actually read.
 
 ### LakeFS Adapter
 

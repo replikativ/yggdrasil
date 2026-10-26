@@ -301,34 +301,55 @@
 (defn- owned-overlay
   "Allocate one overlay with independent native cleanup ownership. Historical
    and ordinary construction share acknowledgement and failure semantics."
-  [parent conn system-name base historical-commit]
+  ([parent conn system-name base historical-commit]
+   (owned-overlay parent conn system-name base historical-commit nil nil))
+  ([parent conn system-name base historical-commit checkpoint-db origin]
+   (platform-async
+    (let [branch (workspace/branch-key (random-uuid))
+          owner (cleanup/owner conn branch base)
+          child (atom nil)]
+      (try
+        (await (cleanup/acquire! owner execution/default-opts))
+        (cleanup/allocating! owner)
+        (if checkpoint-db
+          (await (workspace/fork-at-checkpoint! conn branch origin checkpoint-db))
+          (await (workspace/fork! conn branch)))
+        (cleanup/allocated! owner)
+        (let [child-conn (await (cleanup/connect-child! owner execution/default-opts))]
+          (reset! child child-conn)
+          (when checkpoint-db
+            (workspace/verify-checkpoint-workspace! checkpoint-db @child-conn branch))
+          (when historical-commit
+            (await (repo/materialize-bytes! child-conn [] {:force? true}))
+            (await (repo/reset! child-conn historical-commit {:mode :hard})))
+          (->GeschichteOverlay parent (atom (->GeschichteSystem child-conn system-name))
+                               branch base :frozen child-conn owner))
+        (catch #?(:clj Throwable :cljs :default) error
+          (if @child
+            (let [cleanup-error (try (await (cleanup/discard! owner execution/default-opts)) nil
+                                     (catch #?(:clj Throwable :cljs :default) failure failure))]
+              (if cleanup-error
+                (throw (ex-info "Geschichte overlay construction cleanup is uncertain"
+                                {:type ::historical-construction-incomplete
+                                 :cleanup (cleanup/info owner) :yggdrasil.adapters.datahike-cleanup/owner owner
+                                 :cleanup-errors [cleanup-error]} error))
+                (throw error)))
+            (cleanup/construction-failed! owner error))))))))
+
+(defn- resolve-checkpoint-origin [parent conn checkpoint opts]
   (platform-async
-   (let [branch (workspace/branch-key (random-uuid))
-         owner (cleanup/owner conn branch base)
-         child (atom nil)]
-     (try
-       (await (cleanup/acquire! owner execution/default-opts))
-       (cleanup/allocating! owner)
-       (await (workspace/fork! conn branch))
-       (cleanup/allocated! owner)
-       (let [child-conn (await (cleanup/connect-child! owner execution/default-opts))]
-         (reset! child child-conn)
-         (when historical-commit
-           (await (repo/materialize-bytes! child-conn [] {:force? true}))
-           (await (repo/reset! child-conn historical-commit {:mode :hard})))
-         (->GeschichteOverlay parent (atom (->GeschichteSystem child-conn system-name))
-                              branch base :frozen child-conn owner))
-       (catch #?(:clj Throwable :cljs :default) error
-         (if @child
-           (let [cleanup-error (try (await (cleanup/discard! owner execution/default-opts)) nil
-                                    (catch #?(:clj Throwable :cljs :default) failure failure))]
-             (if cleanup-error
-               (throw (ex-info "Geschichte overlay construction cleanup is uncertain"
-                               {:type ::historical-construction-incomplete
-                                :cleanup (cleanup/info owner) :yggdrasil.adapters.datahike-cleanup/owner owner
-                                :cleanup-errors [cleanup-error]} error))
-               (throw error)))
-           (cleanup/construction-failed! owner error)))))))
+   (when-not (p/supports-checkpoint-overlay? parent opts)
+     (throw (ex-info "Unsupported Geschichte checkpoint mode" {:type ::invalid-checkpoint})))
+   (let [db (await (workspace/resolve-checkpoint conn checkpoint (select-keys opts [:sync?])))
+         base (get (query/refs db) (query/current-ref db))]
+     {:db db :base (some-> base str)})))
+
+(defn- checkpoint-overlay [parent conn system-name {:keys [checkpoint] :as opts}]
+  (platform-async
+   (let [{:keys [db base]}
+         (await (resolve-checkpoint-origin parent conn checkpoint (dissoc opts :checkpoint)))]
+     (assoc (await (owned-overlay parent conn system-name base nil db checkpoint))
+            :checkpoint checkpoint))))
 
 (defn- historical-overlay
   "Construct one owned physical workspace at a committed logical snapshot.
@@ -355,7 +376,8 @@
   (system-type [_] :geschichte)
   (capabilities [_]
     (assoc (t/->Capabilities true true true true true false true false true)
-           :snapshot-overlay true))
+           :snapshot-overlay true :checkpoint-overlay true
+           :checkpoint-overlay-modes #{#?(:clj :sync :cljs :async)}))
 
   p/Snapshotable
   (snapshot-id [_] (some-> (head conn) :geschichte.commit/id str))
@@ -605,11 +627,18 @@
            {:system-id system-name
             :reclaimed (if (counted? removed) (count removed) 0)})))))
 
+  p/CheckpointOriginValidator
+  (-validate-checkpoint-origin [this descriptor opts]
+    (platform-async
+     (await (resolve-checkpoint-origin this conn descriptor opts))
+     descriptor))
+
   p/Overlayable
   (overlay [this opts]
-    (if (contains? opts :snapshot)
-      (historical-overlay this conn system-name opts)
-      (owned-overlay this conn system-name (p/snapshot-id this) nil))))
+    (cond
+      (contains? opts :checkpoint) (checkpoint-overlay this conn system-name opts)
+      (contains? opts :snapshot) (historical-overlay this conn system-name opts)
+      :else (owned-overlay this conn system-name (p/snapshot-id this) nil))))
 
 (defn create
   "Wrap an initialized Geschichte connection as a Yggdrasil system."

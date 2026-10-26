@@ -377,13 +377,105 @@
    (when-not (and (or (nil? opts) (map? opts))
                   (or (uuid? snapshot) (and (string? snapshot) (seq snapshot)))
                   (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
-                  (not (contains? opts :snapshot)))
+                  (not (contains? opts :snapshot))
+                  (not (contains? opts :checkpoint)))
      (throw (ex-info "Invalid historical workspace request"
                      {:type ::invalid-historical-workspace})))
    (when-not (supports-snapshot-overlay? system)
      (throw (ex-info "System does not support isolated historical workspaces"
                      {:type ::unsupported-historical-workspace})))
    (overlay system (assoc (or opts {}) :snapshot snapshot :mode :frozen))))
+
+(defn checkpoint-origin?
+  "Nonnil portable adapter-defined data, without backend field assumptions.
+   Bound descriptor traversal to 1024 values, depth 16, collection width 256
+   and string length 8192. Native handles, metadata, records and lazy sequences refuse.
+   This validates transport shape only; the adapter validates its own identity."
+  [value]
+  (and (some? value)
+       (loop [pending [[value 0]] visited 0]
+         (if (empty? pending) true
+             (let [[v depth] (peek pending) remaining (pop pending)]
+               (and (< visited 1024) (<= depth 16) (not (seq (meta v)))
+                    (cond
+                      (or (nil? v) (boolean? v) (keyword? v) (symbol? v) (uuid? v))
+                      (recur remaining (inc visited))
+                      (string? v) (and (<= (count v) 8192) (recur remaining (inc visited)))
+                      (number? v) (and #?(:clj (Double/isFinite (double v)) :cljs (js/isFinite v))
+                                       (recur remaining (inc visited)))
+                      (record? v) false
+                      (or (map? v) (vector? v) (set? v) (list? v))
+                      (and (<= (count v) 256)
+                           (recur (into remaining (map #(vector % (inc depth)))
+                                        (if (map? v) (mapcat identity v) v)) (inc visited)))
+                      :else false)))))))
+
+(defn supports-checkpoint-overlay?
+  "Pure capability/execution check, before allocation or source loading.
+   Absent :sync? uses the platform default; explicit modes never fall back."
+  ([system] (supports-checkpoint-overlay? system nil))
+  ([system opts]
+   (and (or (nil? opts) (map? opts))
+        (every? #{:sync? :mode} (keys opts))
+        (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
+        (or (not (contains? opts :sync?)) (boolean? (:sync? opts)))
+        (satisfies? SystemIdentity system) (satisfies? Overlayable system)
+        (let [caps (capabilities system) modes (:checkpoint-overlay-modes caps)
+              sync? (get opts :sync? #?(:clj true :cljs false))]
+          (and (true? (:checkpoint-overlay caps)) (set? modes)
+               (contains? modes (if sync? :sync :async)))))))
+
+(defprotocol CheckpointOriginValidator
+  "Optional read-only source validation, distinct from workspace allocation."
+  (-validate-checkpoint-origin [system descriptor opts]
+    "Verify the exact source is currently readable; return descriptor unchanged.
+     Preserve the adapter's value-or-CPS convention. Never allocate a workspace,
+     acquire retention or return native database/connection handles."))
+
+(defn supports-checkpoint-validation?
+  "Pure check for advertised checkpoint execution support and its validator."
+  ([system] (supports-checkpoint-validation? system nil))
+  ([system opts]
+   (and (supports-checkpoint-overlay? system opts)
+        (satisfies? CheckpointOriginValidator system))))
+
+(defn validate-checkpoint-origin!
+  "Read-only preflight of an adapter-specific checkpoint before allocation.
+   This proves current availability, not permission or future GC retention.
+   Returns the same portable descriptor, using the adapter's value-or-CPS mode.
+   Construction must still revalidate after preflight."
+  ([system descriptor] (validate-checkpoint-origin! system descriptor nil))
+  ([system descriptor opts]
+   (when-not (and (checkpoint-origin? descriptor)
+                  (or (nil? opts) (map? opts))
+                  (every? #{:sync? :mode} (keys opts))
+                  (or (not (contains? opts :sync?)) (boolean? (:sync? opts)))
+                  (or (not (contains? opts :mode)) (= :frozen (:mode opts))))
+     (throw (ex-info "Invalid checkpoint validation request"
+                     {:type ::invalid-checkpoint-validation})))
+   (when-not (supports-checkpoint-validation? system opts)
+     (throw (ex-info "System does not support checkpoint validation"
+                     {:type ::unsupported-checkpoint-validation})))
+   (-validate-checkpoint-origin system descriptor (or opts {}))))
+
+(defn overlay-at-checkpoint
+  "Create an owned workspace from an exact adapter-specific checkpoint.
+   The descriptor is portable adapter-defined data; generic dispatch does not
+   interpret its fields. The adapter validates its shape and exact source before
+   allocation. The caller owns checkpoint retention and authorization.
+   Preserve the adapter's value-or-CPS result; unsupported systems refuse."
+  ([system checkpoint] (overlay-at-checkpoint system checkpoint nil))
+  ([system checkpoint opts]
+   (when-not (and (checkpoint-origin? checkpoint) (or (nil? opts) (map? opts))
+                  (every? #{:sync? :mode} (keys opts))
+                  (or (not (contains? opts :sync?)) (boolean? (:sync? opts)))
+                  (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
+                  (not-any? #(contains? opts %) [:snapshot :checkpoint]))
+     (throw (ex-info "Invalid checkpoint workspace request" {:type ::invalid-checkpoint-workspace})))
+   (when-not (supports-checkpoint-overlay? system opts)
+     (throw (ex-info "System does not support exact checkpoint workspaces"
+                     {:type ::unsupported-checkpoint-workspace})))
+   (overlay system (assoc (or opts {}) :checkpoint checkpoint :mode :frozen))))
 
 ;; NOTE: the per-system runtime-mode helpers `system-sync?`/`system-async?` were
 ;; REMOVED — a system no longer carries an execution mode (`:opts {:sync?}` was
