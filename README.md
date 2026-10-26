@@ -204,6 +204,7 @@ These are the supported namespaces. **Everything else under `yggdrasil.*` is imp
 | IPFS | commit CIDs | IPNS names | full DAG | manual | - | poll | yes | - | yes |
 | Iceberg | snapshots | branches | full DAG | manual | - | poll | yes | - | yes |
 | Datahike | commit-id | branch! | full DAG | merge! | branch fork | via hooks¹ | yes | - | - |
+| Geschichte | logical commits | logical refs | full DAG | 3-way | Datahike workspace | - | yes | - | yes |
 | Scriptum | generations | COW dirs | full DAG | add-only | - | - | yes | yes | yes |
 | OverlayFS | upper dir archives | overlay dirs | full DAG | file-level | - | poll | yes | yes | yes |
 | Podman | image layers | containers | full DAG | diff+apply | - | poll | yes | - | yes |
@@ -501,6 +502,69 @@ Wraps a Datahike connection, using its internal versioning system. Uses `d/liste
 ```
 
 Requires Datahike on the classpath.
+
+### Geschichte Adapter
+
+Requires Geschichte and Datahike on the classpath. Logical Git refs and commits
+live inside an isolated, structurally shared Datahike workspace branch.
+
+```clojure
+(require '[yggdrasil.adapters.geschichte :as geschichte]
+         '[yggdrasil.protocols :as p])
+
+(def sys (geschichte/create conn {:system-name "knowledge"}))
+
+;; A logical Git commit: reconstruct its files/index in a private workspace.
+(def historical (p/overlay-at sys logical-commit-id))
+
+;; An exact physical checkpoint: includes dirty files, stage, refs, schema,
+;; history and other repository attributes as captured at that Datahike commit.
+(def exact
+  (p/overlay-at-checkpoint
+   sys {:version 1 :kind :datahike :commit datahike-commit-id
+        :source {:store store-uuid :repository repository-uuid}}))
+
+(geschichte/connection exact) ; private child connection
+(p/discard! exact)            ; release only its owned resources
+(p/discard! historical)
+```
+
+These origins are distinct. A logical commit overlay may retain other current
+database state; it does not promise a complete historical database. A checkpoint
+overlay starts a new physical branch directly from the exact stored Datahike
+record, without resetting or reconnecting the parent. No file bodies are copied
+up front. The new branch configuration is intentional; connections must preserve
+the checkpoint's source identity, schema, transaction counters and immutable
+secondary-generation addresses. Checkpoints with building secondary indices are
+refused, because Datahike deliberately drops their unfinished generations when
+branching. Missing or mismatched checkpoints never fall back to current state.
+
+The closed descriptor is an identity assertion, not authorization or a GC lease.
+The caller must retain the source checkpoint before construction and retain the
+historical bytes for any promised execution/evidence lifetime. Keeping its UUID
+after discarding a workspace does not by itself preserve that evidence.
+
+`:checkpoint-overlay true` is a separate positive capability, accompanied by
+`:checkpoint-overlay-modes` (`#{:sync}` on JVM, `#{:async}` on CLJS for this
+adapter). Absent `:sync?` follows the platform default; an explicit unsupported
+or non-boolean mode refuses before source IO or allocation. Use the guarded
+`overlay-at-checkpoint` constructor rather than assuming every overlay adapter
+understands `:checkpoint`. It cannot be combined with `:snapshot`. Failed native
+allocation/connect acknowledgements retain the exact existing cleanup owner;
+callers must not guess-delete or automatically replay uncertain construction.
+
+Child verification compares the constant number of primary index root addresses
+(or shared immutable root identity for an in-memory store), plus source metadata
+and secondary generations. It does not scan the whole database or read file
+bodies to establish the copied root.
+
+This fixes the **initial repository state**, not every input to a computation.
+Attached/global code roots, network access and remote workers need their own
+declared policies. The child remains writable. Merge still uses the checkpoint's
+logical Git HEAD as its base, not its Datahike commit ID; inherited dirty changes
+can enter a later child commit. Existing conflict handling and dirty-parent
+refusal remain in force. A checkpoint is not a claim that only post-checkpoint
+edits will be published, nor proof of which files an agent actually read.
 
 ### LakeFS Adapter
 

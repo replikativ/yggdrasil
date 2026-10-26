@@ -377,13 +377,58 @@
    (when-not (and (or (nil? opts) (map? opts))
                   (or (uuid? snapshot) (and (string? snapshot) (seq snapshot)))
                   (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
-                  (not (contains? opts :snapshot)))
+                  (not (contains? opts :snapshot))
+                  (not (contains? opts :checkpoint)))
      (throw (ex-info "Invalid historical workspace request"
                      {:type ::invalid-historical-workspace})))
    (when-not (supports-snapshot-overlay? system)
      (throw (ex-info "System does not support isolated historical workspaces"
                      {:type ::unsupported-historical-workspace})))
    (overlay system (assoc (or opts {}) :snapshot snapshot :mode :frozen))))
+
+(defn checkpoint-origin?
+  "Closed portable identity of an exact Datahike repository checkpoint.
+   This is neither permission nor a GC retention capability. Logical Git
+   snapshot IDs deliberately use the separate overlay-at contract."
+  [value]
+  (and (map? value) (= #{:version :kind :commit :source} (set (keys value)))
+       (= 1 (:version value)) (= :datahike (:kind value)) (uuid? (:commit value))
+       (map? (:source value)) (= #{:store :repository} (set (keys (:source value))))
+       (every? uuid? ((juxt :store :repository) (:source value)))))
+
+(defn supports-checkpoint-overlay?
+  "Pure capability/execution check, before allocation or source loading.
+   Absent :sync? uses the platform default; explicit modes never fall back."
+  ([system] (supports-checkpoint-overlay? system nil))
+  ([system opts]
+   (and (or (nil? opts) (map? opts))
+        (every? #{:sync? :mode} (keys opts))
+        (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
+        (or (not (contains? opts :sync?)) (boolean? (:sync? opts)))
+        (satisfies? SystemIdentity system) (satisfies? Overlayable system)
+        (let [caps (capabilities system) modes (:checkpoint-overlay-modes caps)
+              sync? (get opts :sync? #?(:clj true :cljs false))]
+          (and (true? (:checkpoint-overlay caps)) (set? modes)
+               (contains? modes (if sync? :sync :async)))))))
+
+(defn overlay-at-checkpoint
+  "Create an owned workspace from an exact physical repository checkpoint.
+   The adapter verifies source identity and checkpoint availability before
+   allocation. Unlike a logical snapshot, this includes dirty/staged files,
+   refs and repository attributes. The caller owns checkpoint retention.
+   Preserve the adapter's value-or-CPS result; unsupported systems refuse."
+  ([system checkpoint] (overlay-at-checkpoint system checkpoint nil))
+  ([system checkpoint opts]
+   (when-not (and (checkpoint-origin? checkpoint) (or (nil? opts) (map? opts))
+                  (every? #{:sync? :mode} (keys opts))
+                  (or (not (contains? opts :sync?)) (boolean? (:sync? opts)))
+                  (or (not (contains? opts :mode)) (= :frozen (:mode opts)))
+                  (not-any? #(contains? opts %) [:snapshot :checkpoint]))
+     (throw (ex-info "Invalid checkpoint workspace request" {:type ::invalid-checkpoint-workspace})))
+   (when-not (supports-checkpoint-overlay? system opts)
+     (throw (ex-info "System does not support exact checkpoint workspaces"
+                     {:type ::unsupported-checkpoint-workspace})))
+   (overlay system (assoc (or opts {}) :checkpoint checkpoint :mode :frozen))))
 
 ;; NOTE: the per-system runtime-mode helpers `system-sync?`/`system-async?` were
 ;; REMOVED — a system no longer carries an execution mode (`:opts {:sync?}` was

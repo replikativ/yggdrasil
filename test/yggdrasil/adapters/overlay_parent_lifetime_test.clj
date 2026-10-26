@@ -4,6 +4,7 @@
             [datahike.connections :as connections]
             [datahike.store :as store]
             [geschichte.repo :as repo]
+            [geschichte.query :as query]
             [yggdrasil.adapters.datahike :as dh]
             [yggdrasil.adapters.datahike-cleanup :as cleanup]
             [yggdrasil.adapters.geschichte :as gy]
@@ -59,12 +60,18 @@
 
 (deftest siblings-discard-after-their-source-has-merged-and-been-disposed
   (doseq [kind [:geschichte :datahike]
-          historical? [false true]
-          reverse? [false true]]
+          historical? [false true :checkpoint]
+          reverse? [false true]
+          :when (or (not= historical? :checkpoint) (= kind :geschichte))]
     (with-source kind
       (fn [conn system track!]
         (let [baseline (conn-count conn)
-              opts (if historical? {:snapshot (p/snapshot-id system)} {})
+              opts (case historical?
+                     :checkpoint {:checkpoint {:version 1 :kind :datahike :commit (d/commit-id @conn)
+                                               :source {:store (store/store-identity (get-in @conn [:config :store]))
+                                                        :repository (:geschichte.repo/id (query/repository @conn))}}}
+                     true {:snapshot (p/snapshot-id system)}
+                     {})
               source (track! (p/overlay system opts))
               source-system (overlay/overlay-system source)
               a (track! (p/overlay source-system opts))

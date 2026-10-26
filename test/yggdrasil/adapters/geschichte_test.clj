@@ -7,9 +7,11 @@
    consumers fell back to a bare datom count of geschichte's INTERNAL
    commit/tree/blob schema."
   (:require [clojure.string :as str]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [datahike.versioning :as versioning]
+            [datahike.index.audit :as audit]
             [geschichte.bytes :as gbytes]
             [geschichte.query :as query]
             [geschichte.repo :as repo]
@@ -26,19 +28,20 @@
 
 (defn- with-repo
   "Run `f` against a fresh initialized in-memory Geschichte repository."
-  [f]
-  (let [cfg {:store {:backend :memory :id (random-uuid)}
-             :schema-flexibility :write
-             :keep-history? true
-             :commit-graph? true}]
-    (d/create-database cfg)
-    (let [conn (d/connect cfg)]
-      (try
-        (repo/init! conn)
-        (f conn)
-        (finally
-          (d/release conn)
-          (d/delete-database cfg))))))
+  ([f] (with-repo {:backend :memory :id (random-uuid)} f))
+  ([store f]
+   (let [cfg {:store store
+              :schema-flexibility :write
+              :keep-history? true
+              :commit-graph? true}]
+     (d/create-database cfg)
+     (let [conn (d/connect cfg)]
+       (try
+         (repo/init! conn)
+         (f conn)
+         (finally
+           (d/release conn)
+           (d/delete-database cfg)))))))
 
 (defn- commit-file!
   "Write, stage and commit one path. Returns the commit id."
@@ -611,3 +614,230 @@
         (is (seq (p/conflicts sys :main :side))
             "a real overlap must still reach a person")
         (is (thrown? clojure.lang.ExceptionInfo (p/merge! sys :side)))))))
+
+(defn- physical-checkpoint [db]
+  {:version 1 :kind :datahike :commit (d/commit-id db)
+   :source {:store (get-in db [:config :store :id])
+            :repository (:geschichte.repo/id (query/repository db))}})
+
+(deftest exact-checkpoint-retains-the-entire-repository-state-without-resetting-parent
+  (with-repo
+    (fn [conn]
+      (let [logical (commit-file! conn "state.txt" "C1" "C1")]
+        (d/transact conn [{:db/ident :fixture/value :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+        (let [eid (:db/id (query/repository @conn))]
+          (d/transact conn [{:db/id eid :fixture/value "C1"}])
+          (repo/write! conn "staged.txt" (->bytes "C1 staged"))
+          (repo/stage-all! conn)
+          (repo/write! conn "untracked.txt" (->bytes "C1 untracked"))
+          (let [c1 @conn origin (physical-checkpoint c1)
+                later (commit-file! conn "state.txt" "C2" "C2")]
+            (repo/create-ref! conn "refs/heads/future")
+            (repo/write! conn "future.txt" (->bytes "Only C2"))
+            (d/transact conn [{:db/id eid :fixture/value "C2"}])
+            (let [c2 @conn branches (d/branches conn)
+                  child (p/overlay-at-checkpoint (gy/create conn) origin)
+                  selected (gy/connection child)]
+              (try
+                (is (= (vec (d/datoms c1 :eavt)) (vec (d/datoms @selected :eavt))))
+                (is (= (query/stage c1) (query/stage @selected)))
+                (is (= (query/refs c1) (query/refs @selected)))
+                (is (= (:schema c1) (:schema @selected)))
+                (is (= (:secondary-index-keys c1) (:secondary-index-keys @selected)))
+                (is (= (str logical) (p/base-ref child)))
+                (is (= origin (:checkpoint child)))
+                (is (= "C1" (text (repo/read selected "state.txt"))))
+                (is (= "C1 untracked" (text (repo/read selected "untracked.txt"))))
+                (is (nil? (repo/read selected "future.txt")))
+                (commit-file! selected "own.txt" "Child only" "Own work")
+                (is (nil? (repo/read conn "own.txt")))
+                (is (thrown? clojure.lang.ExceptionInfo (p/merge-down! child)) "Dirty parent is still refused")
+                (is (= (vec (d/datoms c2 :eavt)) (vec (d/datoms @conn :eavt))))
+                (finally (p/discard! child)))
+              (is (= branches (d/branches conn))))))))))
+
+(deftest checkpoint-child-merge-keeps-logical-ancestry-and-newer-parent-work
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "left.txt" "C1 left" "C1 left")
+      (commit-file! conn "right.txt" "C1 right" "C1 right")
+      (let [origin (physical-checkpoint @conn)]
+        (commit-file! conn "right.txt" "Parent C2" "Parent work")
+        (let [child (p/overlay-at-checkpoint (gy/create conn) origin)]
+          (try
+            (commit-file! (gy/connection child) "left.txt" "Child work" "Child work")
+            (p/merge-down! child)
+            (is (= "Child work" (text (repo/read conn "left.txt"))))
+            (is (= "Parent C2" (text (repo/read conn "right.txt"))))
+            (finally (p/discard! child))))))))
+
+(deftest invalid-checkpoints-refuse-before-owning-or-allocating-native-resources
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) system (gy/create conn)]
+        (with-redefs [cleanup-owner/acquire! (fn [& _] (throw (AssertionError. "No native allocation for invalid origin")))]
+          (doseq [opts [{:checkpoint (assoc-in origin [:source :store] (random-uuid))}
+                        {:checkpoint (assoc-in origin [:source :repository] (random-uuid))}
+                        {:checkpoint (assoc origin :commit (random-uuid))}
+                        {:checkpoint origin :mode :following}
+                        {:checkpoint origin :snapshot (p/snapshot-id system)}
+                        {:checkpoint (assoc origin :native :handle)}]]
+            (is (thrown? clojure.lang.ExceptionInfo (p/overlay system opts))))
+          (let [db (assoc-in @conn [:schema :fixture/building] {:db.secondary/status :building})]
+            (with-redefs [versioning/commit-as-db (fn [& _] db)]
+              (is (= :yggdrasil.adapters.geschichte/checkpoint-building-index
+                     (try (p/overlay-at-checkpoint system origin) nil
+                          (catch clojure.lang.ExceptionInfo error (:type (ex-data error)))))))))))))
+
+(deftest checkpoint-lost-allocation-ack-retains-its-exact-cleanup-owner
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) before (physical-view conn)
+            allocate versioning/branch! failure (ex-info "allocation reply lost" {})
+            error (with-redefs [versioning/branch! (fn [& args] (apply allocate args) (throw failure))]
+                    (try (p/overlay-at-checkpoint (gy/create conn) origin)
+                         (catch Throwable error error)))
+            owner (cleanup-test/owner-of error) resource (cleanup-test/state-of owner)]
+        (try
+          (is (identical? failure (ex-cause error)))
+          (is (= :canonical-open (:stage resource)))
+          (is (= :branch-allocation (:uncertain resource)))
+          (is (= #{(:branch resource)} (workspace/list conn)))
+          (is (= before (physical-view conn)))
+          (finally (cleanup-test/dispose-known! owner)))))))
+
+(deftest checkpoint-lost-connect-ack-keeps-the-native-branch-and-connection
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) before (physical-view conn)
+            connected (atom nil) connect d/connect failure (ex-info "connect reply lost" {})
+            error (with-redefs [d/connect (fn [cfg & args]
+                                            (let [child (apply connect cfg args)]
+                                              (if (= :db (:branch cfg)) child
+                                                  (do (reset! connected child) (throw failure)))))]
+                    (try (p/overlay-at-checkpoint (gy/create conn) origin)
+                         (catch Throwable error error)))
+            owner (cleanup-test/owner-of error) resource (cleanup-test/state-of owner)]
+        (try
+          (is (identical? failure (ex-cause error)))
+          (is (= :branch-open (:stage resource)))
+          (is (= :child-connect (:uncertain resource)))
+          (is (nil? (:child-conn resource)))
+          (is (= "C1" (text (repo/read @connected "state.txt"))))
+          (is (= before (physical-view conn)))
+          (finally (cleanup-test/dispose-known! owner @connected)))))))
+
+(deftest checkpoint-post-connect-verification-failure-has-owned-cleanup
+  (doseq [cleanup-fails? [false true]]
+    (with-repo
+      (fn [conn]
+        (commit-file! conn "state.txt" "C1" "C1")
+        (let [origin (physical-checkpoint @conn) before (physical-view conn)
+              connect cleanup-owner/connect-child! remove-branch versioning/delete-branch!
+              cleanup-failure (ex-info "removal refused" {})
+              error (with-redefs [cleanup-owner/connect-child!
+                                  (fn [& args]
+                                    (let [child (apply connect args)]
+                                      (repo/write! child "unexpected.txt" (->bytes "Changed before return"))
+                                      child))
+                                  versioning/delete-branch!
+                                  (fn [& args] (if cleanup-fails? (throw cleanup-failure) (apply remove-branch args)))]
+                      (try (p/overlay-at-checkpoint (gy/create conn) origin)
+                           (catch Throwable error error)))]
+          (if cleanup-fails?
+            (let [owner (cleanup-test/owner-of error) resource (cleanup-test/state-of owner)]
+              (try
+                (is (= :yggdrasil.adapters.geschichte/checkpoint-child-changed (:type (ex-data (ex-cause error)))))
+                (is (seq (:cleanup-errors (ex-data error))))
+                (is (= #{(:branch resource)} (workspace/list conn)))
+                (finally (cleanup-test/dispose-known! owner))))
+            (do
+              (is (= :yggdrasil.adapters.geschichte/checkpoint-child-changed (:type (ex-data error))))
+              (is (empty? (workspace/list conn)))))
+          (is (= before (physical-view conn))))))))
+
+(deftest checkpoint-destination-collision-never-deletes-or-overwrites-the-existing-branch
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) collision :geschichte.workspace/existing-checkpoint-test]
+        (workspace/fork! conn collision)
+        (let [before (versioning/branch-as-db conn collision)
+              error (with-redefs [workspace/branch-key (constantly collision)]
+                      (try (p/overlay-at-checkpoint (gy/create conn) origin)
+                           (catch Throwable error error)))
+              owner (cleanup-test/owner-of error) resource (cleanup-test/state-of owner)]
+          (try
+            (is (= :branch-already-exists (:type (ex-data (ex-cause error)))))
+            (is (= :branch-allocation (:uncertain resource)))
+            (is (= #{collision} (workspace/list conn)))
+            (is (= (vec (d/datoms before :eavt))
+                   (vec (d/datoms (versioning/branch-as-db conn collision) :eavt))))
+            (finally
+              ;; The injected collision tells this test the pre-existing branch
+              ;; was not allocated by the failed constructor. Release its extra
+              ;; canonical lease only; production must retain uncertainty.
+              (d/release (:cleanup-conn resource))
+              (d/delete-branch! conn collision))))))))
+
+(deftest checkpoint-verification-rejects-different-primary-state-with-the-same-commit-metadata
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) before (physical-view conn)
+            connect cleanup-owner/connect-child!
+            error (with-redefs [cleanup-owner/connect-child!
+                                (fn [& args]
+                                  (let [native (apply connect args)
+                                        db @native
+                                        changed (:db-after (d/with db [[:db/add (:db/id (query/repository db))
+                                                                        :geschichte.repo/head "refs/heads/corrupt"]]))
+                                        malformed (assoc db :eavt (:eavt changed))]
+                                    (is (= (d/commit-id db) (d/commit-id malformed)))
+                                    (is (= (:hash db) (:hash malformed)))
+                                    ;; The owner still retains the exact real
+                                    ;; connection for cleanup; this bad returned
+                                    ;; view must never escape the constructor.
+                                    (reify clojure.lang.IDeref (deref [_] malformed))))]
+                    (try (p/overlay-at-checkpoint (gy/create conn) origin)
+                         (catch Throwable error error)))]
+        (is (= :yggdrasil.adapters.geschichte/checkpoint-child-changed (:type (ex-data error))))
+        (is (empty? (workspace/list conn)))
+        (is (= before (physical-view conn)))))))
+
+(deftest incompatible-checkpoint-execution-refuses-before-source-io
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [system (gy/create conn) origin (physical-checkpoint @conn)]
+        (is (p/supports-checkpoint-overlay? system {:sync? true}))
+        (is (not (p/supports-checkpoint-overlay? system {:sync? false})))
+        (with-redefs [versioning/commit-as-db (fn [& _] (throw (AssertionError. "No source IO for incompatible execution")))]
+          (doseq [sync? [false nil :yes]]
+            (is (thrown? clojure.lang.ExceptionInfo (p/overlay-at-checkpoint system origin {:sync? sync?})))
+            (is (thrown? clojure.lang.ExceptionInfo (p/overlay system {:checkpoint origin :sync? sync?})))))))))
+
+(deftest checkpoint-uses-persisted-primary-root-addresses-on-a-file-store
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "ygg-checkpoint-" (make-array java.nio.file.attribute.FileAttribute 0)))]
+    (try
+      (with-repo {:backend :file :id (random-uuid) :path (str (.getPath directory) "/store")}
+        (fn [conn]
+          (commit-file! conn "state.txt" "C1" "C1")
+          (let [c1 @conn origin (physical-checkpoint c1)
+                keys [:eavt :aevt :avet :temporal-eavt :temporal-aevt :temporal-avet]
+                roots (mapv #(audit/-merkle-root (get c1 %)) keys)]
+            (is (every? some? roots))
+            (commit-file! conn "state.txt" "C2" "C2")
+            (let [child (p/overlay-at-checkpoint (gy/create conn) origin)]
+              (try
+                (is (= roots (mapv #(audit/-merkle-root (get @(gy/connection child) %)) keys)))
+                (is (= "C1" (text (repo/read (gy/connection child) "state.txt"))))
+                (is (= "C2" (text (repo/read conn "state.txt"))))
+                (finally (p/discard! child)))))))
+      (finally
+        (when (.exists directory)
+          (doseq [file (reverse (file-seq directory))] (io/delete-file file true)))))))
