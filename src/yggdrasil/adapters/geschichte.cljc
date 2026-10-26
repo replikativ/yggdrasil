@@ -305,7 +305,9 @@
    (owned-overlay parent conn system-name base historical-commit nil nil))
   ([parent conn system-name base historical-commit checkpoint-db origin]
    (platform-async
-    (let [branch (workspace/branch-key (random-uuid))
+    ;; A UUID may start with a digit. Prefix generated names so their keyword
+    ;; representation also round-trips through EDN checkpoint/artifact readers.
+    (let [branch (workspace/branch-key (str "overlay-" (random-uuid)))
           owner (cleanup/owner conn branch base)
           child (atom nil)]
       (try
