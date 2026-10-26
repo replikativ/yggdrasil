@@ -841,3 +841,42 @@
       (finally
         (when (.exists directory)
           (doseq [file (reverse (file-seq directory))] (io/delete-file file true)))))))
+
+(deftest checkpoint-validation-is-read-only-and-returns-only-the-original-descriptor
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) system (gy/create conn)
+            before (physical-view conn) branches (d/branches conn)
+            refuse (fn [& _] (throw (AssertionError. "Read-only validation acquired native resources")))]
+        (with-redefs [cleanup-owner/owner refuse cleanup-owner/acquire! refuse
+                      versioning/branch! refuse workspace/fork! refuse
+                      d/connect refuse d/transact refuse d/transact! refuse]
+          (is (p/supports-checkpoint-validation? system))
+          (is (identical? origin (p/validate-checkpoint-origin! system origin)))
+          (doseq [bad [(assoc-in origin [:source :store] (random-uuid))
+                       (assoc-in origin [:source :repository] (random-uuid))
+                       (assoc origin :commit (random-uuid))
+                       (assoc origin :native :handle)]]
+            (is (thrown? clojure.lang.ExceptionInfo (p/validate-checkpoint-origin! system bad))))
+          (doseq [opts [{:sync? false} {:sync? nil} {:mode :following} {:unknown true}]]
+            (is (thrown? clojure.lang.ExceptionInfo (p/validate-checkpoint-origin! system origin opts))))
+          (let [db (assoc-in @conn [:schema :fixture/building] {:db.secondary/status :building})]
+            (with-redefs [versioning/commit-as-db (fn [& _] db)]
+              (is (= :yggdrasil.adapters.geschichte/checkpoint-building-index
+                     (try (p/validate-checkpoint-origin! system origin) nil
+                          (catch clojure.lang.ExceptionInfo error (:type (ex-data error)))))))))
+        (is (= before (physical-view conn)))
+        (is (= branches (d/branches conn)))))))
+
+(deftest checkpoint-construction-rechecks-a-previously-validated-origin
+  (with-repo
+    (fn [conn]
+      (commit-file! conn "state.txt" "C1" "C1")
+      (let [origin (physical-checkpoint @conn) system (gy/create conn)]
+        (is (= origin (p/validate-checkpoint-origin! system origin)))
+        (with-redefs [versioning/commit-as-db (fn [& _] nil)
+                      cleanup-owner/owner (fn [& _] (throw (AssertionError. "Unavailable source must not allocate")))]
+          (is (= :yggdrasil.adapters.geschichte/checkpoint-unavailable
+                 (try (p/overlay-at-checkpoint system origin) nil
+                      (catch clojure.lang.ExceptionInfo error (:type (ex-data error)))))))))))

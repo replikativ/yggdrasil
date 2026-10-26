@@ -375,10 +375,10 @@
                 (throw error)))
             (cleanup/construction-failed! owner error))))))))
 
-(defn- checkpoint-overlay [parent conn system-name {:keys [checkpoint mode] :as opts}]
+(defn- resolve-checkpoint-origin [parent conn checkpoint opts]
   (platform-async
    (when-not (and (p/checkpoint-origin? checkpoint)
-                  (p/supports-checkpoint-overlay? parent (dissoc opts :checkpoint)))
+                  (p/supports-checkpoint-overlay? parent opts))
      (throw (ex-info "Invalid Geschichte checkpoint origin" {:type ::invalid-checkpoint})))
    (let [db (await (execution/io-result (versioning/commit-as-db conn (:commit checkpoint) execution/default-opts)
                                         execution/default-opts))
@@ -394,10 +394,15 @@
      ;; Refuse rather than call that normalization an exact checkpoint copy.
      (when (some #(= :building (:db.secondary/status %)) (vals (:schema db)))
        (throw (ex-info "Checkpoint has a building secondary index" {:type ::checkpoint-building-index})))
-     (let [base (get (query/refs db) (query/current-ref db))
-           roots (checkpoint-roots db)]
-       (assoc (await (owned-overlay parent conn system-name (some-> base str) nil db roots))
-              :checkpoint checkpoint)))))
+     {:db db :base (get (query/refs db) (query/current-ref db))
+      :roots (checkpoint-roots db)})))
+
+(defn- checkpoint-overlay [parent conn system-name {:keys [checkpoint] :as opts}]
+  (platform-async
+   (let [{:keys [db base roots]}
+         (await (resolve-checkpoint-origin parent conn checkpoint (dissoc opts :checkpoint)))]
+     (assoc (await (owned-overlay parent conn system-name (some-> base str) nil db roots))
+            :checkpoint checkpoint))))
 
 (defn- historical-overlay
   "Construct one owned physical workspace at a committed logical snapshot.
@@ -674,6 +679,12 @@
                                                    execution/default-opts))]
            {:system-id system-name
             :reclaimed (if (counted? removed) (count removed) 0)})))))
+
+  p/CheckpointOriginValidator
+  (-validate-checkpoint-origin [this descriptor opts]
+    (platform-async
+     (await (resolve-checkpoint-origin this conn descriptor opts))
+     descriptor))
 
   p/Overlayable
   (overlay [this opts]

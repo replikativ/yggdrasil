@@ -73,3 +73,60 @@
         (is (= :ok (p/overlay-at-checkpoint s checkpoint {:sync? supported})))
         (is (= [{:checkpoint checkpoint :mode :frozen :sync? supported}] @calls))
         (reset! calls [])))))
+
+(defn- validating-system [calls result modes]
+  (reify
+    p/SystemIdentity
+    (system-id [_] "validating-checkpoint-fixture")
+    (system-type [_] :fixture)
+    (capabilities [_] {:checkpoint-overlay true :checkpoint-overlay-modes modes})
+    p/CheckpointOriginValidator
+    (-validate-checkpoint-origin [_ descriptor opts]
+      (swap! calls conj [descriptor opts]) result)
+    p/Overlayable
+    (overlay [_ _] (throw (ex-info "Validation must not allocate" {})))
+    (advance! [this] this)
+    (advance! [this _] this)
+    (peek-parent [_] nil)
+    (peek-parent [_ _] nil)
+    (base-ref [_] nil)
+    (overlay-writes [_] nil)
+    (merge-down! [_] nil)
+    (merge-down! [_ _] nil)
+    (discard! [_] nil)
+    (discard! [_ _] nil)))
+
+(deftest checkpoint-validation-requires-the-real-optional-protocol
+  (let [calls (atom []) forged (system true calls :allocated)]
+    (is (p/supports-checkpoint-overlay? forged))
+    (is (not (p/supports-checkpoint-validation? forged)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (p/validate-checkpoint-origin! forged checkpoint)))
+    (is (empty? @calls))))
+
+(deftest checkpoint-validation-preflights-closed-shape-and-execution
+  (let [calls (atom []) s (validating-system calls checkpoint #{:sync :async})]
+    (is (p/supports-checkpoint-validation? s))
+    (is (empty? @calls) "Support predicate must never invoke validation")
+    (doseq [bad [nil {} (assoc checkpoint :native :handle)
+                 (assoc checkpoint :commit "logical")]]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (p/validate-checkpoint-origin! s bad))))
+    (doseq [opts [[] {:sync? nil} {:mode :following} {:snapshot "logical"} {:unknown true}]]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (p/validate-checkpoint-origin! s checkpoint opts))))
+    (is (empty? @calls))
+    (is (identical? checkpoint (p/validate-checkpoint-origin! s checkpoint)))
+    (is (= [[checkpoint {}]] @calls))
+    (reset! calls [])
+    (let [unsupported (validating-system calls checkpoint #{:async})]
+      (is (not (p/supports-checkpoint-validation? unsupported {:sync? true})))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (p/validate-checkpoint-origin! unsupported checkpoint {:sync? true})))
+      (is (empty? @calls)))))
+
+(deftest checkpoint-validation-preserves-cps-without-running-it
+  (let [calls (atom []) cps (fn [_ _] (throw (ex-info "Not during preflight dispatch" {})))
+        s (validating-system calls cps #{:sync :async})]
+    (is (identical? cps (p/validate-checkpoint-origin! s checkpoint {:sync? false})))
+    (is (= [[checkpoint {:sync? false}]] @calls))))

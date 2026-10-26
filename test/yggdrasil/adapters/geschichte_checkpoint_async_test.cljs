@@ -2,6 +2,9 @@
   "Run the exact physical checkpoint path through real Node channel/CPS IO."
   (:require [cljs.test :refer-macros [is]]
             [datahike.api :as d]
+            [datahike.versioning :as versioning]
+            [geschichte.workspace :as workspace]
+            [yggdrasil.adapters.datahike-cleanup :as cleanup]
             [geschichte.bytes :as bytes]
             [geschichte.query :as query]
             [geschichte.repo :as repo]
@@ -9,6 +12,11 @@
             [yggdrasil.adapters.geschichte :as gy]
             [yggdrasil.protocols :as p]
             [yggdrasil.test-async :refer-macros [deftest-async <?]]))
+
+(defn- snapshot-proof [db]
+  {:commit (d/commit-id db)
+   :state (select-keys db [:config :hash :max-tx :max-eid :op-count :schema :secondary-index-keys])
+   :refs (query/refs db) :worktree (query/worktree db) :stage (query/stage db)})
 
 (deftest-async checkpoint-forks-earlier-dirty-state-and-cleans-up-on-node
   (let [cfg {:store {:backend :memory :id (random-uuid)}
@@ -32,6 +40,33 @@
           (<? (repo/write! conn "future.txt" (bytes/utf8 "Only C2")))
           (is (p/supports-checkpoint-overlay? system {:sync? false}))
           (is (not (p/supports-checkpoint-overlay? system {:sync? true})))
+          (let [before (snapshot-proof @conn) original-owner cleanup/owner original-branch versioning/branch!
+                original-fork workspace/fork! original-connect d/connect
+                original-transact d/transact original-transact! d/transact!
+                refuse (fn [& _] (throw (js/Error. "Validation acquired native resources")))]
+            ;; Scope native spies through the actual suspended CPS operation,
+            ;; then restore them before exercising ordinary construction below.
+            (set! cleanup/owner refuse)
+            (set! versioning/branch! refuse)
+            (set! workspace/fork! refuse)
+            (set! d/connect refuse)
+            (set! d/transact refuse)
+            (set! d/transact! refuse)
+            (try
+              (is (p/supports-checkpoint-validation? system {:sync? false}))
+              (is (identical? origin (<? (p/validate-checkpoint-origin! system origin {:sync? false}))))
+              (is (= before (snapshot-proof @conn)))
+              (let [foreign (assoc-in origin [:source :store] (random-uuid))
+                    failure (try (<? (p/validate-checkpoint-origin! system foreign {:sync? false})) nil
+                                 (catch :default error error))]
+                (is (= :yggdrasil.adapters.geschichte/checkpoint-unavailable (:type (ex-data failure)))))
+              (finally
+                (set! cleanup/owner original-owner)
+                (set! versioning/branch! original-branch)
+                (set! workspace/fork! original-fork)
+                (set! d/connect original-connect)
+                (set! d/transact original-transact)
+                (set! d/transact! original-transact!))))
           (reset! child (<? (p/overlay-at-checkpoint system origin {:sync? false})))
           (let [selected (gy/connection @child)
                 state (<? (repo/read selected "state.txt"))

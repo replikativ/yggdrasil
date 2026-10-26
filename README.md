@@ -553,6 +553,17 @@ understands `:checkpoint`. It cannot be combined with `:snapshot`. Failed native
 allocation/connect acknowledgements retain the exact existing cleanup owner;
 callers must not guess-delete or automatically replay uncertain construction.
 
+For whole-plan preflight before allocating any child, use
+`supports-checkpoint-validation?` followed by `validate-checkpoint-origin!`.
+The support predicate checks only capabilities and the optional
+`CheckpointOriginValidator` protocol. The validator reads and verifies the
+source checkpoint and returns the original descriptor, directly on JVM or as
+CPS on CLJS, without allocating a branch, connection, cleanup owner or GC lease.
+Geschichte uses the same source checks for validation and construction, and
+construction repeats them: successful preflight is not a promise that a later
+unretained checkpoint will remain available. A capability advertisement without
+the validator protocol cannot satisfy this preflight.
+
 Child verification compares the constant number of primary index root addresses
 (or shared immutable root identity for an in-memory store), plus source metadata
 and secondary generations. It does not scan the whole database or read file

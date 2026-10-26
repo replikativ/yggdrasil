@@ -411,6 +411,39 @@
           (and (true? (:checkpoint-overlay caps)) (set? modes)
                (contains? modes (if sync? :sync :async)))))))
 
+(defprotocol CheckpointOriginValidator
+  "Optional read-only source validation, distinct from workspace allocation."
+  (-validate-checkpoint-origin [system descriptor opts]
+    "Verify the exact source is currently readable; return descriptor unchanged.
+     Preserve the adapter's value-or-CPS convention. Never allocate a workspace,
+     acquire retention or return native database/connection handles."))
+
+(defn supports-checkpoint-validation?
+  "Pure check for advertised checkpoint execution support and its validator."
+  ([system] (supports-checkpoint-validation? system nil))
+  ([system opts]
+   (and (supports-checkpoint-overlay? system opts)
+        (satisfies? CheckpointOriginValidator system))))
+
+(defn validate-checkpoint-origin!
+  "Read-only preflight of an exact checkpoint before any workspace allocation.
+   This proves current availability, not permission or future GC retention.
+   Returns the same portable descriptor, using the adapter's value-or-CPS mode.
+   Construction must still revalidate after preflight."
+  ([system descriptor] (validate-checkpoint-origin! system descriptor nil))
+  ([system descriptor opts]
+   (when-not (and (checkpoint-origin? descriptor)
+                  (or (nil? opts) (map? opts))
+                  (every? #{:sync? :mode} (keys opts))
+                  (or (not (contains? opts :sync?)) (boolean? (:sync? opts)))
+                  (or (not (contains? opts :mode)) (= :frozen (:mode opts))))
+     (throw (ex-info "Invalid checkpoint validation request"
+                     {:type ::invalid-checkpoint-validation})))
+   (when-not (supports-checkpoint-validation? system opts)
+     (throw (ex-info "System does not support checkpoint validation"
+                     {:type ::unsupported-checkpoint-validation})))
+   (-validate-checkpoint-origin system descriptor (or opts {}))))
+
 (defn overlay-at-checkpoint
   "Create an owned workspace from an exact physical repository checkpoint.
    The adapter verifies source identity and checkpoint availability before
