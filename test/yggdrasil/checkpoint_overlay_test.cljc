@@ -29,14 +29,6 @@
      (discard! [_] nil)
      (discard! [_ _] nil))))
 
-(deftest checkpoint-origin-is-closed-inert-identity
-  (is (p/checkpoint-origin? checkpoint))
-  (doseq [bad [nil {} (assoc checkpoint :version 2) (assoc checkpoint :kind :git)
-               (assoc checkpoint :commit (str (:commit checkpoint)))
-               (assoc checkpoint :conn :native) (assoc-in checkpoint [:source :path] "/private")
-               (dissoc checkpoint :source) (assoc-in checkpoint [:source :repository] nil)]]
-    (is (not (p/checkpoint-origin? bad)))))
-
 (deftest checkpoint-requests-require-positive-capability-and-unambiguous-origin
   (let [calls (atom [])]
     (doseq [advertised [nil false :yes 1]]
@@ -104,14 +96,12 @@
                  (p/validate-checkpoint-origin! forged checkpoint)))
     (is (empty? @calls))))
 
-(deftest checkpoint-validation-preflights-closed-shape-and-execution
+(deftest checkpoint-validation-preflights-presence-and-execution
   (let [calls (atom []) s (validating-system calls checkpoint #{:sync :async})]
     (is (p/supports-checkpoint-validation? s))
     (is (empty? @calls) "Support predicate must never invoke validation")
-    (doseq [bad [nil {} (assoc checkpoint :native :handle)
-                 (assoc checkpoint :commit "logical")]]
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
-                   (p/validate-checkpoint-origin! s bad))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (p/validate-checkpoint-origin! s nil)))
     (doseq [opts [[] {:sync? nil} {:mode :following} {:snapshot "logical"} {:unknown true}]]
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (p/validate-checkpoint-origin! s checkpoint opts))))
@@ -130,3 +120,29 @@
         s (validating-system calls cps #{:sync :async})]
     (is (identical? cps (p/validate-checkpoint-origin! s checkpoint {:sync? false})))
     (is (= [[checkpoint {:sync? false}]] @calls))))
+
+(deftest checkpoint-dispatch-does-not-interpret-backend-fields
+  (let [origin {:kind :custom-store :revision "opaque-revision"}
+        calls (atom []) s (system true calls :child)]
+    (is (= :child (p/overlay-at-checkpoint s origin)))
+    (is (= [{:checkpoint origin :mode :frozen}] @calls))
+    (reset! calls [])
+    (is (identical? origin (p/validate-checkpoint-origin!
+                            (validating-system calls origin #{:sync :async}) origin)))
+    (is (= [[origin {}]] @calls))))
+
+(deftest generic-origin-validation-keeps-native-state-out-of-provenance
+  (doseq [value ["revision-A" {:kind :custom :revision "A"} checkpoint]]
+    (is (p/checkpoint-origin? value)))
+  (doseq [value [nil (atom :native) (fn [] :native) {:conn (atom nil)}
+                 (with-meta {:revision "A"} {:native (atom nil)})
+                 (map identity [1 2]) (vec (range 257))
+                 (apply str (repeat 8193 "x"))
+                 (nth (iterate vector :leaf) 17)
+                 (nth (iterate #(vector % % % %) :leaf) 8)]]
+    (is (not (p/checkpoint-origin? value))))
+  (let [calls (atom []) s (validating-system calls :unexpected #{:sync :async})]
+    (doseq [value [(atom :native) (fn [] :native)]]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (p/validate-checkpoint-origin! s value))))
+    (is (empty? @calls))))

@@ -19,10 +19,6 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [datahike.api :as d]
-            [datahike.index.audit :as audit]
-            [datahike.index.interface :as index]
-            [datahike.store :as store]
-            [datahike.versioning :as versioning]
             [geschichte.async :as execution]
             [geschichte.bytes :as gbytes]
             [geschichte.diff :as gdiff]
@@ -302,37 +298,12 @@
      (await (cleanup/discard! cleanup-owner execution/default-opts))
      parent)))
 
-(defn- checkpoint-roots [db]
-  ;; Constant-size verification: persisted root addresses, or shared immutable
-  ;; root objects in an identity-preserving memory store. Never scan datoms.
-  (into {}
-        (for [key (cond-> [:eavt :aevt :avet]
-                    (get-in db [:config :keep-history?])
-                    (into [:temporal-eavt :temporal-aevt :temporal-avet]))
-              :let [tree (get db key)
-                    supported? (and (satisfies? audit/IAuditable tree) (satisfies? index/IIndex tree))
-                    address (when supported? (audit/-merkle-root tree))
-                    root (when (and supported? (nil? address)) (index/-root-node tree))]]
-          (do
-            (when-not (or address root)
-              (throw (ex-info "Checkpoint index has no verifiable root" {:type ::checkpoint-index-unavailable})))
-            [key {:address address :root root}]))))
-
-(defn- same-checkpoint-roots? [before after]
-  (and (= (set (keys before)) (set (keys after)))
-       (every? (fn [[key {:keys [address root]}]]
-                 (let [other (get after key)]
-                   (if address
-                     (= address (:address other))
-                     (and (nil? (:address other)) (identical? root (:root other))))))
-               before)))
-
 (defn- owned-overlay
   "Allocate one overlay with independent native cleanup ownership. Historical
    and ordinary construction share acknowledgement and failure semantics."
   ([parent conn system-name base historical-commit]
    (owned-overlay parent conn system-name base historical-commit nil nil))
-  ([parent conn system-name base historical-commit checkpoint-db roots]
+  ([parent conn system-name base historical-commit checkpoint-db origin]
    (platform-async
     (let [branch (workspace/branch-key (random-uuid))
           owner (cleanup/owner conn branch base)
@@ -341,23 +312,13 @@
         (await (cleanup/acquire! owner execution/default-opts))
         (cleanup/allocating! owner)
         (if checkpoint-db
-          (await (execution/io-result (versioning/branch! conn (d/commit-id checkpoint-db) branch execution/default-opts)
-                                      execution/default-opts))
+          (await (workspace/fork-at-checkpoint! conn branch origin checkpoint-db))
           (await (workspace/fork! conn branch)))
         (cleanup/allocated! owner)
         (let [child-conn (await (cleanup/connect-child! owner execution/default-opts))]
           (reset! child child-conn)
           (when checkpoint-db
-           ;; branch! copies the immutable stored checkpoint. Check that
-           ;; connecting did not publish a different state or generation.
-            (let [selected @child-conn
-                  state #(select-keys % [:hash :max-tx :max-eid :op-count :schema :secondary-index-keys])]
-              (when-not (and (= (d/commit-id checkpoint-db) (d/commit-id selected))
-                             (= (state checkpoint-db) (state selected))
-                             (same-checkpoint-roots? roots (checkpoint-roots selected))
-                             (= (dissoc (:config checkpoint-db) :branch) (dissoc (:config selected) :branch))
-                             (= branch (get-in selected [:config :branch])))
-                (throw (ex-info "Checkpoint child changed during construction" {:type ::checkpoint-child-changed})))))
+            (workspace/verify-checkpoint-workspace! checkpoint-db @child-conn branch))
           (when historical-commit
             (await (repo/materialize-bytes! child-conn [] {:force? true}))
             (await (repo/reset! child-conn historical-commit {:mode :hard})))
@@ -377,31 +338,17 @@
 
 (defn- resolve-checkpoint-origin [parent conn checkpoint opts]
   (platform-async
-   (when-not (and (p/checkpoint-origin? checkpoint)
-                  (p/supports-checkpoint-overlay? parent opts))
-     (throw (ex-info "Invalid Geschichte checkpoint origin" {:type ::invalid-checkpoint})))
-   (let [db (await (execution/io-result (versioning/commit-as-db conn (:commit checkpoint) execution/default-opts)
-                                        execution/default-opts))
-         source (:source checkpoint)
-         repository (when db (query/repository db))]
-     (when-not (and db (= (:commit checkpoint) (d/commit-id db))
-                    (= (:store source) (store/store-identity (get-in @conn [:config :store]))
-                       (store/store-identity (get-in db [:config :store])))
-                    (= (:repository source) (:geschichte.repo/id repository)
-                       (:geschichte.repo/id (query/repository @conn))))
-       (throw (ex-info "Geschichte checkpoint source is unavailable" {:type ::checkpoint-unavailable})))
-     ;; Datahike deliberately omits building generations when branching.
-     ;; Refuse rather than call that normalization an exact checkpoint copy.
-     (when (some #(= :building (:db.secondary/status %)) (vals (:schema db)))
-       (throw (ex-info "Checkpoint has a building secondary index" {:type ::checkpoint-building-index})))
-     {:db db :base (get (query/refs db) (query/current-ref db))
-      :roots (checkpoint-roots db)})))
+   (when-not (p/supports-checkpoint-overlay? parent opts)
+     (throw (ex-info "Unsupported Geschichte checkpoint mode" {:type ::invalid-checkpoint})))
+   (let [db (await (workspace/resolve-checkpoint conn checkpoint (select-keys opts [:sync?])))
+         base (get (query/refs db) (query/current-ref db))]
+     {:db db :base (some-> base str)})))
 
 (defn- checkpoint-overlay [parent conn system-name {:keys [checkpoint] :as opts}]
   (platform-async
-   (let [{:keys [db base roots]}
+   (let [{:keys [db base]}
          (await (resolve-checkpoint-origin parent conn checkpoint (dissoc opts :checkpoint)))]
-     (assoc (await (owned-overlay parent conn system-name (some-> base str) nil db roots))
+     (assoc (await (owned-overlay parent conn system-name base nil db checkpoint))
             :checkpoint checkpoint))))
 
 (defn- historical-overlay

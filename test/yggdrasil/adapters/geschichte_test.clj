@@ -686,9 +686,25 @@
             (is (thrown? clojure.lang.ExceptionInfo (p/overlay system opts))))
           (let [db (assoc-in @conn [:schema :fixture/building] {:db.secondary/status :building})]
             (with-redefs [versioning/commit-as-db (fn [& _] db)]
-              (is (= :yggdrasil.adapters.geschichte/checkpoint-building-index
+              (is (= :geschichte.workspace/checkpoint-building-index
                      (try (p/overlay-at-checkpoint system origin) nil
                           (catch clojure.lang.ExceptionInfo error (:type (ex-data error)))))))))))))
+
+(deftest checkpoint-delegation-preserves-native-ack-order
+  (with-repo
+    (fn [conn]
+      (let [origin (physical-checkpoint @conn) events (atom [])
+            resolve workspace/resolve-checkpoint allocate versioning/branch!
+            allocated cleanup-owner/allocated! connect cleanup-owner/connect-child!
+            verify workspace/verify-checkpoint-workspace!]
+        (with-redefs [workspace/resolve-checkpoint (fn [& args] (swap! events conj :resolve) (apply resolve args))
+                      versioning/branch! (fn [& args] (swap! events conj :allocate) (apply allocate args))
+                      cleanup-owner/allocated! (fn [& args] (swap! events conj :allocation-ack) (apply allocated args))
+                      cleanup-owner/connect-child! (fn [& args] (swap! events conj :connect) (apply connect args))
+                      workspace/verify-checkpoint-workspace! (fn [& args] (swap! events conj :verify) (apply verify args))]
+          (let [child (p/overlay-at-checkpoint (gy/create conn) origin)]
+            (try (is (= [:resolve :allocate :allocation-ack :connect :verify] @events))
+                 (finally (p/discard! child)))))))))
 
 (deftest checkpoint-lost-allocation-ack-retains-its-exact-cleanup-owner
   (with-repo
@@ -750,12 +766,12 @@
           (if cleanup-fails?
             (let [owner (cleanup-test/owner-of error) resource (cleanup-test/state-of owner)]
               (try
-                (is (= :yggdrasil.adapters.geschichte/checkpoint-child-changed (:type (ex-data (ex-cause error)))))
+                (is (= :geschichte.workspace/checkpoint-child-changed (:type (ex-data (ex-cause error)))))
                 (is (seq (:cleanup-errors (ex-data error))))
                 (is (= #{(:branch resource)} (workspace/list conn)))
                 (finally (cleanup-test/dispose-known! owner))))
             (do
-              (is (= :yggdrasil.adapters.geschichte/checkpoint-child-changed (:type (ex-data error))))
+              (is (= :geschichte.workspace/checkpoint-child-changed (:type (ex-data error))))
               (is (empty? (workspace/list conn)))))
           (is (= before (physical-view conn))))))))
 
@@ -804,7 +820,7 @@
                                     (reify clojure.lang.IDeref (deref [_] malformed))))]
                     (try (p/overlay-at-checkpoint (gy/create conn) origin)
                          (catch Throwable error error)))]
-        (is (= :yggdrasil.adapters.geschichte/checkpoint-child-changed (:type (ex-data error))))
+        (is (= :geschichte.workspace/checkpoint-child-changed (:type (ex-data error))))
         (is (empty? (workspace/list conn)))
         (is (= before (physical-view conn)))))))
 
@@ -863,7 +879,7 @@
             (is (thrown? clojure.lang.ExceptionInfo (p/validate-checkpoint-origin! system origin opts))))
           (let [db (assoc-in @conn [:schema :fixture/building] {:db.secondary/status :building})]
             (with-redefs [versioning/commit-as-db (fn [& _] db)]
-              (is (= :yggdrasil.adapters.geschichte/checkpoint-building-index
+              (is (= :geschichte.workspace/checkpoint-building-index
                      (try (p/validate-checkpoint-origin! system origin) nil
                           (catch clojure.lang.ExceptionInfo error (:type (ex-data error)))))))))
         (is (= before (physical-view conn)))
@@ -877,6 +893,6 @@
         (is (= origin (p/validate-checkpoint-origin! system origin)))
         (with-redefs [versioning/commit-as-db (fn [& _] nil)
                       cleanup-owner/owner (fn [& _] (throw (AssertionError. "Unavailable source must not allocate")))]
-          (is (= :yggdrasil.adapters.geschichte/checkpoint-unavailable
+          (is (= :geschichte.workspace/checkpoint-unavailable
                  (try (p/overlay-at-checkpoint system origin) nil
                       (catch clojure.lang.ExceptionInfo error (:type (ex-data error)))))))))))

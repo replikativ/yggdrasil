@@ -387,14 +387,28 @@
    (overlay system (assoc (or opts {}) :snapshot snapshot :mode :frozen))))
 
 (defn checkpoint-origin?
-  "Closed portable identity of an exact Datahike repository checkpoint.
-   This is neither permission nor a GC retention capability. Logical Git
-   snapshot IDs deliberately use the separate overlay-at contract."
+  "Nonnil portable adapter-defined data, without backend field assumptions.
+   Bound descriptor traversal to 1024 values, depth 16, collection width 256
+   and string length 8192. Native handles, metadata, records and lazy sequences refuse.
+   This validates transport shape only; the adapter validates its own identity."
   [value]
-  (and (map? value) (= #{:version :kind :commit :source} (set (keys value)))
-       (= 1 (:version value)) (= :datahike (:kind value)) (uuid? (:commit value))
-       (map? (:source value)) (= #{:store :repository} (set (keys (:source value))))
-       (every? uuid? ((juxt :store :repository) (:source value)))))
+  (and (some? value)
+       (loop [pending [[value 0]] visited 0]
+         (if (empty? pending) true
+             (let [[v depth] (peek pending) remaining (pop pending)]
+               (and (< visited 1024) (<= depth 16) (not (seq (meta v)))
+                    (cond
+                      (or (nil? v) (boolean? v) (keyword? v) (symbol? v) (uuid? v))
+                      (recur remaining (inc visited))
+                      (string? v) (and (<= (count v) 8192) (recur remaining (inc visited)))
+                      (number? v) (and #?(:clj (Double/isFinite (double v)) :cljs (js/isFinite v))
+                                       (recur remaining (inc visited)))
+                      (record? v) false
+                      (or (map? v) (vector? v) (set? v) (list? v))
+                      (and (<= (count v) 256)
+                           (recur (into remaining (map #(vector % (inc depth)))
+                                        (if (map? v) (mapcat identity v) v)) (inc visited)))
+                      :else false)))))))
 
 (defn supports-checkpoint-overlay?
   "Pure capability/execution check, before allocation or source loading.
@@ -426,7 +440,7 @@
         (satisfies? CheckpointOriginValidator system))))
 
 (defn validate-checkpoint-origin!
-  "Read-only preflight of an exact checkpoint before any workspace allocation.
+  "Read-only preflight of an adapter-specific checkpoint before allocation.
    This proves current availability, not permission or future GC retention.
    Returns the same portable descriptor, using the adapter's value-or-CPS mode.
    Construction must still revalidate after preflight."
@@ -445,10 +459,10 @@
    (-validate-checkpoint-origin system descriptor (or opts {}))))
 
 (defn overlay-at-checkpoint
-  "Create an owned workspace from an exact physical repository checkpoint.
-   The adapter verifies source identity and checkpoint availability before
-   allocation. Unlike a logical snapshot, this includes dirty/staged files,
-   refs and repository attributes. The caller owns checkpoint retention.
+  "Create an owned workspace from an exact adapter-specific checkpoint.
+   The descriptor is portable adapter-defined data; generic dispatch does not
+   interpret its fields. The adapter validates its shape and exact source before
+   allocation. The caller owns checkpoint retention and authorization.
    Preserve the adapter's value-or-CPS result; unsupported systems refuse."
   ([system checkpoint] (overlay-at-checkpoint system checkpoint nil))
   ([system checkpoint opts]

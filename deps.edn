@@ -12,7 +12,7 @@
         ;; 0.1.60 ships the optional core.async adapter (is.simm.partial-cps.core-async)
         ;; that kbridge + the storage layer delegate to.
         ;; partial-cps moved to org.replikativ (namespaces unchanged).
-        org.replikativ/partial-cps {:mvn/version "0.1.68"}
+        org.replikativ/partial-cps {:mvn/version "0.1.69"}
         org.clojure/core.async {:mvn/version "1.6.681"}}
 
  :aliases
@@ -28,7 +28,8 @@
                       {:mvn/version "0.8.1910"}
                       ;; geschichte is likewise an OPTIONAL adapter dep, for
                       ;; yggdrasil.adapters.geschichte-test.
-                      org.replikativ/geschichte {:mvn/version "0.1.22"}}
+                      org.replikativ/geschichte {:git/url "https://github.com/replikativ/geschichte.git"
+                                                  :git/sha "c3c8239f048b30e4cb56dbadf5d078999aba2de3"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
@@ -54,7 +55,8 @@
                         {:mvn/version "0.8.1910"}
                         ;; same for the (optional) geschichte adapter — the whole
                         ;; adapter is .cljc, so cljs exercises the same code.
-                        org.replikativ/geschichte {:mvn/version "0.1.22"}}}
+                        org.replikativ/geschichte {:git/url "https://github.com/replikativ/geschichte.git"
+                                                  :git/sha "c3c8239f048b30e4cb56dbadf5d078999aba2de3"}}}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy {:mvn/version "0.2.0"}

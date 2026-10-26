@@ -59,7 +59,7 @@
               (let [foreign (assoc-in origin [:source :store] (random-uuid))
                     failure (try (<? (p/validate-checkpoint-origin! system foreign {:sync? false})) nil
                                  (catch :default error error))]
-                (is (= :yggdrasil.adapters.geschichte/checkpoint-unavailable (:type (ex-data failure)))))
+                (is (= :geschichte.workspace/checkpoint-unavailable (:type (ex-data failure)))))
               (finally
                 (set! cleanup/owner original-owner)
                 (set! versioning/branch! original-branch)

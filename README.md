@@ -507,6 +507,10 @@ Requires Datahike on the classpath.
 
 Requires Geschichte and Datahike on the classpath. Logical Git refs and commits
 live inside an isolated, structurally shared Datahike workspace branch.
+The adapter requires Geschichte's checkpoint workspace API from commit
+`c3c8239f048b30e4cb56dbadf5d078999aba2de3` ([Geschichte #21](https://github.com/replikativ/geschichte/pull/21))
+or a release containing it. The test and Node aliases pin that public source
+revision until the corresponding release is available.
 
 ```clojure
 (require '[yggdrasil.adapters.geschichte :as geschichte]
@@ -538,6 +542,14 @@ the checkpoint's source identity, schema, transaction counters and immutable
 secondary-generation addresses. Checkpoints with building secondary indices are
 refused, because Datahike deliberately drops their unfinished generations when
 branching. Missing or mismatched checkpoints never fall back to current state.
+
+Repository checkpoint resolution, named branch allocation and connected-child
+verification live in `geschichte.workspace`. The adapter delegates those steps
+and retains its existing native acquisition/cleanup owner. It records allocation
+ACK before connecting or verifying the child. Generic Yggdrasil dispatch checks
+capabilities, execution mode and bounded portable descriptor data; each adapter
+interprets its own descriptor fields. The Datahike/store/repository descriptor
+above belongs to Geschichte and is not required of other Yggdrasil systems.
 
 The closed descriptor is an identity assertion, not authorization or a GC lease.
 The caller must retain the source checkpoint before construction and retain the
