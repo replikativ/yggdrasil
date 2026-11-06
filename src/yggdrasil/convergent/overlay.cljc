@@ -17,6 +17,7 @@
    live-tracking modes `:following`/`:gated` are thin here — `advance!` re-joins
    the parent's current state into the overlay; the sequence-lock/gated machinery
    is deferred until an agent-tracking case needs it."
+  (:refer-clojure :exclude [await])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]

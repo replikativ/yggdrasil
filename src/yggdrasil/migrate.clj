@@ -22,6 +22,7 @@
    `:registry/roots`) is returned untouched. The dead `:registry/roots`/
    `:registry/freed` cells + old nodes are left in place — a windowed
    `registry/gc!` reclaims them (unreachable from `:crdt/roots`). JVM/ops tool (sync)."
+  (:refer-clojure :exclude [sync])
   (:require [yggdrasil.kbridge :as kb]
             [yggdrasil.storage :as store]
             [yggdrasil.registry :as registry]))

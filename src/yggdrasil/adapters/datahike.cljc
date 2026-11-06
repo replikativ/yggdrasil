@@ -9,6 +9,7 @@
 
   Requires datahike on the classpath. Only load this namespace when
   datahike is available as a dependency."
+  (:refer-clojure :exclude [await])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.hooks :as hooks]

@@ -24,6 +24,7 @@
    (a) konserve-sync's incremental transport set and (b) the basis of the
    element-level join-delta. `ship!` is the store-to-store sync primitive; it
    copies only the nodes the destination is missing (incremental)."
+  (:refer-clojure :exclude [await])
   (:require [yggdrasil.kbridge :as kb]
             [konserve.utils :as ku]
             [yggdrasil.storage :as store]

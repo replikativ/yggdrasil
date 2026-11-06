@@ -31,7 +31,7 @@
    **Fully cross-platform**: the record does NOT carry an execution mode — each
    content-touching op takes an OPTIONAL trailing `opts` ({:sync?}, default
    `c/default-opts`: sync on JVM, CPS on cljs)."
-  (:refer-clojure :exclude [assoc dissoc get keys])
+  (:refer-clojure :exclude [await assoc dissoc get keys])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]

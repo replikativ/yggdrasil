@@ -43,6 +43,7 @@
                                subs in ONE store, so `:composite/root` is the
                                lone causal gate (the network-atomic, browser/
                                local-first form)."
+  (:refer-clojure :exclude [await])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.storage :as store]

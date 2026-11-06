@@ -12,6 +12,7 @@
    commit) when the commit is present, or `nil` when absent. Each public fn mirrors
    its pure counterpart 1:1, with `(mapcat graph heads)` → `parents-set` and
    `(select-keys graph ids)`-counting → `count-present` (both awaited)."
+  (:refer-clojure :exclude [await])
   (:require [clojure.set :as set]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]
                :cljs [is.simm.partial-cps.async :refer [await]])
