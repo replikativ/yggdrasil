@@ -2,6 +2,7 @@
   "Native ownership of overlay cleanup, independent of temporary parents.
    Optional Datahike dependency. Owners are opaque process-local resources,
    not portable semantic state, transport receipts or authorization."
+  (:refer-clojure :exclude [await])
   (:require [datahike.api :as d]
             [datahike.versioning :as versioning]
             [datahike.store :as store]

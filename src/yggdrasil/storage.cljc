@@ -18,6 +18,7 @@
    Registry entries are RegistryEntry records on JVM (serialized via a RegistryEntry
    fressian element handler the registry attaches alongside the node handlers) and plain
    maps on cljs (fressian-native)."
+  (:refer-clojure :exclude [await])
   (:require [konserve.store :as kstore]
             [konserve.core :as kc]
             [konserve.serializers :as kser]

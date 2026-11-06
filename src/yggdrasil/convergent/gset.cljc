@@ -19,7 +19,7 @@
    **Fully cross-platform.** The record does NOT carry an execution mode — each
    content-touching op takes an OPTIONAL trailing `opts` ({:sync?}) and defaults to
    `c/default-opts` (SYNC on JVM, ASYNC on cljs)."
-  (:refer-clojure :exclude [conj contains?])
+  (:refer-clojure :exclude [await conj contains?])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]

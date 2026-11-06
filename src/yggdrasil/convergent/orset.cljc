@@ -30,7 +30,7 @@
    OPTIONAL trailing `opts` ({:sync?}, default `c/default-opts`: sync on JVM,
    async/CPS on cljs). Fixed-arity protocol methods (snapshot-id/gc-roots) use the
    platform default."
-  (:refer-clojure :exclude [conj disj contains?])
+  (:refer-clojure :exclude [await conj disj contains?])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]

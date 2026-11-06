@@ -34,7 +34,7 @@
    **Runtime mode**: the record does NOT carry an execution mode — each op takes an
    OPTIONAL trailing `opts` ({:sync?}, default `c/default-opts`: sync on JVM, CPS on
    cljs)."
-  (:refer-clojure :exclude [merge])
+  (:refer-clojure :exclude [await merge])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [yggdrasil.convergent :as c]

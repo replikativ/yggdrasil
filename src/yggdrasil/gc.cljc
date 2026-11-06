@@ -17,6 +17,7 @@
    Each system runs its own internal GC (Btrfs prunes snapshots,
    Git runs git gc, etc.) but coordinates externally via the registry
    to prevent cross-system reference breakage."
+  (:refer-clojure :exclude [await])
   (:require [yggdrasil.protocols :as p]
             [yggdrasil.registry :as reg]
             [yggdrasil.types :as t]

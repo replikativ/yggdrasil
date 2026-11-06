@@ -6,7 +6,7 @@
    is invisible to dedup/convergence. Small values ride inline; the break-out POLICY (when
    to break out) is the consumer's. `yggdrasil.hashref` registers the wire codec (a ref is
    pure data — no IO); GC follows a ref to its key via `hasch/ref->uuid`."
-  (:refer-clojure :exclude [resolve])
+  (:refer-clojure :exclude [await resolve])
   (:require [hasch.core :as hasch]
             [yggdrasil.kbridge :as kb]
             #?(:clj  [is.simm.partial-cps.async :refer [async await]]

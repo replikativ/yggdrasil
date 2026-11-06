@@ -26,7 +26,7 @@
    gives it a stable snapshot identity. **Fully cross-platform**: the record does
    NOT carry an execution mode — each content-touching op takes an OPTIONAL trailing
    `opts` ({:sync?}, default `c/default-opts`)."
-  (:refer-clojure :exclude [conj disj contains? into])
+  (:refer-clojure :exclude [await conj disj contains? into])
   (:require [clojure.set :as set]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
